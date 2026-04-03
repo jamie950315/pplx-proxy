@@ -455,102 +455,57 @@ async def _stream_openai(client, query, mode, model_pref, model_name, cid, creat
 
 # ─── Model Discovery ───────────────────────────────────────────────────────
 
-# ─── Pattern-based candidate generator ─────────────────────────────────────
+# ─── Model Discovery ──────────────────────────────────────────────────────
 
-import re as _re
-
-# Known pref patterns: (regex to extract version, template to generate next versions)
-_PREF_PATTERNS=[
-    # OpenAI: gpt54 → try gpt55, gpt56, gpt60...
-    (_re.compile(r"^gpt(\d)(\d)$"), lambda ma,mi: [f"gpt{ma}{mi}"]),
-    (_re.compile(r"^gpt(\d)(\d)_thinking$"), lambda ma,mi: [f"gpt{ma}{mi}_thinking"]),
-    # Anthropic Sonnet: claude46sonnet → try claude47sonnet, claude50sonnet...
-    (_re.compile(r"^claude(\d)(\d)sonnet$"), lambda ma,mi: [f"claude{ma}{mi}sonnet"]),
-    (_re.compile(r"^claude(\d)(\d)sonnetthinking$"), lambda ma,mi: [f"claude{ma}{mi}sonnetthinking"]),
-    # Anthropic Opus: claude46opus → try claude47opus...
-    (_re.compile(r"^claude(\d)(\d)opus$"), lambda ma,mi: [f"claude{ma}{mi}opus"]),
-    (_re.compile(r"^claude(\d)(\d)opusthinking$"), lambda ma,mi: [f"claude{ma}{mi}opusthinking"]),
-    # Google Gemini: gemini31pro_high → try gemini32pro_high...
-    (_re.compile(r"^gemini(\d)(\d)pro_high$"), lambda ma,mi: [f"gemini{ma}{mi}pro_high"]),
-    (_re.compile(r"^gemini(\d)(\d)pro$"), lambda ma,mi: [f"gemini{ma}{mi}pro"]),
-    # xAI Grok: grok41nonreasoning → try grok42...
-    (_re.compile(r"^grok(\d)(\d)nonreasoning$"), lambda ma,mi: [f"grok{ma}{mi}nonreasoning"]),
-    (_re.compile(r"^grok(\d)(\d)reasoning$"), lambda ma,mi: [f"grok{ma}{mi}reasoning"]),
-    # Moonshot Kimi: kimik2thinking → try kimik3thinking...
-    (_re.compile(r"^kimik(\d+)thinking$"), lambda ma,mi: [f"kimik{ma}thinking"]),
-    (_re.compile(r"^kimik(\d+)$"), lambda ma,mi: [f"kimik{ma}"]),
-]
-
-def _next_versions(major: int, minor: int, steps: int=3) -> list:
-    """Generate the next `steps` version tuples from (major, minor)."""
-    versions=[]
-    ma, mi=major, minor
-    for _ in range(steps):
-        mi+=1
-        if mi >= 10:
-            mi=0
-            ma+=1
-        versions.append((ma, mi))
-    return versions
-
-def _next_kimi_versions(ver: str, steps: int=3) -> list:
-    """Generate next kimi version strings: 2→25→3→35→4..."""
-    seq=["2", "25", "3", "35", "4", "45", "5", "55", "6"]
-    try:
-        idx=seq.index(ver)
-    except ValueError:
-        return [str(int(ver)+1)]
-    return seq[idx+1:idx+1+steps]
-
-
-def generate_candidates(current_map: dict) -> dict:
-    """From the current model map, extrapolate next versions to probe."""
-    known_prefs={v[1] for v in current_map.values()}
+def generate_candidates(known_prefs: set) -> dict:
+    """Generate ALL possible model_preference strings from known naming patterns.
+    Scans every single-digit major.minor version. Only unknown prefs are returned."""
     candidates={}
 
-    for pref in known_prefs:
-        for pattern, template_fn in _PREF_PATTERNS:
-            m=pattern.match(pref)
-            if not m:
-                continue
-            groups=m.groups()
-            if len(groups) == 2 and groups[0].isdigit() and groups[1].isdigit():
-                # Versioned: gpt54, claude46sonnet, etc.
-                for ma, mi in _next_versions(int(groups[0]), int(groups[1])):
-                    for new_pref in template_fn(ma, mi):
-                        if new_pref not in known_prefs:
-                            candidates[f"probe-{new_pref}"]=("pro", new_pref)
-            elif len(groups) == 1:
-                # Kimi-style: kimik2, kimik25
-                for new_ver in _next_kimi_versions(groups[0]):
-                    for new_pref in template_fn(new_ver, None):
-                        if new_pref not in known_prefs:
-                            candidates[f"probe-{new_pref}"]=("pro", new_pref)
-            break
-
-    # Also probe NVIDIA next gens (no version pattern, just increment gen number)
-    for pref in known_prefs:
-        nm=_re.match(r"^nv_nemotron_(\d+)_(\w+)$", pref)
-        if nm:
-            gen=int(nm.group(1))
-            variant=nm.group(2)
-            for g in [gen+1, gen+2]:
-                new_pref=f"nv_nemotron_{g}_{variant}"
-                if new_pref not in known_prefs:
-                    candidates[f"probe-{new_pref}"]=("pro", new_pref)
-
-    # Perplexity internal — fixed names, probe common ones
-    for pref in ["pplx_pro", "pplx_alpha", "pplx_beta", "pplx_gamma", "experimental", "turbo"]:
+    def add(pref):
         if pref not in known_prefs:
-            candidates[f"probe-{pref}"]=("pro", pref)
+            candidates[pref]=("pro", pref)
+
+    for ma in range(10):
+        for mi in range(10):
+            v=f"{ma}{mi}"
+            # OpenAI
+            add(f"gpt{v}")
+            add(f"gpt{v}_thinking")
+            # Anthropic Sonnet
+            add(f"claude{v}sonnet")
+            add(f"claude{v}sonnetthinking")
+            # Anthropic Opus
+            add(f"claude{v}opus")
+            add(f"claude{v}opusthinking")
+            # Google Gemini
+            add(f"gemini{v}pro")
+            add(f"gemini{v}pro_high")
+            # xAI Grok
+            add(f"grok{v}nonreasoning")
+            add(f"grok{v}reasoning")
+
+    # Kimi (non-numeric pattern)
+    for v in ["k1","k15","k2","k25","k3","k35","k4","k45","k5"]:
+        add(f"kimi{v}")
+        add(f"kimi{v}thinking")
+
+    # NVIDIA Nemotron
+    for gen in range(1, 10):
+        add(f"nv_nemotron_{gen}_super")
+        add(f"nv_nemotron_{gen}_ultra")
+
+    # Perplexity internal
+    for p in ["pplx_pro","pplx_alpha","pplx_beta","pplx_gamma","pplx_delta","pplx_reasoning","experimental","turbo"]:
+        add(p)
 
     return candidates
 
 
-async def probe_model(client, mode, pref) -> bool:
-    """Send a simple query to test if a model_preference is valid."""
+async def probe_model(client, pref) -> bool:
+    """Test if a model_preference is valid by sending a trivial query."""
     try:
-        async for chunk in client.search("What is 2+2? Answer with just the number.", mode, pref, ["web"], "en-US"):
+        async for chunk in client.search("2+2=?", "pro", pref, ["web"], "en-US"):
             if chunk.get("error"):
                 return False
             if chunk.get("answer", "").strip():
@@ -560,39 +515,42 @@ async def probe_model(client, mode, pref) -> bool:
         return False
 
 
-def pref_to_friendly_name(pref: str) -> str:
+def pref_to_name(pref: str) -> str:
     """Convert internal pref to friendly model ID."""
-    if pref.endswith("_thinking"):
-        return f"pplx-{pref.replace('_thinking', '')}-thinking"
-    if pref.endswith("thinking"):
-        return f"pplx-{pref.replace('thinking', '')}-thinking"
-    if pref.endswith("nonreasoning"):
-        return f"pplx-{pref.replace('nonreasoning', '')}"
-    if pref.endswith("reasoning"):
-        return f"pplx-{pref.replace('reasoning', '')}-thinking"
-    return f"pplx-{pref}"
+    if pref.startswith("pplx_") or pref in ("experimental", "turbo"):
+        return f"pplx-{pref.replace('_','-')}"
+    name=pref
+    for suffix, repl in [("_thinking", "-thinking"), ("thinking", "-thinking"),
+                         ("nonreasoning", ""), ("reasoning", "-thinking"),
+                         ("_high", "-high")]:
+        if name.endswith(suffix):
+            name=name[:-len(suffix)]+repl
+            break
+    return f"pplx-{name}"
 
 
 @app.post("/admin/discover-models")
 async def discover_models(request: Request, _=Depends(verify_api_key)):
-    """Auto-discover new models by extrapolating version patterns from known models.
-    Probes a few versions ahead of each known model. Uses ~1 Pro Search per probe."""
+    """Probe Perplexity for all working model identifiers.
+    Generates every possible version number for known naming patterns,
+    skips already-known prefs, and probes the rest."""
     client=get_client()
     await client.init()
 
-    mm=get_model_map()
-    candidates=generate_candidates(mm)
+    known_prefs={v[1] for v in get_model_map().values()}
+    candidates=generate_candidates(known_prefs)
+    log.info(f"Discovery: {len(candidates)} unknown candidates to probe ({len(known_prefs)} already known)")
 
-    results={"valid": {}, "invalid": 0, "probed": 0}
+    results={"valid": {}, "probed": 0, "invalid": 0}
 
-    for probe_name, (mode, pref) in candidates.items():
+    for pref, (mode, _) in candidates.items():
         results["probed"]+=1
         try:
-            ok=await probe_model(client, mode, pref)
+            ok=await probe_model(client, pref)
             if ok:
-                friendly=pref_to_friendly_name(pref)
-                results["valid"][friendly]=[mode, pref]
-                log.info(f"Discovery: {pref} → VALID ({friendly})")
+                name=pref_to_name(pref)
+                results["valid"][name]=[mode, pref]
+                log.info(f"Discovery: {pref} → VALID ({name})")
             else:
                 results["invalid"]+=1
         except Exception as e:
@@ -602,7 +560,7 @@ async def discover_models(request: Request, _=Depends(verify_api_key)):
     if results["valid"]:
         global MODEL_MAP
         for name, (mode, pref) in results["valid"].items():
-            MODEL_MAP[name]=tuple([mode, pref])
+            MODEL_MAP[name]=(mode, pref)
         save_model_map(MODEL_MAP)
 
     return {
@@ -613,6 +571,7 @@ async def discover_models(request: Request, _=Depends(verify_api_key)):
         "total_models": len(MODEL_MAP),
         "discovered": results["valid"],
     }
+
 
 
 
