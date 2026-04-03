@@ -367,6 +367,12 @@ async def verify_api_key(request: Request):
 app=FastAPI(title="pplx-proxy", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+# Global error handler: unconfigured service → 503
+@app.exception_handler(RuntimeError)
+async def runtime_error_handler(request: Request, exc: RuntimeError):
+    return JSONResponse(status_code=503, content={"error": {"message": str(exc), "type": "service_unavailable"}})
+
+
 
 from fastapi.responses import FileResponse as _FileResponse
 from pathlib import Path as _StaticPath
