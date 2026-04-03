@@ -414,22 +414,17 @@ import xml.etree.ElementTree as _ET
 import re as _re
 
 def _build_tool_prompt(tool_defs: str, tool_choice: str="auto") -> str:
+    if tool_choice == "none":
+        return ""
     base=(
-        "You have access to tools. When calling a tool, use this EXACT XML format:\n"
-        "<tool_call>\n<function_name>\n<param>value</param>\n</function_name>\n</tool_call>\n\n"
-        "Available tools:\n" + tool_defs + "\n\n"
-        "Example — get_weather(location=Tokyo):\n"
-        "<tool_call>\n<get_weather>\n<location>Tokyo</location>\n</get_weather>\n</tool_call>\n\n"
-        "Rules: Each param is its own XML element. Root element = function name. "
-        "Multiple calls = multiple <tool_call> blocks. "
-        "When calling a tool, output ONLY the XML, nothing else."
+        "Tools available:\n" + tool_defs + "\n"
+        "Call format: <tool_call><NAME><PARAM>value</PARAM></NAME></tool_call>\n"
+        "Example: <tool_call><get_weather><city>Tokyo</city></get_weather></tool_call>\n"
+        "When using a tool, output ONLY the XML."
     )
     if tool_choice == "required":
-        return base + "\nYou MUST call at least one tool. Do NOT respond with plain text."
-    elif tool_choice == "none":
-        return ""  # no tool prompt
-    else:  # auto
-        return base + "\nOnly use tools when the user\'s request specifically needs one. If you can answer directly, respond normally WITHOUT <tool_call> tags."
+        return base + " You MUST use a tool now."
+    return base
 
 
 def _tools_to_xml(tools: list) -> str:
@@ -565,24 +560,34 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
         except (ValueError, TypeError):
             raise HTTPException(500, f"Corrupted model entry for {model_name}. Fix via /admin/update-models")
 
+    # Build query from messages — keep last 10 turns, truncate long assistant messages
     parts=[]
     for msg in messages:
         role=msg.get("role", "user")
         content=msg.get("content") or ""
         if isinstance(content, list):
-            text_parts=[c.get("text", "") for c in content if c.get("type") == "text"]
+            text_parts=[ct.get("text", "") for ct in content if ct.get("type") == "text"]
             content=" ".join(text_parts)
+        if not content:
+            continue
         if role == "system":
             parts.append(f"[System]: {content}")
         elif role == "user":
             parts.append(content)
         elif role == "assistant":
+            if len(content) > 500:
+                content=content[:500] + "..."
             parts.append(f"[Assistant]: {content}")
         elif role == "tool":
             parts.append(f"[Tool Result]: {content}")
+
+    # Keep last 12 parts max to avoid context overflow
+    if len(parts) > 12:
+        parts=parts[-12:]
+
     query="\n\n".join(parts)
 
-    # Tool calling: inject tool definitions into query
+    # Tool calling: append at end, keep it short
     if tools and isinstance(tools, list) and len(tools) > 0 and tool_choice != "none":
         tool_defs=_tools_to_xml(tools)
         if tool_defs:
