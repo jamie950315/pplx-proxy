@@ -445,7 +445,8 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
     sources=body.get("sources", ["web"])
     tools=body.get("tools", None)
     tool_choice=body.get("tool_choice", "auto")
-    thinking=body.get("thinking", False)  # toggle thinking mode
+    thinking=body.get("thinking", False)
+    reasoning_effort=body.get("reasoning_effort", None)  # "none" = no thinking, anything else = thinking
 
     # Validate messages
     if messages is None:
@@ -474,10 +475,11 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
     if model_name not in mm:
         raise HTTPException(400, f"Unknown model: {model_name}. Available: {list(mm.keys())}")
 
-    # Thinking mode: switch to thinking variant if enabled
-    if thinking and model_name in _THINKING_MAP:
+    # Thinking mode: thinking=true OR reasoning_effort != "none"
+    use_thinking=thinking or (reasoning_effort is not None and reasoning_effort != "none")
+    if use_thinking and model_name in _THINKING_MAP:
         mode, model_pref=_THINKING_MAP[model_name]
-        log.info(f"thinking=true → {model_name} using {model_pref}")
+        log.info(f"thinking on → {model_name} using {model_pref}")
     else:
         try:
             mode, model_pref=mm[model_name]
