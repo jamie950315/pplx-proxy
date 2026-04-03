@@ -455,44 +455,58 @@ async def _stream_openai(client, query, mode, model_pref, model_name, cid, creat
 
 # ─── Model Discovery ───────────────────────────────────────────────────────
 
-# Candidate internal prefs to probe — extend as Perplexity adds models
-_DISCOVERY_CANDIDATES={
-    # pattern: "friendly_name": ("mode", "internal_pref")
-    # Pro
-    "pplx-auto": ("pro", "pplx_pro"),
-    "pplx-pro-sonar": ("pro", "experimental"),
-    "pplx-pro-gpt5": ("pro", "gpt54"),
-    "pplx-pro-gpt52": ("pro", "gpt52"),
-    "pplx-pro-gpt55": ("pro", "gpt55"),
-    "pplx-pro-claude": ("pro", "claude46sonnet"),
-    "pplx-pro-claude45": ("pro", "claude45sonnet"),
-    "pplx-pro-claude47": ("pro", "claude47sonnet"),
-    "pplx-pro-gemini": ("pro", "gemini31pro_high"),
-    "pplx-pro-gemini30": ("pro", "gemini30pro"),
-    "pplx-pro-gemini32": ("pro", "gemini32pro_high"),
-    "pplx-pro-nemotron": ("pro", "nv_nemotron_3_super"),
-    "pplx-pro-opus": ("pro", "claude46opus"),
-    "pplx-pro-opus45": ("pro", "claude45opus"),
-    "pplx-pro-grok": ("pro", "grok41nonreasoning"),
-    "pplx-pro-grok42": ("pro", "grok42nonreasoning"),
-    "pplx-pro-kimi": ("pro", "kimik25"),
-    # Thinking
-    "pplx-pro-gpt5-thinking": ("pro", "gpt54_thinking"),
-    "pplx-pro-gpt52-thinking": ("pro", "gpt52_thinking"),
-    "pplx-pro-gpt55-thinking": ("pro", "gpt55_thinking"),
-    "pplx-pro-claude-thinking": ("pro", "claude46sonnetthinking"),
-    "pplx-pro-claude45-thinking": ("pro", "claude45sonnetthinking"),
-    "pplx-pro-claude47-thinking": ("pro", "claude47sonnetthinking"),
-    "pplx-pro-opus-thinking": ("pro", "claude46opusthinking"),
-    "pplx-pro-grok-thinking": ("pro", "grok41reasoning"),
-    "pplx-pro-grok42-thinking": ("pro", "grok42reasoning"),
-    "pplx-pro-kimi-thinking": ("pro", "kimik2thinking"),
-    "pplx-pro-kimi25-thinking": ("pro", "kimik25thinking"),
-    "pplx-pro-nemotron-thinking": ("pro", "nv_nemotron_3_super_thinking"),
-    # Deep Research & Labs
-    "pplx-deep-research": ("pro", "pplx_alpha"),
-    "pplx-labs": ("pro", "pplx_beta"),
-}
+# ─── Pattern-based candidate generator ─────────────────────────────────────
+
+def generate_candidates() -> dict:
+    """Generate candidate model_preference strings from known naming patterns.
+    Covers current + future versions automatically."""
+    candidates={}
+
+    # Perplexity internal
+    for pref in ["pplx_pro", "experimental", "pplx_alpha", "pplx_beta", "pplx_gamma", "pplx_reasoning", "turbo"]:
+        candidates[f"probe-{pref}"]=("pro", pref)
+
+    # OpenAI: gpt{major}{minor} — scan 50..65
+    for v in range(50, 66):
+        p=f"gpt{v}"
+        candidates[f"probe-{p}"]=("pro", p)
+        candidates[f"probe-{p}-t"]=("pro", f"{p}_thinking")
+
+    # Anthropic Claude Sonnet: claude{major}{minor}sonnet — scan 45..50
+    for v in range(45, 51):
+        p=f"claude{v}sonnet"
+        candidates[f"probe-{p}"]=("pro", p)
+        candidates[f"probe-{p}-t"]=("pro", f"{p}thinking")
+
+    # Anthropic Claude Opus: claude{major}{minor}opus — scan 45..50
+    for v in range(45, 51):
+        p=f"claude{v}opus"
+        candidates[f"probe-{p}"]=("pro", p)
+        candidates[f"probe-{p}-t"]=("pro", f"{p}thinking")
+
+    # Google Gemini: gemini{major}{minor}pro / gemini{major}{minor}pro_high — scan 20..35
+    for v in range(20, 36):
+        candidates[f"probe-gemini{v}pro"]=("pro", f"gemini{v}pro")
+        candidates[f"probe-gemini{v}pro-h"]=("pro", f"gemini{v}pro_high")
+
+    # xAI Grok: grok{major}{minor}nonreasoning/reasoning — scan 40..45
+    for v in range(40, 46):
+        candidates[f"probe-grok{v}"]=("pro", f"grok{v}nonreasoning")
+        candidates[f"probe-grok{v}-t"]=("pro", f"grok{v}reasoning")
+
+    # Moonshot Kimi: kimik{ver}thinking — scan k2..k4, k25, k35
+    for ver in ["k2", "k25", "k3", "k35", "k4"]:
+        candidates[f"probe-kimi{ver}"]=("pro", f"kimi{ver}")
+        candidates[f"probe-kimi{ver}-t"]=("pro", f"kimi{ver}thinking")
+
+    # NVIDIA Nemotron
+    for gen in ["3", "4", "5"]:
+        for suffix in ["super", "ultra"]:
+            p=f"nv_nemotron_{gen}_{suffix}"
+            candidates[f"probe-{p}"]=("pro", p)
+
+    return candidates
+
 
 async def probe_model(client, mode, pref) -> bool:
     """Send a simple query to test if a model_preference is valid.
@@ -509,34 +523,51 @@ async def probe_model(client, mode, pref) -> bool:
         return False
 
 
+def pref_to_friendly_name(pref: str) -> str:
+    """Convert internal pref like gpt54_thinking to friendly model ID like pplx-pro-gpt54-thinking."""
+    if pref.endswith("_thinking") or pref.endswith("thinking"):
+        base=pref.replace("_thinking", "").replace("thinking", "")
+        return f"pplx-{base}-thinking"
+    if pref.endswith("nonreasoning"):
+        base=pref.replace("nonreasoning", "")
+        return f"pplx-{base}"
+    if pref.endswith("reasoning"):
+        base=pref.replace("reasoning", "")
+        return f"pplx-{base}-thinking"
+    return f"pplx-{pref}"
+
+
 @app.post("/admin/discover-models")
 async def discover_models(request: Request, _=Depends(verify_api_key)):
     """Probe Perplexity for all working model identifiers.
-    Tests each candidate and returns which ones are valid.
-    WARNING: This sends many requests and may hit rate limits. Use sparingly."""
+    Auto-generates candidates from naming patterns (GPT, Claude, Gemini, Grok, Kimi, Nemotron).
+    WARNING: Uses ~1 Pro Search query per unknown candidate. Skips already-known prefs."""
     client=get_client()
     await client.init()
 
-    results={"valid": {}, "invalid": [], "error": [], "skipped": []}
+    candidates=generate_candidates()
     current_mm=get_model_map()
+    known_prefs={v[1] for v in current_mm.values()}
 
-    # Probe candidates
-    for name, (mode, pref) in _DISCOVERY_CANDIDATES.items():
-        # Skip if already in current map (save quota)
-        if name in current_mm and current_mm[name] == (mode, pref):
-            results["skipped"].append(name)
+    results={"valid": {}, "invalid": 0, "skipped": 0, "probed": 0}
+
+    for probe_name, (mode, pref) in candidates.items():
+        # Skip if this pref is already known
+        if pref in known_prefs:
+            results["skipped"]+=1
             continue
 
+        results["probed"]+=1
         try:
             ok=await probe_model(client, mode, pref)
             if ok:
-                results["valid"][name]=[mode, pref]
-                log.info(f"Discovery: {name} ({pref}) = VALID")
+                friendly=pref_to_friendly_name(pref)
+                results["valid"][friendly]=[mode, pref]
+                log.info(f"Discovery: {pref} = VALID → {friendly}")
             else:
-                results["invalid"].append(f"{name} ({pref})")
-                log.info(f"Discovery: {name} ({pref}) = invalid")
+                results["invalid"]+=1
         except Exception as e:
-            results["error"].append(f"{name}: {e}")
+            log.warning(f"Discovery probe error {pref}: {e}")
 
         await asyncio.sleep(3)  # rate limit protection
 
@@ -545,17 +576,19 @@ async def discover_models(request: Request, _=Depends(verify_api_key)):
         global MODEL_MAP
         for name, (mode, pref) in results["valid"].items():
             MODEL_MAP[name]=tuple([mode, pref])
-        # Also re-add skipped (already valid) models
         save_model_map(MODEL_MAP)
 
     return {
         "status": "ok",
-        "discovered": len(results["valid"]),
-        "invalid": len(results["invalid"]),
-        "skipped": len(results["skipped"]),
+        "new_models": len(results["valid"]),
+        "invalid": results["invalid"],
+        "skipped": results["skipped"],
+        "probed": results["probed"],
+        "total_candidates": len(candidates),
         "total_models": len(MODEL_MAP),
-        "details": results,
+        "discovered": results["valid"],
     }
+
 
 
 # ─── MCP Server ────────────────────────────────────────────────────────────
