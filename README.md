@@ -1,6 +1,6 @@
 # pplx-proxy
 
-Reverse proxy for [Perplexity.ai](https://www.perplexity.ai) — use your existing **Pro subscription cookie** to access Pro Search, Reasoning, and Deep Research via standard APIs.
+Reverse proxy for [Perplexity.ai](https://www.perplexity.ai) — use your existing **Pro/Max subscription cookie** to access all models via standard APIs.
 
 Exposes two interfaces:
 - **OpenAI-compatible REST API** (`/v1/chat/completions`)
@@ -8,18 +8,19 @@ Exposes two interfaces:
 
 ## How It Works
 
-Perplexity's web frontend communicates with its backend through an internal SSE endpoint (`/rest/sse/perplexity_ask`). This proxy authenticates with your session cookie via [curl_cffi](https://github.com/yifeikong/curl_cffi) (Chrome TLS fingerprinting), translates requests/responses into OpenAI and MCP formats, and keeps your session alive automatically.
+Perplexity's web frontend talks to its backend through an internal SSE endpoint (`/rest/sse/perplexity_ask`). This proxy authenticates with your session cookie via [curl_cffi](https://github.com/yifeikong/curl_cffi) (Chrome TLS fingerprinting), translates requests/responses into OpenAI and MCP formats, and keeps your session alive automatically.
 
-No official API key needed — just your Pro subscription.
+No official API key needed — just your subscription.
 
 ## Features
 
-- **12+ models**: GPT-5.4, Claude 4.6 Sonnet, Gemini 3.1 Pro, Nemotron 3 Super, Sonar, and thinking variants
-- **Dynamic model management**: Add/remove models at runtime via admin API, persisted to disk
-- **Session keep-alive**: Background task pings Perplexity periodically to prevent cookie expiry
-- **Push notifications**: [ntfy.sh](https://ntfy.sh) alerts when cookie expires and needs manual refresh
-- **Full input validation**: Proper error messages for every malformed request
-- **Zero hardcoded values**: Every configurable parameter lives in `.env`
+- **Account tier support**: free/pro/max — only exposes models your tier can access
+- **Auto-discovery**: background task checks model health every 24h, auto-upgrades when versions change
+- **Session keep-alive**: periodic pings prevent cookie expiry
+- **Push notifications**: [ntfy.sh](https://ntfy.sh) alerts on cookie expiry or model upgrades
+- **Dynamic model management**: add/remove models at runtime via admin API
+- **Full input validation**: proper error messages for every malformed request
+- **Zero hardcoded values**: every parameter lives in `.env`
 
 ## Quick Start
 
@@ -30,7 +31,7 @@ python3 -m venv venv
 venv/bin/pip install -r requirements.txt
 
 cp .env.example .env
-# Edit .env — set PPLX_COOKIE (see "Getting Your Cookie" below)
+# Edit .env — set PPLX_COOKIE and ACCOUNT_TYPE
 
 venv/bin/uvicorn server:app --host 0.0.0.0 --port 8892
 ```
@@ -38,53 +39,69 @@ venv/bin/uvicorn server:app --host 0.0.0.0 --port 8892
 ## Getting Your Cookie
 
 1. Log in to [perplexity.ai](https://www.perplexity.ai)
-2. Open DevTools (F12) → **Application** → **Cookies** → `www.perplexity.ai`
-3. Copy the value of `next-auth.session-token`
+2. F12 → **Application** → **Cookies** → `www.perplexity.ai`
+3. Copy `next-auth.session-token`
 4. Set `PPLX_COOKIE=<value>` in `.env`
+
+## Models by Account Tier
+
+### FREE ($0/mo)
+
+| Model ID | Backend |
+|----------|---------|
+| `pplx-auto` | Perplexity Best (auto-select) |
+
+### PRO ($20/mo)
+
+| Model ID | Backend | Thinking |
+|----------|---------|----------|
+| `pplx-auto` | Perplexity Best | — |
+| `pplx-sonar` | Sonar | — |
+| `pplx-gpt5` | GPT-5.4 | `pplx-gpt5-thinking` |
+| `pplx-claude` | Claude Sonnet 4.6 | `pplx-claude-thinking` |
+| `pplx-gemini` | Gemini 3.1 Pro | always on |
+| `pplx-nemotron` | Nemotron 3 Super | always on |
+
+### MAX ($200/mo)
+
+Everything in PRO, plus:
+
+| Model ID | Backend | Thinking |
+|----------|---------|----------|
+| `pplx-opus` | Claude Opus 4.6 | `pplx-opus-thinking` |
+
+Using a model outside your tier returns `403` with a clear error message.
 
 ## API Endpoints
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| `GET` | `/health` | No | Health check (includes cookie age) |
-| `GET` | `/v1/models` | Yes | List available models with mode/pref info |
-| `POST` | `/v1/chat/completions` | Yes | OpenAI-compatible chat (streaming + non-streaming) |
+| `GET` | `/health` | No | Health check |
+| `GET` | `/v1/models` | Yes | List tier-available models |
+| `POST` | `/v1/chat/completions` | Yes | Chat (streaming + non-streaming) |
 | `POST` | `/mcp/mcp` | No | MCP Streamable HTTP |
-| `GET` | `/sse/sse` | No | MCP SSE (legacy) |
-| `GET` | `/admin/models` | Yes | Full model map with internals |
-| `POST` | `/admin/update-models` | Yes | Add/replace models at runtime |
-| `POST` | `/admin/refresh-cookie` | Yes | Inject new session token without restart |
+| `GET` | `/sse/sse` | No | MCP SSE |
+| `GET` | `/admin/models` | Yes | Full model map |
+| `POST` | `/admin/update-models` | Yes | Add/replace models |
+| `POST` | `/admin/refresh-cookie` | Yes | Inject new session token |
+| `POST` | `/admin/discover-models` | Yes | Run model discovery |
 
 ## Usage
 
-### OpenAI-compatible API
+### OpenAI API
 
 ```bash
 curl -X POST http://localhost:8892/v1/chat/completions \
-  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Authorization: Bearer YOUR_KEY" \
   -H "Content-Type: application/json" \
-  -d '{
-    "model": "pplx-pro-gpt5",
-    "messages": [{"role": "user", "content": "Latest AI news"}],
-    "stream": true
-  }'
+  -d '{"model": "pplx-gpt5", "messages": [{"role": "user", "content": "Hello"}], "stream": true}'
 ```
 
-### MCP (Claude Code / Cursor / Windsurf)
+### MCP
 
 ```bash
 # Claude Code
 claude mcp add pplx-proxy --transport http http://localhost:8892/mcp/mcp
-
-# MCP config JSON
-{
-  "mcpServers": {
-    "pplx-proxy": {
-      "transport": "streamable-http",
-      "url": "http://localhost:8892/mcp/mcp"
-    }
-  }
-}
 ```
 
 **MCP Tools:**
@@ -93,52 +110,43 @@ claude mcp add pplx-proxy --transport http http://localhost:8892/mcp/mcp
 |------|-------------|
 | `perplexity_search` | Pro Search with model/source selection |
 | `perplexity_ask` | Quick auto-mode Q&A |
-| `perplexity_reason` | Step-by-step reasoning (multiple model backends) |
-| `perplexity_research` | Deep Research (comprehensive, 30s+) |
-| `perplexity_models` | List all available models and IDs |
+| `perplexity_reason` | Reasoning with model selection |
+| `perplexity_research` | Deep Research |
+| `perplexity_models` | List available models for your tier |
 
-## Available Models
+## Auto-Discovery
 
-Internal identifiers sourced from Perplexity's web frontend (April 2026).
+Every `PROBE_INTERVAL_HOURS` (default 24h), pplx-proxy checks if models are still alive. If one dies, it increments the version number (e.g., `gpt54` → `gpt55` → ... up to +1.0) and auto-upgrades. Thinking variants follow their base model automatically.
 
-### Models
+| Model | Probe strategy |
+|-------|---------------|
+| `pplx-sonar` | alive check only |
+| `pplx-gpt5` | gpt54 → gpt55...gpt64 (max 10), thinking auto-follows |
+| `pplx-claude` | claude46sonnet → claude47...claude56 (max 10), thinking auto-follows |
+| `pplx-opus` | claude46opus → claude47...claude56 (max 10), thinking auto-follows |
+| `pplx-gemini` | gemini31pro_high → gemini32...gemini41 (max 10) |
+| `pplx-nemotron` | nv_nemotron_3_super → nv_nemotron_4 (max 1) |
 
-| Model ID | Backend | Thinking |
-|----------|---------|----------|
-| `pplx-auto` | Perplexity Best (auto) | — |
-| `pplx-sonar` | Sonar | — |
-| `pplx-gpt5` | GPT-5.4 | `pplx-gpt5-thinking` |
-| `pplx-claude` | Claude Sonnet 4.6 | `pplx-claude-thinking` |
-| `pplx-gemini` | Gemini 3.1 Pro | always on |
-| `pplx-nemotron` | Nemotron 3 Super | always on |
-| `pplx-opus` | Claude Opus 4.6 (**Max**) | `pplx-opus-thinking` |
-| `pplx-deep-research` | Deep Research | — |
-| `pplx-labs` | Labs (files & apps) | — |
-
-### Auto-Discovery
-
-`POST /admin/discover-models` checks if current models still work. If one dies, it increments the version (e.g., `gpt54` → `gpt55` → ... up to +2.0) and auto-upgrades. No brute force, no wasted quota when everything works.
-
-Models can be added/removed at runtime via `POST /admin/update-models`.
+Manual trigger: `POST /admin/discover-models`
 
 ## Configuration
 
-All settings in `.env` (see `.env.example`):
-
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PPLX_COOKIE` | — | Perplexity session token (**required**) |
-| `PPLX_PROXY_API_KEY` | — | Bearer token for API auth (empty = no auth) |
+| `PPLX_COOKIE` | — | Session token (**required**) |
+| `PPLX_PROXY_API_KEY` | — | Bearer auth (empty = no auth) |
+| `ACCOUNT_TYPE` | `pro` | `free`, `pro`, or `max` |
+| `DEFAULT_MODEL` | `pplx-gpt5` | Default when not specified |
 | `PPLX_PROXY_PORT` | `8892` | Listen port |
-| `DEFAULT_MODEL` | `pplx-pro-gpt5` | Default model when not specified |
-| `KEEPALIVE_HOURS` | `6` | Session keep-alive ping interval |
-| `NTFY_TOPIC` | `pplx-proxy` | ntfy.sh topic for expiry alerts |
-| `NTFY_COOLDOWN_SECS` | `3600` | Min interval between notifications |
-| `PUBLIC_URL` | `http://localhost:8892` | Public URL (used in ntfy messages) |
-| `PPLX_API_VERSION` | `2.18` | Perplexity internal API version |
-| `PPLX_IMPERSONATE` | `chrome` | curl_cffi TLS fingerprint target |
-| `USER_AGENT` | Chrome/130 Linux | HTTP User-Agent string |
-| `COOKIE_MAX_AGE_HOURS` | `168` | Max cookie cache age before stale |
+| `KEEPALIVE_HOURS` | `6` | Session ping interval |
+| `PROBE_INTERVAL_HOURS` | `24` | Auto-discovery interval |
+| `NTFY_TOPIC` | `pplx-proxy` | ntfy.sh topic |
+| `NTFY_COOLDOWN_SECS` | `3600` | Min interval between alerts |
+| `PUBLIC_URL` | `http://localhost:8892` | URL in ntfy messages |
+| `PPLX_API_VERSION` | `2.18` | Perplexity internal API ver |
+| `PPLX_IMPERSONATE` | `chrome` | curl_cffi TLS fingerprint |
+| `USER_AGENT` | Chrome/130 | HTTP User-Agent |
+| `COOKIE_MAX_AGE_HOURS` | `168` | Cookie cache max age |
 | `LOG_LEVEL` | `INFO` | Logging level |
 
 ## Deployment (systemd)
@@ -147,16 +155,14 @@ All settings in `.env` (see `.env.example`):
 sudo cp pplx-proxy.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now pplx-proxy
-sudo journalctl -u pplx-proxy -f
 ```
 
 ## Cookie Lifecycle
 
 ```
-Manual inject (one-time) → keep-alive pings every 6h → session stays alive
-                                                       ↓
-                                    If Perplexity force-revokes session:
-                                    ntfy push notification → manual re-inject
+Manual inject → keep-alive every 6h → session stays alive indefinitely
+                                      ↓ (if Perplexity force-revokes)
+                                      ntfy alert → manual re-inject
 ```
 
 Re-inject without SSH:
@@ -168,22 +174,9 @@ curl -X POST https://your-domain/admin/refresh-cookie \
   -d '{"session_token": "NEW_TOKEN"}'
 ```
 
-## Updating Models
-
-When Perplexity adds new models, update at runtime:
-
-```bash
-curl -X POST https://your-domain/admin/update-models \
-  -H "Authorization: Bearer YOUR_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"models": {"pplx-pro-newmodel": ["pro", "new_internal_pref"]}, "merge": true}'
-```
-
-Find internal preference strings by inspecting Perplexity's frontend JS bundles or checking community reverse-engineering projects.
-
 ## Disclaimer
 
-This is an unofficial reverse proxy for personal use. It relies on Perplexity's internal web API which may change without notice. Use responsibly and respect Perplexity's terms of service.
+Unofficial reverse proxy for personal use. Relies on Perplexity's internal web API which may change without notice. Use responsibly.
 
 ## License
 

@@ -1,118 +1,115 @@
-# CLAUDE.md — Project Context for Claude Code
+# CLAUDE.md
 
 ## What This Is
 
-`pplx-proxy` is a self-hosted reverse proxy for Perplexity.ai that exposes Pro Search, Reasoning, and Deep Research through OpenAI-compatible REST API and MCP (Model Context Protocol) server. It uses the user's existing Perplexity Pro subscription cookie for authentication instead of an API key.
+`pplx-proxy` is a self-hosted reverse proxy for Perplexity.ai. Uses your Pro/Max subscription cookie to access all models through OpenAI-compatible REST API and MCP server.
 
 ## Architecture
 
-Single-file FastAPI application (`server.py`, ~700 lines) that:
+Single FastAPI app (`server.py`) that:
 
-1. Receives OpenAI-format requests at `/v1/chat/completions` or MCP tool calls at `/mcp/mcp`
-2. Translates them into Perplexity's internal SSE format (`POST /rest/sse/perplexity_ask`)
+1. Receives OpenAI-format or MCP tool call requests
+2. Translates to Perplexity's internal SSE (`POST /rest/sse/perplexity_ask`)
 3. Uses `curl_cffi` with Chrome TLS fingerprinting to bypass Cloudflare
 4. Streams responses back in OpenAI SSE or MCP format
+5. Background tasks: session keep-alive (6h) + model discovery (24h)
 
-```
-Client → FastAPI → curl_cffi (Chrome TLS) → Perplexity SSE endpoint
-  ↑                                              ↓
-  └──── OpenAI/MCP format ← parse SSE chunks ←──┘
-```
+## Key Concepts
 
-## Key Components
+**Account Tiers** (`ACCOUNT_TYPE` in .env):
+- `free`: only `pplx-auto`
+- `pro`: all models except Opus
+- `max`: all models including Opus
+- Tier filtering applies to API, MCP, model listing, and discovery
 
-- **PerplexityClient**: Async SSE client using `curl_cffi.requests.AsyncSession` with `impersonate` for TLS fingerprinting. The `search()` method is an async generator yielding delta chunks.
-- **MODEL_MAP**: Dynamic dict mapping model IDs (e.g., `pplx-pro`) to `(mode, internal_pref)` tuples. Persisted to `.models.json`. Mode maps to Perplexity's `concise`/`copilot` parameter; internal_pref maps to their model backend identifier.
-- **MCP server**: FastMCP mounted as sub-app. Streamable HTTP at `/mcp`, SSE at `/sse`. Lifespan is manually wired into FastAPI's lifespan to initialize the MCP session manager's TaskGroup.
-- **Keep-alive**: Background asyncio task pings `/api/auth/session` every `KEEPALIVE_HOURS` to prevent cookie expiry.
-- **ntfy**: Sends push notification on 401/403 from Perplexity, rate-limited to one per `NTFY_COOLDOWN_SECS`.
+**Model Map**: dict of `{model_id: (mode, internal_pref)}`. Loaded from `.models.json` (persisted) or defaults. Filtered by tier at runtime. All models use `mode="copilot"` (Perplexity Pro Search).
 
-## Code Style
-
-- No spaces around `=` in assignments: `x=1` not `x = 1`
-- One space after commas
-- camelCase for locals, ALL_UPPERCASE for module-level constants
-- Opening brace on same line
-- Minimal blank lines
+**Auto-Discovery**: every `PROBE_INTERVAL_HOURS`, checks if models are alive. Dead models get version-incremented (e.g., `gpt54` → `gpt55`) up to +1.0. Thinking variants auto-follow base model. Sends ntfy on upgrade.
 
 ## File Structure
 
 ```
-server.py          # Everything: FastAPI app, Perplexity client, MCP tools, admin endpoints
-inject_cookie.sh   # Helper script to inject cookie and restart service
-test.sh            # Basic smoke test script
-pplx-proxy.service # systemd unit file
-.env.example       # Config template (all configurable params)
-.gitignore         # Excludes .env, .cookie_cache.json, .models.json, venv/
+server.py            # Everything: FastAPI, Perplexity client, MCP, admin, discovery
+inject_cookie.sh     # Helper to inject cookie + restart
+test.sh              # Smoke test
+pplx-proxy.service   # systemd unit
+.env.example         # All config params
+.gitignore
 ```
 
-## Runtime Files (git-ignored)
+## Runtime Files (gitignored)
 
 ```
-.env               # Actual config with secrets
-.cookie_cache.json # Cached cookie + timestamp (written by /admin/refresh-cookie)
-.models.json       # Persisted model map (written by /admin/update-models)
+.env                 # Secrets + config
+.cookie_cache.json   # Cached cookie + timestamp
+.models.json         # Persisted model map
 ```
-
-## Configuration
-
-All config via environment variables loaded from `.env` by `python-dotenv`. Zero hardcoded values. See `.env.example` for all parameters.
 
 ## Endpoints
 
-### Public
-- `GET /health` — no auth
+**Public**: `GET /health`
 
-### Requires API key (Bearer token)
-- `GET /v1/models`
-- `POST /v1/chat/completions`
-- `GET /admin/models`
-- `POST /admin/update-models`
-- `POST /admin/refresh-cookie`
+**Auth required** (Bearer token):
+- `GET /v1/models` — tier-filtered model list
+- `POST /v1/chat/completions` — OpenAI chat
+- `GET /admin/models` — full model map
+- `POST /admin/update-models` — modify models
+- `POST /admin/refresh-cookie` — inject new token
+- `POST /admin/discover-models` — manual discovery run
 
-### MCP (no API key, uses MCP session management)
+**MCP** (no auth, MCP session):
 - `POST /mcp/mcp` — Streamable HTTP
 - `GET /sse/sse` — SSE transport
 
 ## MCP Tools
 
-| Tool | Params | Notes |
-|------|--------|-------|
-| `perplexity_search` | `query`, `model="default"`, `sources="web"`, `language="en-US"` | Validates model ID, sources |
-| `perplexity_ask` | `query`, `language` | Auto mode, no model selection |
-| `perplexity_reason` | `query`, `model="default"`, `language` | Accepts full IDs or shorthand (gpt5/claude/gemini/kimi/grok) |
-| `perplexity_research` | `query`, `language` | Deep Research, slow (30s+) |
-| `perplexity_models` | (none) | Lists all model IDs grouped by mode |
+| Tool | Params |
+|------|--------|
+| `perplexity_search` | `query`, `model="default"`, `sources="web"`, `language` |
+| `perplexity_ask` | `query`, `language` |
+| `perplexity_reason` | `query`, `model="default"`, `language` |
+| `perplexity_research` | `query`, `language` |
+| `perplexity_models` | (none) — lists tier-available models |
 
-## Common Tasks
+All tools validate: empty query, invalid model, invalid sources, tier restrictions.
 
-### Adding a new model
-```bash
-curl -X POST /admin/update-models \
-  -d '{"models": {"pplx-pro-newmodel": ["pro", "newmodel_internal"]}, "merge": true}'
-```
+## Discovery Probe Strategy
 
-### Updating cookie without restart
-```bash
-curl -X POST /admin/refresh-cookie \
-  -d '{"session_token": "new_token_value"}'
-```
+Only base models are probed. Thinking variants auto-follow.
 
-### Perplexity changes their API version
-Update `PPLX_API_VERSION` in `.env` and restart.
+- `pplx-sonar` (`experimental`) → alive check only, no version pattern
+- `pplx-gpt5` (`gpt54`) → gpt55...gpt64 (max 10)
+- `pplx-claude` (`claude46sonnet`) → claude47...claude56 (max 10)
+- `pplx-opus` (`claude46opus`) → claude47...claude56 (max 10)
+- `pplx-gemini` (`gemini31pro_high`) → gemini32...gemini41 (max 10)
+- `pplx-nemotron` (`nv_nemotron_3_super`) → nv_nemotron_4 (max 1)
+
+## Code Style
+
+- No spaces around `=`: `x=1`
+- One space after commas
+- camelCase for locals, ALL_UPPERCASE for module constants
+- Opening brace on same line
 
 ## Dependencies
 
 - `fastapi` + `uvicorn` — HTTP server
-- `curl_cffi` — HTTP client with TLS fingerprinting (critical for bypassing Cloudflare)
-- `mcp` — Model Context Protocol SDK (FastMCP)
+- `curl_cffi` — TLS fingerprinting (critical)
+- `mcp` — MCP SDK (FastMCP)
 - `python-dotenv` — .env loading
-- `httpx` — used only for ntfy notifications (already a transitive dep of `mcp`)
+- `httpx` — ntfy notifications (transitive dep of mcp)
 
-## Known Limitations
+## Common Tasks
 
-- Perplexity's internal API (`/rest/sse/perplexity_ask`) can change without notice
-- Cookie may be force-revoked by Perplexity (security events, account changes)
-- Deep Research mode is slow (30s+) and may timeout on short-timeout clients
-- Rate limits are enforced by Perplexity server-side (429 responses)
-- No automatic cookie refresh — Perplexity uses magic-link login and Cloudflare Turnstile blocks headless browsers on arm64
+```bash
+# Add model
+curl -X POST /admin/update-models -d '{"models":{"new":["pro","pref"]},"merge":true}'
+
+# Update cookie
+curl -X POST /admin/refresh-cookie -d '{"session_token":"NEW"}'
+
+# Run discovery
+curl -X POST /admin/discover-models
+
+# Change tier: edit ACCOUNT_TYPE in .env, restart
+```
