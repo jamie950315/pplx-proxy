@@ -115,7 +115,7 @@ for(let l of ls){if(!l.startsWith('data: '))continue;let s=l.slice(6).trim();
 if(s==='[DONE]'){L('[DONE]');continue}
 try{let c=JSON.parse(s),dl=c.choices?.[0]?.delta||{},f=c.choices?.[0]?.finish_reason;rm=c.model||rm;
 if(dl.reasoning_content){fr_+=dl.reasoning_content;L('δ think: '+dl.reasoning_content.slice(0,50))}
-if(dl.content){fc+=dl.content;if(fc.length<100||fc.length%200<dl.content.length)log('δ text: '+dl.content.slice(0,60))}
+if(dl.content){fc+=dl.content;if(fc.length<100||fc.length%200<dl.content.length)L('δ text: '+dl.content.slice(0,60))}
 if(dl.tool_calls){tc=dl.tool_calls;L('δ tools: '+JSON.stringify(dl.tool_calls))}
 if(f){fn=f;L('finish: '+f)}
 }catch(e){L('err: '+e.message)}}

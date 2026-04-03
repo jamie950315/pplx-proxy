@@ -569,23 +569,24 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
         if isinstance(content, list):
             text_parts=[ct.get("text", "") for ct in content if ct.get("type") == "text"]
             content=" ".join(text_parts)
-        if not content:
+        # Skip empty messages (common after tool_calls)
+        if not content or not content.strip():
             continue
         if role == "system":
             system_msg=content
         elif role == "user":
             history.append(("user", content))
         elif role == "assistant":
-            # Aggressively truncate assistant messages in history
-            if len(content) > 300:
-                content=content[:300] + "..."
+            # Short truncation — only keep first 200 chars of assistant history
+            if len(content) > 200:
+                content=content[:200] + "..."
             history.append(("assistant", content))
         elif role == "tool":
-            history.append(("tool", content[:200]))
+            history.append(("tool", content[:150]))
 
-    # Keep only last 8 turns (16 messages) to prevent context overflow
-    if len(history) > 8:
-        history=history[-8:]
+    # Keep only last 6 turns to prevent context overflow
+    if len(history) > 6:
+        history=history[-6:]
 
     # Separate current user message from history
     current_msg=""
@@ -730,12 +731,22 @@ async def _stream_openai_with_tools(client, query, mode, model_pref, model_name,
         yield f"data: {json.dumps(stop)}\n\n"
     else:
         # No tool calls — emit buffered text as progressive stream
-        for i in range(0, len(full), 80):
-            ct=full[i:i+80]
+        # Emit buffered text progressively in small chunks with delay
+        pos=0
+        while pos < len(full):
+            # Variable chunk size: 15-40 chars, break at word boundaries when possible
+            end=min(pos+30, len(full))
+            # Try to break at space within last 10 chars
+            if end < len(full):
+                space=full.rfind(" ", max(pos, end-10), end+5)
+                if space > pos:
+                    end=space+1
+            ct=full[pos:end]
+            pos=end
             d={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
                "choices": [{"index": 0, "delta": {"content": ct}, "finish_reason": None}]}
             yield f"data: {json.dumps(d)}\n\n"
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.03)
         stop={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
               "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
         yield f"data: {json.dumps(stop)}\n\n"
