@@ -445,6 +445,7 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
     sources=body.get("sources", ["web"])
     tools=body.get("tools", None)
     tool_choice=body.get("tool_choice", "auto")
+    reasoning_effort=body.get("reasoning_effort", None)  # low/medium/high — ignored by Perplexity
 
     # Validate messages
     if messages is None:
@@ -472,6 +473,13 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
         raise HTTPException(403, tier_err)
     if model_name not in mm:
         raise HTTPException(400, f"Unknown model: {model_name}. Available: {list(mm.keys())}")
+
+    # reasoning_effort: auto-upgrade to thinking model if "high" and thinking variant exists
+    if reasoning_effort in ("high",) and not model_name.endswith("-thinking"):
+        thinking_name=f"{model_name}-thinking"
+        if thinking_name in mm:
+            model_name=thinking_name
+            log.info(f"reasoning_effort=high → auto-upgraded to {model_name}")
 
     try:
         mode, model_pref=mm[model_name]
