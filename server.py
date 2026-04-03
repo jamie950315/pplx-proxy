@@ -417,37 +417,32 @@ def _build_tool_prompt(tool_defs: str, tool_choice: str="auto") -> str:
     if tool_choice == "none":
         return ""
     base=(
-        "Tools available:\n" + tool_defs + "\n"
-        "Call format: <tool_call><NAME><PARAM>value</PARAM></NAME></tool_call>\n"
+        tool_defs + "\n"
         "Example: <tool_call><get_weather><city>Tokyo</city></get_weather></tool_call>\n"
-        "When using a tool, output ONLY the XML."
+        "If request matches a tool, respond with ONLY the XML. No other text."
     )
     if tool_choice == "required":
-        return base + " You MUST use a tool now."
+        return base + " You MUST call a tool."
     return base
 
 
 def _tools_to_xml(tools: list) -> str:
-    defs=[]
+    """Semi-compact XML — short enough but model can understand structure."""
+    parts=[]
     for tool in tools:
         if tool.get("type") != "function":
             continue
         fn=tool.get("function", {})
-        name=fn.get("name", "unknown")
-        desc=fn.get("description", "No description")
-        params=fn.get("parameters", {})
-        props=params.get("properties", {})
-        required=set(params.get("required", []))
-        plines=[]
-        for pname, ps in props.items():
-            pt=ps.get("type", "string")
-            pd=ps.get("description", "")
-            req="required" if pname in required else "optional"
-            plines.append(f'    <parameter name="{pname}" type="{pt}" {req}="true">{pd}</parameter>')
-        pblock="\n".join(plines) if plines else "    (none)"
-        defs.append(f'  <tool name="{name}">\n    <description>{desc}</description>\n    <parameters>\n{pblock}\n    </parameters>\n  </tool>')
-    return "\n".join(defs)
-
+        name=fn.get("name", "?")
+        desc=fn.get("description", "")
+        props=fn.get("parameters", {}).get("properties", {})
+        req=set(fn.get("parameters", {}).get("required", []))
+        plist=[]
+        for pn, pi in props.items():
+            pt=pi.get("type", "string")
+            plist.append(f"<{pn} type=\"{pt}\"{'*' if pn in req else ''}/>")
+        parts.append(f"<tool name=\"{name}\">{desc} | {' '.join(plist)}</tool>")
+    return "\n".join(parts)
 
 _TOOL_CALL_RE=_re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", _re.DOTALL)
 
@@ -471,38 +466,60 @@ def _clean_response(text: str, strip: bool=True) -> str:
     return text
 
 
+# Also match bare XML function calls without <tool_call> wrapper
+_BARE_XML_RE=_re.compile(r"<([a-z_][a-z0-9_]*)>\s*(?:<[a-z_].*?</\1>)", _re.DOTALL | _re.IGNORECASE)
+
+def _parse_xml_func(xml_str: str) -> list:
+    """Parse XML into tool_calls list."""
+    calls=[]
+    try:
+        root=_ET.fromstring(f"<root>{xml_str.strip()}</root>")
+        for child in root:
+            fn_name=child.tag
+            if fn_name in ("root",): continue
+            arguments={}
+            for param in child:
+                val=(param.text or "").strip()
+                if val.lower() in ("true", "false"):
+                    arguments[param.tag]=val.lower() == "true"
+                else:
+                    try: arguments[param.tag]=int(val)
+                    except ValueError:
+                        try: arguments[param.tag]=float(val)
+                        except ValueError: arguments[param.tag]=val
+            calls.append({
+                "id": f"call_{uuid4().hex[:24]}",
+                "type": "function",
+                "function": {"name": fn_name, "arguments": json.dumps(arguments)},
+            })
+    except _ET.ParseError:
+        pass
+    return calls
+
 def _parse_tool_calls(text: str) -> tuple:
+    # 1. Try <tool_call> wrapped format first
     matches=_TOOL_CALL_RE.findall(text)
-    if not matches:
-        return [], text
-    tool_calls=[]
-    for xml_str in matches:
-        try:
-            root=_ET.fromstring(f"<root>{xml_str.strip()}</root>")
-            for child in root:
-                fn_name=child.tag
-                arguments={}
-                for param in child:
-                    val=(param.text or "").strip()
-                    if val.lower() in ("true", "false"):
-                        arguments[param.tag]=val.lower() == "true"
-                    else:
-                        try:
-                            arguments[param.tag]=int(val)
-                        except ValueError:
-                            try:
-                                arguments[param.tag]=float(val)
-                            except ValueError:
-                                arguments[param.tag]=val
-                tool_calls.append({
-                    "id": f"call_{uuid4().hex[:24]}",
-                    "type": "function",
-                    "function": {"name": fn_name, "arguments": json.dumps(arguments)},
-                })
-        except _ET.ParseError:
-            continue
-    remaining=_TOOL_CALL_RE.sub("", text).strip()
-    return tool_calls, remaining
+    if matches:
+        tool_calls=[]
+        for xml_str in matches:
+            tool_calls.extend(_parse_xml_func(xml_str))
+        remaining=_TOOL_CALL_RE.sub("", text).strip()
+        if tool_calls:
+            return tool_calls, remaining
+
+    # 2. Try bare XML: response starts with or is primarily XML function calls
+    stripped=text.strip()
+    if stripped.startswith("<") and not stripped.startswith("<p") and not stripped.startswith("<h"):
+        calls=_parse_xml_func(stripped)
+        if calls:
+            # Remove the XML from text to get remaining
+            remaining=stripped
+            for call in calls:
+                fn=call["function"]["name"]
+                remaining=_re.sub(f"<{fn}>.*?</{fn}>", "", remaining, flags=_re.DOTALL).strip()
+            return calls, remaining
+
+    return [], text
 
 
 
@@ -586,9 +603,9 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
         elif role == "tool":
             history.append(("tool", content[:150]))
 
-    # Keep only last 6 turns to prevent context overflow
-    if len(history) > 6:
-        history=history[-6:]
+    # Keep only last 16 items (~8 turns) to prevent context overflow
+    if len(history) > 16:
+        history=history[-16:]
 
     # Separate current user message from history
     current_msg=""
