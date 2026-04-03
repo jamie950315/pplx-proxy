@@ -66,30 +66,16 @@ DEFAULT_HEADERS={
 
 # Default model map — overridden by .models.json if it exists
 _DEFAULT_MODEL_MAP={
-    # Pro Search (current)
     "pplx-auto": ("pro", "pplx_pro"),
-    "pplx-pro-sonar": ("pro", "experimental"),
-    "pplx-pro-gpt5": ("pro", "gpt54"),
-    "pplx-pro-claude": ("pro", "claude46sonnet"),
-    "pplx-pro-gemini": ("pro", "gemini31pro_high"),
-    "pplx-pro-nemotron": ("pro", "nv_nemotron_3_super"),
-    "pplx-pro-opus": ("pro", "claude46opus"),
-    "pplx-pro-grok": ("pro", "grok41nonreasoning"),
-    # Thinking
-    "pplx-pro-gpt5-thinking": ("pro", "gpt54_thinking"),
-    "pplx-pro-claude-thinking": ("pro", "claude46sonnetthinking"),
-    "pplx-pro-opus-thinking": ("pro", "claude46opusthinking"),
-    "pplx-pro-grok-thinking": ("pro", "grok41reasoning"),
-    "pplx-pro-kimi-thinking": ("pro", "kimik2thinking"),
-    "pplx-pro-kimi25-thinking": ("pro", "kimik25thinking"),
-    # Legacy (removed from UI but still functional)
-    "pplx-pro-gpt52": ("pro", "gpt52"),
-    "pplx-pro-gpt52-thinking": ("pro", "gpt52_thinking"),
-    "pplx-pro-claude45": ("pro", "claude45sonnet"),
-    "pplx-pro-claude45-thinking": ("pro", "claude45sonnetthinking"),
-    "pplx-pro-gemini30": ("pro", "gemini30pro"),
-    "pplx-pro-opus45": ("pro", "claude45opus"),
-    # Deep Research & Labs
+    "pplx-sonar": ("pro", "experimental"),
+    "pplx-gpt5": ("pro", "gpt54"),
+    "pplx-gpt5-thinking": ("pro", "gpt54_thinking"),
+    "pplx-gemini": ("pro", "gemini31pro_high"),
+    "pplx-claude": ("pro", "claude46sonnet"),
+    "pplx-claude-thinking": ("pro", "claude46sonnetthinking"),
+    "pplx-opus": ("pro", "claude46opus"),
+    "pplx-opus-thinking": ("pro", "claude46opusthinking"),
+    "pplx-nemotron": ("pro", "nv_nemotron_3_super"),
     "pplx-deep-research": ("pro", "pplx_alpha"),
     "pplx-labs": ("pro", "pplx_beta"),
 }
@@ -663,9 +649,7 @@ if HAS_MCP:
         if not query or not query.strip():
             return "Error: query cannot be empty"
         mm=get_model_map()
-        shorthand={"gpt5": "pplx-pro-gpt5-thinking", "claude": "pplx-pro-claude-thinking",
-                    "opus": "pplx-pro-opus-thinking", "gemini": "pplx-pro-gemini",
-                    "nemotron": "pplx-pro-nemotron"}
+        shorthand={"gpt5": "pplx-gpt5-thinking", "claude": "pplx-claude-thinking", "opus": "pplx-opus-thinking", "gemini": "pplx-gemini", "nemotron": "pplx-nemotron"}
         if model == "default":
             mode, pref="reasoning", "pplx_reasoning"
         elif model in mm:
