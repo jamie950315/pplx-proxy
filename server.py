@@ -701,9 +701,15 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
         if isinstance(content, list):
             text_parts=[ct.get("text", "") for ct in content if ct.get("type") == "text"]
             content=" ".join(text_parts)
-        # Handle empty assistant messages (common after tool_calls)
-        if role == "assistant" and (not content or not content.strip()):
-            content="[done]"
+        # Handle assistant messages with tool_calls
+        if role == "assistant":
+            tc = msg.get("tool_calls") or []
+            if tc and (not content or not content.strip()):
+                # Extract tool call info for context
+                tc_info = ", ".join(f"{t['function']['name']}({t['function'].get('arguments','{}')})" for t in tc if t.get("function"))
+                content = f"[Called tools: {tc_info[:300]}]"
+            elif not content or not content.strip():
+                content = "[done]"
         elif not content or not content.strip():
             continue
         if role == "system":
@@ -711,14 +717,14 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
         elif role == "user":
             history.append(("user", content))
         elif role == "assistant":
-            # Short truncation — only keep first 200 chars of assistant history
-            if len(content) > 200:
-                content=content[:200] + "..."
+            # Keep enough context per assistant message
+            if len(content) > 600:
+                content=content[:600] + "..."
             history.append(("assistant", content))
         elif role == "tool":
             # Format tool results clearly for the model
             tid=msg.get("tool_call_id", "")
-            history.append(("tool", f"Result: {content[:150]}"))
+            history.append(("tool", f"Result: {content[:400]}"))
 
     # Keep only last 16 items (~8 turns) to prevent context overflow
     if len(history) > 16:
