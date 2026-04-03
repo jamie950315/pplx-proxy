@@ -464,14 +464,16 @@ _GROK_SELF_RE=_clean_re.compile(r'<grok:[^>]*/>')
 _MULTI_SPACE=_clean_re.compile(r' {2,}')
 _MULTI_NL=_clean_re.compile(r'\n{3,}')
 
-def _clean_response(text: str) -> str:
+def _clean_response(text: str, strip: bool=True) -> str:
     """Strip Perplexity citations and internal tags."""
     text=_CITATION_RE.sub('', text)
     text=_GROK_TAG_RE.sub('', text)
     text=_GROK_SELF_RE.sub('', text)
-    text=_MULTI_SPACE.sub(' ', text)
-    text=_MULTI_NL.sub('\n\n', text)
-    return text.strip()
+    if strip:
+        text=_MULTI_SPACE.sub(' ', text)
+        text=_MULTI_NL.sub('\n\n', text)
+        text=text.strip()
+    return text
 
 
 def _parse_tool_calls(text: str) -> tuple:
@@ -721,28 +723,11 @@ async def _stream_openai(client, query, mode, model_pref, model_name, cid, creat
 
         dt=chunk.get("delta", "")
         if dt:
-            # Break large deltas into word-sized chunks for real streaming
-            if len(dt) > 100:
-                words=dt.split(" ")
-                buf=""
-                for w in words:
-                    buf+=(" " if buf else "") + w
-                    if len(buf) >= 20:
-                        d={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
-                           "choices": [{"index": 0, "delta": {"content": buf}, "finish_reason": None}]}
-                        yield f"data: {json.dumps(d)}\n\n"
-                        buf=""
-                        await asyncio.sleep(0.02)
-                if buf:
-                    d={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
-                       "choices": [{"index": 0, "delta": {"content": buf}, "finish_reason": None}]}
-                    yield f"data: {json.dumps(d)}\n\n"
-            else:
-                dt=_clean_response(dt)
-                if dt:
-                    d={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
-                       "choices": [{"index": 0, "delta": {"content": dt}, "finish_reason": None}]}
-                    yield f"data: {json.dumps(d)}\n\n"
+            dt=_clean_response(dt, strip=False)
+            if dt:
+                d={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
+                   "choices": [{"index": 0, "delta": {"content": dt}, "finish_reason": None}]}
+                yield f"data: {json.dumps(d)}\n\n"
 
         if chunk.get("done"):
             wr=chunk.get("web_results", [])
