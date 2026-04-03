@@ -368,6 +368,17 @@ app=FastAPI(title="pplx-proxy", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
+from fastapi.responses import FileResponse as _FileResponse
+from pathlib import Path as _StaticPath
+
+@app.get("/chat")
+async def chat_ui():
+    """Debug chat interface."""
+    p=_StaticPath(__file__).parent / "static" / "chat.html"
+    if p.exists():
+        return _FileResponse(p, media_type="text/html")
+    raise HTTPException(404, "chat.html not found")
+
 @app.get("/health")
 async def health():
     cache_age=None

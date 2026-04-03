@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>pplx-proxy debug</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#e6edf3;--dim:#8b949e;--accent:#58a6ff;--green:#3fb950;--red:#f85149;--yellow:#d29922;--thinking:#1f2937;--font:'SF Mono',Consolas,monospace}
+body{font-family:var(--font);background:var(--bg);color:var(--text);height:100vh;display:flex;flex-direction:column}
+.header{padding:10px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;flex-shrink:0;flex-wrap:wrap}
+.header h1{font-size:13px;color:var(--accent)}
+.header select,.header input{background:var(--card);border:1px solid var(--border);color:var(--text);padding:3px 6px;border-radius:4px;font:11px var(--font)}
+.header label{font-size:10px;color:var(--dim);display:flex;align-items:center;gap:3px}
+.header input[type=checkbox]{width:auto}
+.main{flex:1;display:flex;overflow:hidden}
+.chat-panel{flex:1;display:flex;flex-direction:column;overflow:hidden}
+.debug-panel{width:380px;border-left:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
+.debug-header{padding:6px 10px;border-bottom:1px solid var(--border);font-size:10px;color:var(--dim);display:flex;justify-content:space-between}
+.debug-body{flex:1;overflow-y:auto;padding:6px;font-size:10px;white-space:pre-wrap;word-break:break-all;color:var(--dim)}
+.messages{flex:1;overflow-y:auto;padding:12px}
+.msg{margin-bottom:10px;padding:8px 12px;border-radius:6px;max-width:85%;font-size:12px;line-height:1.5}
+.msg.user{background:#1f6feb33;margin-left:auto;border:1px solid #1f6feb55}
+.msg.assistant{background:var(--card);border:1px solid var(--border)}
+.msg.error{background:#f8514922;border:1px solid #f8514955;color:var(--red)}
+.msg .thinking{background:var(--thinking);padding:6px;border-radius:4px;margin-bottom:6px;font-size:10px;color:var(--yellow);border-left:3px solid var(--yellow);max-height:150px;overflow-y:auto}
+.msg .thinking-label{font-size:9px;color:var(--dim);margin-bottom:3px;text-transform:uppercase}
+.msg .tool-calls{background:#3fb95011;padding:6px;border-radius:4px;margin-bottom:6px;font-size:10px;color:var(--green);border-left:3px solid var(--green)}
+.msg .meta{font-size:9px;color:var(--dim);margin-top:4px}
+.msg .warn{font-size:10px;color:var(--red);margin-top:3px}
+.input-bar{padding:10px 14px;border-top:1px solid var(--border);display:flex;gap:6px;flex-shrink:0}
+.input-bar input{flex:1;background:var(--card);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:5px;font:12px var(--font)}
+.input-bar button{background:var(--accent);color:#fff;border:none;padding:6px 14px;border-radius:5px;cursor:pointer;font:11px var(--font);font-weight:600}
+.input-bar button:disabled{opacity:0.4}
+.input-bar button.secondary{background:var(--border)}
+.badge{display:inline-block;padding:1px 5px;border-radius:3px;font-size:9px;font-weight:600}
+.badge.ok{background:#3fb95033;color:var(--green)}
+.badge.tool{background:#58a6ff33;color:var(--accent)}
+.status{font-size:10px;color:var(--dim)}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>pplx-proxy debug</h1>
+  <select id="model"><option value="gpt">gpt</option><option value="sonnet" selected>sonnet</option><option value="gemini">gemini</option><option value="nemotron">nemotron</option><option value="sonar">sonar</option><option value="auto">auto</option></select>
+  <label><input type="checkbox" id="thinking"> thinking</label>
+  <label><input type="checkbox" id="stream" checked> stream</label>
+  <input id="api_key" placeholder="API key" style="width:100px">
+  <span class="status" id="status">ready</span>
+</div>
+<div class="main">
+  <div class="chat-panel">
+    <div class="messages" id="messages"></div>
+    <div class="input-bar">
+      <input id="input" placeholder="Type a message..." autofocus>
+      <button id="send" onclick="sendMessage()">Send</button>
+      <button class="secondary" onclick="clearChat()">Clear</button>
+    </div>
+  </div>
+  <div class="debug-panel">
+    <div class="debug-header"><span>Raw Response</span><span id="debug-meta"></span></div>
+    <div class="debug-body" id="debug"></div>
+  </div>
+</div>
+<script>
+const API_BASE=window.location.origin;
+let history=[];
+let debugEl=document.getElementById('debug');
+let messagesEl=document.getElementById('messages');
+let statusEl=document.getElementById('status');
+let debugMetaEl=document.getElementById('debug-meta');
+
+document.getElementById('input').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey)sendMessage()});
+
+function log(t){debugEl.textContent+=t+'\n';debugEl.scrollTop=debugEl.scrollHeight}
+function esc(s){return(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+
+function addMsg(role,content,extra={}){
+  let div=document.createElement('div');
+  div.className='msg '+role;
+  let html='';
+  if(extra.reasoning_content){
+    html+=`<div class="thinking"><div class="thinking-label">🧠 reasoning_content</div>${esc(extra.reasoning_content)}</div>`;
+  }
+  if(extra.tool_calls){
+    html+=`<div class="tool-calls">🔧 tool_calls:\n${extra.tool_calls.map(tc=>`  ${tc.function?.name}(${tc.function?.arguments})`).join('\n')}</div>`;
+  }
+  let cleaned=content||'';
+  let cites=cleaned.match(/\[\d+\]/g);
+  html+=`<div>${esc(cleaned)}</div>`;
+  if(cites)html+=`<div class="warn">⚠️ Raw citations: ${cites.join(' ')}</div>`;
+  if(extra.finish_reason)html+=`<div class="meta">finish: <span class="badge ${extra.finish_reason==='stop'?'ok':'tool'}">${extra.finish_reason}</span> | model: ${extra.model||'?'}</div>`;
+  div.innerHTML=html;
+  messagesEl.appendChild(div);
+  messagesEl.scrollTop=messagesEl.scrollHeight;
+  return div;
+}
+
+function clearChat(){history=[];messagesEl.innerHTML='';debugEl.textContent='';log('cleared\n')}
+
+async function sendMessage(){
+  let input=document.getElementById('input');
+  let text=input.value.trim();
+  if(!text)return;
+  input.value='';
+  let model=document.getElementById('model').value;
+  let thinking=document.getElementById('thinking').checked;
+  let stream=document.getElementById('stream').checked;
+  let apiKey=document.getElementById('api_key').value;
+  history.push({role:'user',content:text});
+  addMsg('user',text);
+  let body={model,messages:[...history],stream,thinking};
+  log('\n=== REQ ===\n'+JSON.stringify(body,null,2));
+  statusEl.textContent='...';
+  document.getElementById('send').disabled=true;
+  let headers={'Content-Type':'application/json'};
+  if(apiKey)headers['Authorization']='Bearer '+apiKey;
+  try{
+    let t0=Date.now();
+    let resp=await fetch(API_BASE+'/v1/chat/completions',{method:'POST',headers,body:JSON.stringify(body)});
+    if(!resp.ok){let e=await resp.text();throw new Error(`HTTP ${resp.status}: ${e}`);}
+    if(!stream){
+      let data=await resp.json();
+      log('\n=== RESP ('+((Date.now()-t0)/1000).toFixed(1)+'s) ===\n'+JSON.stringify(data,null,2));
+      let msg=data.choices?.[0]?.message||{};
+      let fr=data.choices?.[0]?.finish_reason||'?';
+      history.push({role:'assistant',content:msg.content||''});
+      addMsg('assistant',msg.content,{reasoning_content:msg.reasoning_content,tool_calls:msg.tool_calls,finish_reason:fr,model:data.model});
+      debugMetaEl.textContent=`${fr} | ${data.model} | ${((Date.now()-t0)/1000).toFixed(1)}s`;
+    } else {
+      let reader=resp.body.getReader();
+      let decoder=new TextDecoder();
+      let buffer='',fullContent='',fullReasoning='',toolCalls=null,finishReason=null,respModel=model;
+      let msgDiv=addMsg('assistant','');
+      log('\n=== STREAM ===');
+      while(true){
+        let{done,value}=await reader.read();
+        if(done)break;
+        buffer+=decoder.decode(value,{stream:true});
+        let lines=buffer.split('\n');buffer=lines.pop();
+        for(let line of lines){
+          if(!line.startsWith('data: '))continue;
+          let d=line.slice(6).trim();
+          if(d==='[DONE]'){log('[DONE]');continue}
+          try{
+            let chunk=JSON.parse(d);
+            let delta=chunk.choices?.[0]?.delta||{};
+            let fr=chunk.choices?.[0]?.finish_reason;
+            respModel=chunk.model||respModel;
+            if(delta.reasoning_content){fullReasoning+=delta.reasoning_content;log('δ think: '+delta.reasoning_content.slice(0,50))}
+            if(delta.content)fullContent+=delta.content;
+            if(delta.tool_calls){toolCalls=delta.tool_calls;log('δ tools: '+JSON.stringify(delta.tool_calls))}
+            if(fr){finishReason=fr;log('finish: '+fr)}
+          }catch(e){log('err: '+e.message)}
+        }
+        let html='';
+        if(fullReasoning)html+=`<div class="thinking"><div class="thinking-label">🧠 reasoning_content</div>${esc(fullReasoning)}</div>`;
+        if(toolCalls)html+=`<div class="tool-calls">🔧 tool_calls:\n${toolCalls.map(tc=>`  ${tc.function?.name}(${tc.function?.arguments})`).join('\n')}</div>`;
+        let cites=fullContent.match(/\[\d+\]/g);
+        html+=`<div>${esc(fullContent)}</div>`;
+        if(cites)html+=`<div class="warn">⚠️ Raw citations: ${cites.join(' ')}</div>`;
+        if(finishReason)html+=`<div class="meta">finish: <span class="badge ${finishReason==='stop'?'ok':'tool'}">${finishReason}</span> | ${respModel} | ${((Date.now()-t0)/1000).toFixed(1)}s</div>`;
+        msgDiv.innerHTML=html;
+        messagesEl.scrollTop=messagesEl.scrollHeight;
+      }
+      history.push({role:'assistant',content:fullContent});
+      debugMetaEl.textContent=`${finishReason} | ${respModel} | ${fullContent.length}ch | ${((Date.now()-t0)/1000).toFixed(1)}s`;
+    }
+  }catch(e){
+    log('\n=== ERR ===\n'+e.message);
+    addMsg('error',e.message);
+  }
+  statusEl.textContent='ready';
+  document.getElementById('send').disabled=false;
+  document.getElementById('input').focus();
+}
+</script>
+</body>
+</html>
