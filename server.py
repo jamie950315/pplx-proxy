@@ -349,6 +349,89 @@ async def list_models(_=Depends(verify_api_key)):
     return {"object": "list", "data": models, "default_model": DEFAULT_MODEL, "account_type": ACCOUNT_TYPE}
 
 
+# ─── Tool Calling Support ──────────────────────────────────────────────────
+
+import xml.etree.ElementTree as _ET
+import re as _re
+
+def _build_tool_prompt(tool_defs: str, tool_choice: str="auto") -> str:
+    base=(
+        "You have access to tools. When calling a tool, use this EXACT XML format:\n"
+        "<tool_call>\n<function_name>\n<param>value</param>\n</function_name>\n</tool_call>\n\n"
+        "Available tools:\n" + tool_defs + "\n\n"
+        "Example — get_weather(location=Tokyo):\n"
+        "<tool_call>\n<get_weather>\n<location>Tokyo</location>\n</get_weather>\n</tool_call>\n\n"
+        "Rules: Each param is its own XML element. Root element = function name. "
+        "Multiple calls = multiple <tool_call> blocks. "
+        "When calling a tool, output ONLY the XML, nothing else."
+    )
+    if tool_choice == "required":
+        return base + "\nYou MUST call at least one tool. Do NOT respond with plain text."
+    elif tool_choice == "none":
+        return ""  # no tool prompt
+    else:  # auto
+        return base + "\nOnly use tools when the user\'s request specifically needs one. If you can answer directly, respond normally WITHOUT <tool_call> tags."
+
+
+def _tools_to_xml(tools: list) -> str:
+    defs=[]
+    for tool in tools:
+        if tool.get("type") != "function":
+            continue
+        fn=tool.get("function", {})
+        name=fn.get("name", "unknown")
+        desc=fn.get("description", "No description")
+        params=fn.get("parameters", {})
+        props=params.get("properties", {})
+        required=set(params.get("required", []))
+        plines=[]
+        for pname, ps in props.items():
+            pt=ps.get("type", "string")
+            pd=ps.get("description", "")
+            req="required" if pname in required else "optional"
+            plines.append(f'    <parameter name="{pname}" type="{pt}" {req}="true">{pd}</parameter>')
+        pblock="\n".join(plines) if plines else "    (none)"
+        defs.append(f'  <tool name="{name}">\n    <description>{desc}</description>\n    <parameters>\n{pblock}\n    </parameters>\n  </tool>')
+    return "\n".join(defs)
+
+
+_TOOL_CALL_RE=_re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", _re.DOTALL)
+
+def _parse_tool_calls(text: str) -> tuple:
+    matches=_TOOL_CALL_RE.findall(text)
+    if not matches:
+        return [], text
+    tool_calls=[]
+    for xml_str in matches:
+        try:
+            root=_ET.fromstring(f"<root>{xml_str.strip()}</root>")
+            for child in root:
+                fn_name=child.tag
+                arguments={}
+                for param in child:
+                    val=(param.text or "").strip()
+                    if val.lower() in ("true", "false"):
+                        arguments[param.tag]=val.lower() == "true"
+                    else:
+                        try:
+                            arguments[param.tag]=int(val)
+                        except ValueError:
+                            try:
+                                arguments[param.tag]=float(val)
+                            except ValueError:
+                                arguments[param.tag]=val
+                tool_calls.append({
+                    "id": f"call_{uuid4().hex[:24]}",
+                    "type": "function",
+                    "function": {"name": fn_name, "arguments": json.dumps(arguments)},
+                })
+        except _ET.ParseError:
+            continue
+    remaining=_TOOL_CALL_RE.sub("", text).strip()
+    return tool_calls, remaining
+
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, _=Depends(verify_api_key)):
     try:
@@ -360,6 +443,8 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
     stream=body.get("stream", False)
     language=body.get("language", "en-US")
     sources=body.get("sources", ["web"])
+    tools=body.get("tools", None)
+    tool_choice=body.get("tool_choice", "auto")
 
     # Validate messages
     if messages is None:
@@ -410,11 +495,26 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
             parts.append(f"[Tool Result]: {content}")
     query="\n\n".join(parts)
 
+    # Tool calling: inject tool definitions into query
+    if tools and isinstance(tools, list) and len(tools) > 0 and tool_choice != "none":
+        tool_defs=_tools_to_xml(tools)
+        if tool_defs:
+            tool_prompt=_build_tool_prompt(tool_defs, tool_choice)
+            if tool_prompt:
+                query=f"{query}\n\n---\n{tool_prompt}"
+
     client=get_client()
     cid=f"chatcmpl-{uuid4().hex[:12]}"
     created=int(time.time())
 
     if stream:
+        # With tools: buffer response to detect tool calls, then emit appropriately
+        if tools and isinstance(tools, list) and len(tools) > 0:
+            return StreamingResponse(
+                _stream_openai_with_tools(client, query, mode, model_pref, model_name, cid, created, sources, language),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
         return StreamingResponse(
             _stream_openai(client, query, mode, model_pref, model_name, cid, created, sources, language),
             media_type="text/event-stream",
@@ -430,11 +530,74 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
             break
         full=chunk.get("answer", full)
 
+    # Check for tool calls in response
+    if tools and isinstance(tools, list):
+        tool_calls, remaining=_parse_tool_calls(full)
+        if tool_calls:
+            msg={"role": "assistant", "content": remaining if remaining else None, "tool_calls": tool_calls}
+            return {
+                "id": cid, "object": "chat.completion", "created": created, "model": model_name,
+                "choices": [{"index": 0, "message": msg, "finish_reason": "tool_calls"}],
+                "usage": {"prompt_tokens": len(query)//4, "completion_tokens": len(full)//4, "total_tokens": (len(query)+len(full))//4},
+            }
+
     return {
         "id": cid, "object": "chat.completion", "created": created, "model": model_name,
         "choices": [{"index": 0, "message": {"role": "assistant", "content": full}, "finish_reason": "stop"}],
         "usage": {"prompt_tokens": len(query)//4, "completion_tokens": len(full)//4, "total_tokens": (len(query)+len(full))//4},
     }
+
+
+async def _stream_openai_with_tools(client, query, mode, model_pref, model_name, cid, created, sources, language):
+    """Stream with tool call detection: buffer response, check for tool_calls, then emit."""
+    full=""
+    async for chunk in client.search(query, mode, model_pref, sources, language):
+        if chunk.get("error"):
+            e={"id": f"chatcmpl-{uuid4().hex[:12]}", "object": "chat.completion.chunk", "created": int(time.time()), "model": model_name,
+               "choices": [{"index": 0, "delta": {"content": f"[Error: {chunk['error']}]"}, "finish_reason": None}]}
+            yield f"data: {json.dumps(e)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+        if chunk.get("done"):
+            full=chunk.get("answer", full)
+            break
+        full=chunk.get("answer", full)
+
+    cid=f"chatcmpl-{uuid4().hex[:12]}"
+    created=int(time.time())
+
+    # Check for tool calls
+    tool_calls, remaining=_parse_tool_calls(full)
+    if tool_calls:
+        # Emit as tool_calls in a single chunk
+        msg_delta={"role": "assistant", "tool_calls": []}
+        for i, tc in enumerate(tool_calls):
+            msg_delta["tool_calls"].append({
+                "index": i, "id": tc["id"], "type": "function",
+                "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]},
+            })
+        init={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
+              "choices": [{"index": 0, "delta": msg_delta, "finish_reason": None}]}
+        yield f"data: {json.dumps(init)}\n\n"
+        stop={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
+              "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}
+        yield f"data: {json.dumps(stop)}\n\n"
+        yield "data: [DONE]\n\n"
+    else:
+        # No tool calls — emit buffered text as stream
+        init={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
+              "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
+        yield f"data: {json.dumps(init)}\n\n"
+        # Emit content in chunks
+        for i in range(0, len(full), 50):
+            chunk_text=full[i:i+50]
+            d={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
+               "choices": [{"index": 0, "delta": {"content": chunk_text}, "finish_reason": None}]}
+            yield f"data: {json.dumps(d)}\n\n"
+        stop={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
+              "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+        yield f"data: {json.dumps(stop)}\n\n"
+        yield "data: [DONE]\n\n"
 
 
 async def _stream_openai(client, query, mode, model_pref, model_name, cid, created, sources, language):
