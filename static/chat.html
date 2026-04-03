@@ -46,6 +46,7 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);height:100vh
   <label><input type="checkbox" id="thinking"> thinking</label>
   <label><input type="checkbox" id="stream" checked> stream</label>
   <input id="api_key" placeholder="API key" style="width:100px">
+  <button id="tools-btn" onclick="toggleTools()" style="background:var(--border);color:var(--text);border:none;padding:3px 8px;border-radius:4px;cursor:pointer;font:10px var(--font)">Tools OFF</button>
   <span class="status" id="status">ready</span>
 </div>
 <div class="main">
@@ -98,7 +99,7 @@ function addMsg(role,content,extra={}){
 
 function clearChat(){history=[];messagesEl.innerHTML='';debugEl.textContent='';log('cleared\n')}
 
-async function sendMessage(){
+async function _sendMessageOriginal_unused(){
   let input=document.getElementById('input');
   let text=input.value.trim();
   if(!text)return;
@@ -174,6 +175,104 @@ async function sendMessage(){
   document.getElementById('send').disabled=false;
   document.getElementById('input').focus();
 }
+
+// Test tools for tool calling
+const TEST_TOOLS=[
+  {type:"function",function:{name:"get_weather",description:"Get current weather for a city",parameters:{type:"object",properties:{city:{type:"string",description:"City name"},units:{type:"string",enum:["celsius","fahrenheit"],description:"Temperature unit"}},required:["city"]}}},
+  {type:"function",function:{name:"calculator",description:"Evaluate a math expression",parameters:{type:"object",properties:{expression:{type:"string",description:"Math expression to evaluate"}},required:["expression"]}}},
+  {type:"function",function:{name:"search_web",description:"Search the web for information",parameters:{type:"object",properties:{query:{type:"string",description:"Search query"},max_results:{type:"integer",description:"Max results to return"}},required:["query"]}}},
+  {type:"function",function:{name:"get_user",description:"Look up a user by ID from the database",parameters:{type:"object",properties:{user_id:{type:"integer",description:"User ID"}},required:["user_id"]}}},
+  {type:"function",function:{name:"send_email",description:"Send an email to a recipient",parameters:{type:"object",properties:{to:{type:"string",description:"Recipient email"},subject:{type:"string",description:"Email subject"},body:{type:"string",description:"Email body"}},required:["to","subject","body"]}}},
+];
+
+let toolsEnabled=false;
+function toggleTools(){
+  toolsEnabled=!toolsEnabled;
+  document.getElementById('tools-btn').style.background=toolsEnabled?'var(--green)':'var(--border)';
+  document.getElementById('tools-btn').textContent=toolsEnabled?'Tools ON':'Tools OFF';
+  log(toolsEnabled?'Tools enabled: '+TEST_TOOLS.map(t=>t.function.name).join(', '):'Tools disabled');
+}
+
+// Patch sendMessage to include tools
+const _origSend=sendMessage;
+sendMessage=async function(){
+  let input=document.getElementById('input');
+  let text=input.value.trim();
+  if(!text)return;
+  input.value='';
+  let model=document.getElementById('model').value;
+  let thinking=document.getElementById('thinking').checked;
+  let stream=document.getElementById('stream').checked;
+  let apiKey=document.getElementById('api_key').value;
+  history.push({role:'user',content:text});
+  addMsg('user',text);
+  let body={model,messages:[...history],stream,thinking};
+  if(toolsEnabled)body.tools=TEST_TOOLS;
+  log('\n=== REQ ===\n'+JSON.stringify(body,null,2));
+  statusEl.textContent='...';
+  document.getElementById('send').disabled=true;
+  let headers={'Content-Type':'application/json'};
+  if(apiKey)headers['Authorization']='Bearer '+apiKey;
+  try{
+    let t0=Date.now();
+    let resp=await fetch(API_BASE+'/v1/chat/completions',{method:'POST',headers,body:JSON.stringify(body)});
+    if(!resp.ok){let e=await resp.text();throw new Error('HTTP '+resp.status+': '+e);}
+    if(!stream){
+      let data=await resp.json();
+      log('\n=== RESP ('+((Date.now()-t0)/1000).toFixed(1)+'s) ===\n'+JSON.stringify(data,null,2));
+      let msg=data.choices?.[0]?.message||{};
+      let fr=data.choices?.[0]?.finish_reason||'?';
+      history.push({role:'assistant',content:msg.content||'',tool_calls:msg.tool_calls});
+      addMsg('assistant',msg.content,{reasoning_content:msg.reasoning_content,tool_calls:msg.tool_calls,finish_reason:fr,model:data.model});
+      debugMetaEl.textContent=fr+' | '+data.model+' | '+((Date.now()-t0)/1000).toFixed(1)+'s';
+    } else {
+      let reader=resp.body.getReader();
+      let decoder=new TextDecoder();
+      let buffer='',fullContent='',fullReasoning='',toolCalls=null,finishReason=null,respModel=model;
+      let msgDiv=addMsg('assistant','');
+      log('\n=== STREAM ===');
+      while(true){
+        let{done,value}=await reader.read();
+        if(done)break;
+        buffer+=decoder.decode(value,{stream:true});
+        let lines=buffer.split('\n');buffer=lines.pop();
+        for(let line of lines){
+          if(!line.startsWith('data: '))continue;
+          let d=line.slice(6).trim();
+          if(d==='[DONE]'){log('[DONE]');continue}
+          try{
+            let chunk=JSON.parse(d);
+            let delta=chunk.choices?.[0]?.delta||{};
+            let fr=chunk.choices?.[0]?.finish_reason;
+            respModel=chunk.model||respModel;
+            if(delta.reasoning_content){fullReasoning+=delta.reasoning_content;log('δ think: '+delta.reasoning_content.slice(0,50))}
+            if(delta.content)fullContent+=delta.content;
+            if(delta.tool_calls){toolCalls=delta.tool_calls;log('δ tools: '+JSON.stringify(delta.tool_calls))}
+            if(fr){finishReason=fr;log('finish: '+fr)}
+          }catch(e){log('err: '+e.message)}
+        }
+        let html='';
+        if(fullReasoning)html+='<div class="thinking"><div class="thinking-label">🧠 reasoning_content</div>'+esc(fullReasoning)+'</div>';
+        if(toolCalls)html+='<div class="tool-calls">🔧 tool_calls:\n'+toolCalls.map(tc=>'  '+tc.function?.name+'('+tc.function?.arguments+')').join('\n')+'</div>';
+        let cites=fullContent.match(/\[\d+\]/g);
+        html+='<div>'+esc(fullContent)+'</div>';
+        if(cites)html+='<div class="warn">⚠️ Raw citations: '+cites.join(' ')+'</div>';
+        if(finishReason)html+='<div class="meta">finish: <span class="badge '+(finishReason==='stop'?'ok':'tool')+'">'+finishReason+'</span> | '+respModel+' | '+((Date.now()-t0)/1000).toFixed(1)+'s</div>';
+        msgDiv.innerHTML=html;
+        messagesEl.scrollTop=messagesEl.scrollHeight;
+      }
+      history.push({role:'assistant',content:fullContent});
+      debugMetaEl.textContent=(finishReason||'?')+' | '+respModel+' | '+fullContent.length+'ch | '+((Date.now()-t0)/1000).toFixed(1)+'s';
+    }
+  }catch(e){
+    log('\n=== ERR ===\n'+e.message);
+    addMsg('error',e.message);
+  }
+  statusEl.textContent='ready';
+  document.getElementById('send').disabled=false;
+  document.getElementById('input').focus();
+};
+
 </script>
 </body>
 </html>
