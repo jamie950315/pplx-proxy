@@ -31,7 +31,8 @@ PORT=int(os.getenv("PPLX_PROXY_PORT", "8892"))
 LOG_LEVEL=os.getenv("LOG_LEVEL", "INFO")
 COOKIE_FILE=Path(__file__).parent / ".cookie_cache.json"
 MODELS_FILE=Path(__file__).parent / ".models.json"
-DEFAULT_MODEL=os.getenv("DEFAULT_MODEL", "pplx-pro")
+DEFAULT_MODEL=os.getenv("DEFAULT_MODEL", "pplx-gpt5")
+ACCOUNT_TYPE=os.getenv("ACCOUNT_TYPE", "pro").lower()  # free, pro, max
 PUBLIC_URL=os.getenv("PUBLIC_URL", "http://localhost:8892")
 PPLX_API_VERSION=os.getenv("PPLX_API_VERSION", "2.18")
 PPLX_IMPERSONATE=os.getenv("PPLX_IMPERSONATE", "chrome")
@@ -65,7 +66,9 @@ DEFAULT_HEADERS={
 }
 
 # Default model map — overridden by .models.json if it exists
-_DEFAULT_MODEL_MAP={
+# All known models (superset)
+_ALL_MODELS={
+    "pplx-auto": ("pro", "pplx_pro"),
     "pplx-sonar": ("pro", "experimental"),
     "pplx-gpt5": ("pro", "gpt54"),
     "pplx-gpt5-thinking": ("pro", "gpt54_thinking"),
@@ -77,6 +80,22 @@ _DEFAULT_MODEL_MAP={
     "pplx-nemotron": ("pro", "nv_nemotron_3_super"),
 }
 
+# Model availability per account tier
+_TIER_MODELS={
+    "free": {"pplx-auto"},
+    "pro": {"pplx-auto", "pplx-sonar", "pplx-gpt5", "pplx-gpt5-thinking",
+            "pplx-gemini", "pplx-claude", "pplx-claude-thinking",
+            "pplx-nemotron"},
+    "max": {"pplx-auto", "pplx-sonar", "pplx-gpt5", "pplx-gpt5-thinking",
+            "pplx-gemini", "pplx-claude", "pplx-claude-thinking",
+            "pplx-nemotron", "pplx-opus", "pplx-opus-thinking"},
+}
+
+def _default_model_map() -> dict:
+    """Return default model map filtered by account tier."""
+    allowed=_TIER_MODELS.get(ACCOUNT_TYPE, _TIER_MODELS["pro"])
+    return {k: v for k, v in _ALL_MODELS.items() if k in allowed}
+
 def load_model_map() -> dict:
     """Load model map from .models.json or use defaults."""
     if MODELS_FILE.exists():
@@ -86,7 +105,7 @@ def load_model_map() -> dict:
             return {k: tuple(v) for k, v in data.items()}
         except Exception as e:
             log.warning(f"Failed to load {MODELS_FILE}: {e}")
-    return _DEFAULT_MODEL_MAP.copy()
+    return _default_model_map()
 
 def save_model_map(mm: dict):
     """Save model map to .models.json."""
@@ -94,10 +113,22 @@ def save_model_map(mm: dict):
     MODELS_FILE.write_text(json.dumps(data, indent=2))
     log.info(f"Model map saved ({len(mm)} models)")
 
+def check_tier(model_name: str) -> str:
+    """Check if model is available for current account tier. Returns error msg or empty string."""
+    allowed=_TIER_MODELS.get(ACCOUNT_TYPE, _TIER_MODELS["pro"])
+    if model_name not in allowed:
+        if model_name in _ALL_MODELS:
+            # Model exists but not in this tier
+            needed="max" if model_name in _TIER_MODELS["max"] else "pro"
+            return f"Model '{model_name}' requires {needed} tier (current: {ACCOUNT_TYPE})"
+        return ""  # unknown model, let model_map handle it
+    return ""
+
 def get_model_map() -> dict:
-    """Get current model map (cached in module global)."""
+    """Get current model map filtered by account tier."""
     global MODEL_MAP
-    return MODEL_MAP
+    allowed=_TIER_MODELS.get(ACCOUNT_TYPE, _TIER_MODELS["pro"])
+    return {k: v for k, v in MODEL_MAP.items() if k in allowed}
 
 MODEL_MAP=load_model_map()
 
@@ -309,7 +340,7 @@ async def list_models(_=Depends(verify_api_key)):
     models=[]
     for mid, (mode, pref) in mm.items():
         models.append({"id": mid, "object": "model", "created": 1700000000, "owned_by": "perplexity", "mode": mode, "internal_pref": pref})
-    return {"object": "list", "data": models, "default_model": DEFAULT_MODEL}
+    return {"object": "list", "data": models, "default_model": DEFAULT_MODEL, "account_type": ACCOUNT_TYPE}
 
 
 @app.post("/v1/chat/completions")
@@ -344,6 +375,9 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
             raise HTTPException(400, f"messages[{i}] missing required field: content")
 
     mm=get_model_map()
+    tier_err=check_tier(model_name)
+    if tier_err:
+        raise HTTPException(403, tier_err)
     if model_name not in mm:
         raise HTTPException(400, f"Unknown model: {model_name}. Available: {list(mm.keys())}")
 
@@ -634,6 +668,9 @@ if HAS_MCP:
             return "Error: query cannot be empty"
         mm=get_model_map()
         model_id=DEFAULT_MODEL if model == "default" else model
+        tier_err=check_tier(model_id)
+        if tier_err:
+            return f"Error: {tier_err}"
         if model_id not in mm:
             avail=", ".join(sorted(mm.keys()))
             return f"Error: Unknown model '{model_id}'. Available models: {avail}"
@@ -672,15 +709,18 @@ if HAS_MCP:
             return "Error: query cannot be empty"
         mm=get_model_map()
         shorthand={"gpt5": "pplx-gpt5-thinking", "claude": "pplx-claude-thinking", "opus": "pplx-opus-thinking", "gemini": "pplx-gemini", "nemotron": "pplx-nemotron"}
+        resolved=model
         if model == "default":
-            mode, pref="reasoning", "pplx_reasoning"
-        elif model in mm:
-            mode, pref=mm[model]
-        elif model in shorthand and shorthand[model] in mm:
-            mode, pref=mm[shorthand[model]]
-        else:
-            avail=["default"] + list(shorthand.keys()) + [k for k in mm if "reasoning" in k]
+            resolved="pplx-gpt5-thinking"
+        elif model in shorthand:
+            resolved=shorthand[model]
+        tier_err=check_tier(resolved)
+        if tier_err:
+            return f"Error: {tier_err}"
+        if resolved not in mm:
+            avail=["default"] + list(shorthand.keys()) + [k for k in mm if "thinking" in k]
             return f"Error: Unknown reasoning model '{model}'. Available: {avail}"
+        mode, pref=mm[resolved]
         client=get_client()
         r=""
         async for ch in client.search(query, mode, pref, ["web"], language):
@@ -707,7 +747,7 @@ if HAS_MCP:
         """List all available Perplexity models with their modes and IDs.
         Use these IDs as the 'model' parameter in other tools."""
         mm=get_model_map()
-        lines=[f"Default model: {DEFAULT_MODEL}", "", "Available models:"]
+        lines=[f"Default model: {DEFAULT_MODEL}", f"Account type: {ACCOUNT_TYPE}", "", "Available models:"]
         by_mode={}
         for mid, (mode, pref) in mm.items():
             by_mode.setdefault(mode, []).append(mid)
@@ -776,7 +816,7 @@ async def update_models_endpoint(request: Request, _=Depends(verify_api_key)):
 async def get_models_admin(_=Depends(verify_api_key)):
     """Get full model map with internal details."""
     mm=get_model_map()
-    return {"default": DEFAULT_MODEL, "models": {k: {"mode": v[0], "pref": v[1]} for k, v in mm.items()}}
+    return {"default": DEFAULT_MODEL, "account_type": ACCOUNT_TYPE, "models": {k: {"mode": v[0], "pref": v[1]} for k, v in mm.items()}}
 
 
 # ─── Session Keep-Alive ────────────────────────────────────────────────────
