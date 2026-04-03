@@ -461,6 +461,8 @@ def _clean_response(text: str, strip: bool=True) -> str:
     text=_GROK_TAG_RE.sub('', text)
     text=_GROK_SELF_RE.sub('', text)
     text=_re.sub(r'</?response[^>]*>', '', text)
+    text=_re.sub(r'<script[^>]*>.*?</script>', '', text, flags=_re.DOTALL)
+    text=_re.sub(r'</?script[^>]*>', '', text)
     if strip:
         text=_MULTI_SPACE.sub(' ', text)
         text=_MULTI_NL.sub('\n\n', text)
