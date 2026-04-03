@@ -14,7 +14,7 @@ No official API key needed — just your Pro subscription.
 
 ## Features
 
-- **13+ models**: Auto, Pro (Sonar/GPT-5.2/Claude 4.5/Grok 4.1), Reasoning (5 model backends), Deep Research
+- **12+ models**: GPT-5.4, Claude 4.6 Sonnet, Gemini 3.1 Pro, Nemotron 3 Super, Sonar, and thinking variants
 - **Dynamic model management**: Add/remove models at runtime via admin API, persisted to disk
 - **Session keep-alive**: Background task pings Perplexity periodically to prevent cookie expiry
 - **Push notifications**: [ntfy.sh](https://ntfy.sh) alerts when cookie expires and needs manual refresh
@@ -24,17 +24,14 @@ No official API key needed — just your Pro subscription.
 ## Quick Start
 
 ```bash
-# Clone and install
 git clone https://github.com/jamie950315/pplx-proxy.git
 cd pplx-proxy
 python3 -m venv venv
 venv/bin/pip install -r requirements.txt
 
-# Configure
 cp .env.example .env
 # Edit .env — set PPLX_COOKIE (see "Getting Your Cookie" below)
 
-# Run
 venv/bin/uvicorn server:app --host 0.0.0.0 --port 8892
 ```
 
@@ -47,16 +44,16 @@ venv/bin/uvicorn server:app --host 0.0.0.0 --port 8892
 
 ## API Endpoints
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/health` | Health check (includes cookie age) |
-| `GET` | `/v1/models` | List available models |
-| `POST` | `/v1/chat/completions` | OpenAI-compatible chat (streaming + non-streaming) |
-| `POST` | `/mcp/mcp` | MCP Streamable HTTP |
-| `GET` | `/sse/sse` | MCP SSE (legacy) |
-| `GET` | `/admin/models` | Full model map with internals |
-| `POST` | `/admin/update-models` | Add/replace models |
-| `POST` | `/admin/refresh-cookie` | Inject new session token at runtime |
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/health` | No | Health check (includes cookie age) |
+| `GET` | `/v1/models` | Yes | List available models with mode/pref info |
+| `POST` | `/v1/chat/completions` | Yes | OpenAI-compatible chat (streaming + non-streaming) |
+| `POST` | `/mcp/mcp` | No | MCP Streamable HTTP |
+| `GET` | `/sse/sse` | No | MCP SSE (legacy) |
+| `GET` | `/admin/models` | Yes | Full model map with internals |
+| `POST` | `/admin/update-models` | Yes | Add/replace models at runtime |
+| `POST` | `/admin/refresh-cookie` | Yes | Inject new session token without restart |
 
 ## Usage
 
@@ -67,19 +64,19 @@ curl -X POST http://localhost:8892/v1/chat/completions \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "pplx-pro",
+    "model": "pplx-pro-gpt5",
     "messages": [{"role": "user", "content": "Latest AI news"}],
     "stream": true
   }'
 ```
 
-### MCP (Claude Code / Claude Desktop / Cursor)
+### MCP (Claude Code / Cursor / Windsurf)
 
 ```bash
 # Claude Code
 claude mcp add pplx-proxy --transport http http://localhost:8892/mcp/mcp
 
-# Or in MCP config JSON
+# MCP config JSON
 {
   "mcpServers": {
     "pplx-proxy": {
@@ -102,23 +99,36 @@ claude mcp add pplx-proxy --transport http http://localhost:8892/mcp/mcp
 
 ## Available Models
 
-| Model ID | Mode | Backend |
-|----------|------|---------|
-| `pplx-auto` | Auto | Turbo |
-| `pplx-pro` | Pro | Sonar Pro |
-| `pplx-pro-sonar` | Pro | Sonar |
-| `pplx-pro-gpt5` | Pro | GPT-5.2 |
-| `pplx-pro-claude` | Pro | Claude 4.5 Sonnet |
-| `pplx-pro-grok` | Pro | Grok 4.1 |
-| `pplx-reasoning` | Reasoning | Default |
-| `pplx-reasoning-gpt5` | Reasoning | GPT-5.2 Thinking |
-| `pplx-reasoning-claude` | Reasoning | Claude 4.5 Sonnet Thinking |
-| `pplx-reasoning-gemini` | Reasoning | Gemini 3.0 Pro |
-| `pplx-reasoning-kimi` | Reasoning | Kimi K2 Thinking |
-| `pplx-reasoning-grok` | Reasoning | Grok 4.1 Reasoning |
-| `pplx-deep-research` | Deep Research | Alpha |
+Internal identifiers sourced from Perplexity's web frontend (April 2026).
 
-Models can be added/removed at runtime via `/admin/update-models`.
+### Pro Search
+
+| Model ID | Backend | Internal Pref |
+|----------|---------|---------------|
+| `pplx-auto` | Perplexity Best (auto-select) | `pplx_pro` |
+| `pplx-pro-sonar` | Sonar | `experimental` |
+| `pplx-pro-gpt5` | OpenAI GPT-5.4 | `gpt54` |
+| `pplx-pro-claude` | Anthropic Claude 4.6 Sonnet | `claude46sonnet` |
+| `pplx-pro-gemini` | Google Gemini 3.1 Pro | `gemini31pro_high` |
+| `pplx-pro-nemotron` | NVIDIA Nemotron 3 Super | `nv_nemotron_3_super` |
+
+### Reasoning (Thinking)
+
+| Model ID | Backend | Internal Pref |
+|----------|---------|---------------|
+| `pplx-reasoning-gpt5` | GPT-5.4 Thinking | `gpt54_thinking` |
+| `pplx-reasoning-claude` | Claude 4.6 Sonnet Thinking | `claude46sonnetthinking` |
+| `pplx-reasoning-gemini` | Gemini 3.1 Pro (always thinking) | `gemini31pro_high` |
+| `pplx-reasoning-nemotron` | Nemotron 3 Super (always thinking) | `nv_nemotron_3_super` |
+| `pplx-reasoning-opus` | Claude 4.6 Opus Thinking (**Max only**) | `claude46opusthinking` |
+
+### Deep Research
+
+| Model ID | Backend | Internal Pref |
+|----------|---------|---------------|
+| `pplx-deep-research` | Perplexity Alpha | `pplx_alpha` |
+
+Models can be added/removed at runtime via `POST /admin/update-models`.
 
 ## Configuration
 
@@ -127,12 +137,12 @@ All settings in `.env` (see `.env.example`):
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PPLX_COOKIE` | — | Perplexity session token (**required**) |
-| `PPLX_PROXY_API_KEY` | — | Bearer token for API auth (optional, empty = no auth) |
+| `PPLX_PROXY_API_KEY` | — | Bearer token for API auth (empty = no auth) |
 | `PPLX_PROXY_PORT` | `8892` | Listen port |
-| `DEFAULT_MODEL` | `pplx-pro` | Default model when not specified |
+| `DEFAULT_MODEL` | `pplx-pro-gpt5` | Default model when not specified |
 | `KEEPALIVE_HOURS` | `6` | Session keep-alive ping interval |
-| `NTFY_TOPIC` | `pplx-proxy` | ntfy.sh topic for cookie expiry alerts |
-| `NTFY_COOLDOWN_SECS` | `3600` | Min interval between ntfy notifications |
+| `NTFY_TOPIC` | `pplx-proxy` | ntfy.sh topic for expiry alerts |
+| `NTFY_COOLDOWN_SECS` | `3600` | Min interval between notifications |
 | `PUBLIC_URL` | `http://localhost:8892` | Public URL (used in ntfy messages) |
 | `PPLX_API_VERSION` | `2.18` | Perplexity internal API version |
 | `PPLX_IMPERSONATE` | `chrome` | curl_cffi TLS fingerprint target |
@@ -143,16 +153,11 @@ All settings in `.env` (see `.env.example`):
 ## Deployment (systemd)
 
 ```bash
-# Install service
 sudo cp pplx-proxy.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now pplx-proxy
-
-# Logs
 sudo journalctl -u pplx-proxy -f
 ```
-
-Edit `pplx-proxy.service` paths if not installed at `/home/jamie/pplx-proxy`.
 
 ## Cookie Lifecycle
 
@@ -164,12 +169,26 @@ Manual inject (one-time) → keep-alive pings every 6h → session stays alive
 ```
 
 Re-inject without SSH:
+
 ```bash
 curl -X POST https://your-domain/admin/refresh-cookie \
   -H "Authorization: Bearer YOUR_KEY" \
   -H "Content-Type: application/json" \
   -d '{"session_token": "NEW_TOKEN"}'
 ```
+
+## Updating Models
+
+When Perplexity adds new models, update at runtime:
+
+```bash
+curl -X POST https://your-domain/admin/update-models \
+  -H "Authorization: Bearer YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"models": {"pplx-pro-newmodel": ["pro", "new_internal_pref"]}, "merge": true}'
+```
+
+Find internal preference strings by inspecting Perplexity's frontend JS bundles or checking community reverse-engineering projects.
 
 ## Disclaimer
 
