@@ -101,7 +101,7 @@ claude mcp add pplx-proxy --transport http http://localhost:8892/mcp/mcp
 
 Internal identifiers sourced from Perplexity's web frontend (April 2026).
 
-### Pro Search
+### Pro Search (Current UI Models)
 
 | Model ID | Backend | Internal Pref |
 |----------|---------|---------------|
@@ -112,6 +112,7 @@ Internal identifiers sourced from Perplexity's web frontend (April 2026).
 | `pplx-pro-gemini` | Google Gemini 3.1 Pro (always thinking) | `gemini31pro_high` |
 | `pplx-pro-nemotron` | NVIDIA Nemotron 3 Super (always thinking) | `nv_nemotron_3_super` |
 | `pplx-pro-opus` | Anthropic Claude 4.6 Opus (**Max only**) | `claude46opus` |
+| `pplx-pro-grok` | xAI Grok 4.1 | `grok41nonreasoning` |
 
 ### Thinking / Reasoning
 
@@ -120,8 +121,20 @@ Internal identifiers sourced from Perplexity's web frontend (April 2026).
 | `pplx-pro-gpt5-thinking` | GPT-5.4 Thinking | `gpt54_thinking` |
 | `pplx-pro-claude-thinking` | Claude 4.6 Sonnet Thinking | `claude46sonnetthinking` |
 | `pplx-pro-opus-thinking` | Claude 4.6 Opus Thinking (**Max only**) | `claude46opusthinking` |
+| `pplx-pro-grok-thinking` | Grok 4.1 Reasoning | `grok41reasoning` |
+| `pplx-pro-kimi-thinking` | Kimi K2 Thinking | `kimik2thinking` |
+| `pplx-pro-kimi25-thinking` | Kimi K2.5 Thinking | `kimik25thinking` |
 
-> Gemini 3.1 Pro and Nemotron 3 Super have thinking permanently enabled — use their Pro Search IDs.
+### Legacy (Not in UI, Still Functional)
+
+| Model ID | Backend | Internal Pref |
+|----------|---------|---------------|
+| `pplx-pro-gpt52` | GPT-5.2 | `gpt52` |
+| `pplx-pro-gpt52-thinking` | GPT-5.2 Thinking | `gpt52_thinking` |
+| `pplx-pro-claude45` | Claude 4.5 Sonnet | `claude45sonnet` |
+| `pplx-pro-claude45-thinking` | Claude 4.5 Sonnet Thinking | `claude45sonnetthinking` |
+| `pplx-pro-gemini30` | Gemini 3.0 Pro | `gemini30pro` |
+| `pplx-pro-opus45` | Claude 4.5 Opus | `claude45opus` |
 
 ### Deep Research & Labs
 
@@ -129,6 +142,10 @@ Internal identifiers sourced from Perplexity's web frontend (April 2026).
 |----------|---------|---------------|
 | `pplx-deep-research` | Perplexity Alpha | `pplx_alpha` |
 | `pplx-labs` | Perplexity Labs (files & apps) | `pplx_beta` |
+
+### Auto-Discovery
+
+Run `POST /admin/discover-models` to probe Perplexity for all working model identifiers automatically. This tests candidate preference strings against the live API and adds any new valid models to the map. Uses Pro Search quota (~1 query per candidate).
 
 Models can be added/removed at runtime via `POST /admin/update-models`.
 

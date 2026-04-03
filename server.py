@@ -66,7 +66,7 @@ DEFAULT_HEADERS={
 
 # Default model map — overridden by .models.json if it exists
 _DEFAULT_MODEL_MAP={
-    # Pro Search
+    # Pro Search (current)
     "pplx-auto": ("pro", "pplx_pro"),
     "pplx-pro-sonar": ("pro", "experimental"),
     "pplx-pro-gpt5": ("pro", "gpt54"),
@@ -74,11 +74,21 @@ _DEFAULT_MODEL_MAP={
     "pplx-pro-gemini": ("pro", "gemini31pro_high"),
     "pplx-pro-nemotron": ("pro", "nv_nemotron_3_super"),
     "pplx-pro-opus": ("pro", "claude46opus"),
-    # Thinking / Reasoning
+    "pplx-pro-grok": ("pro", "grok41nonreasoning"),
+    # Thinking
     "pplx-pro-gpt5-thinking": ("pro", "gpt54_thinking"),
     "pplx-pro-claude-thinking": ("pro", "claude46sonnetthinking"),
     "pplx-pro-opus-thinking": ("pro", "claude46opusthinking"),
-    # Always-thinking (Gemini/Nemotron thinking is always on)
+    "pplx-pro-grok-thinking": ("pro", "grok41reasoning"),
+    "pplx-pro-kimi-thinking": ("pro", "kimik2thinking"),
+    "pplx-pro-kimi25-thinking": ("pro", "kimik25thinking"),
+    # Legacy (removed from UI but still functional)
+    "pplx-pro-gpt52": ("pro", "gpt52"),
+    "pplx-pro-gpt52-thinking": ("pro", "gpt52_thinking"),
+    "pplx-pro-claude45": ("pro", "claude45sonnet"),
+    "pplx-pro-claude45-thinking": ("pro", "claude45sonnetthinking"),
+    "pplx-pro-gemini30": ("pro", "gemini30pro"),
+    "pplx-pro-opus45": ("pro", "claude45opus"),
     # Deep Research & Labs
     "pplx-deep-research": ("pro", "pplx_alpha"),
     "pplx-labs": ("pro", "pplx_beta"),
@@ -441,6 +451,111 @@ async def _stream_openai(client, query, mode, model_pref, model_name, cid, creat
 # ─── Cookie Refresh Endpoint ──────────────────────────────────────────────
 
 
+
+
+# ─── Model Discovery ───────────────────────────────────────────────────────
+
+# Candidate internal prefs to probe — extend as Perplexity adds models
+_DISCOVERY_CANDIDATES={
+    # pattern: "friendly_name": ("mode", "internal_pref")
+    # Pro
+    "pplx-auto": ("pro", "pplx_pro"),
+    "pplx-pro-sonar": ("pro", "experimental"),
+    "pplx-pro-gpt5": ("pro", "gpt54"),
+    "pplx-pro-gpt52": ("pro", "gpt52"),
+    "pplx-pro-gpt55": ("pro", "gpt55"),
+    "pplx-pro-claude": ("pro", "claude46sonnet"),
+    "pplx-pro-claude45": ("pro", "claude45sonnet"),
+    "pplx-pro-claude47": ("pro", "claude47sonnet"),
+    "pplx-pro-gemini": ("pro", "gemini31pro_high"),
+    "pplx-pro-gemini30": ("pro", "gemini30pro"),
+    "pplx-pro-gemini32": ("pro", "gemini32pro_high"),
+    "pplx-pro-nemotron": ("pro", "nv_nemotron_3_super"),
+    "pplx-pro-opus": ("pro", "claude46opus"),
+    "pplx-pro-opus45": ("pro", "claude45opus"),
+    "pplx-pro-grok": ("pro", "grok41nonreasoning"),
+    "pplx-pro-grok42": ("pro", "grok42nonreasoning"),
+    "pplx-pro-kimi": ("pro", "kimik25"),
+    # Thinking
+    "pplx-pro-gpt5-thinking": ("pro", "gpt54_thinking"),
+    "pplx-pro-gpt52-thinking": ("pro", "gpt52_thinking"),
+    "pplx-pro-gpt55-thinking": ("pro", "gpt55_thinking"),
+    "pplx-pro-claude-thinking": ("pro", "claude46sonnetthinking"),
+    "pplx-pro-claude45-thinking": ("pro", "claude45sonnetthinking"),
+    "pplx-pro-claude47-thinking": ("pro", "claude47sonnetthinking"),
+    "pplx-pro-opus-thinking": ("pro", "claude46opusthinking"),
+    "pplx-pro-grok-thinking": ("pro", "grok41reasoning"),
+    "pplx-pro-grok42-thinking": ("pro", "grok42reasoning"),
+    "pplx-pro-kimi-thinking": ("pro", "kimik2thinking"),
+    "pplx-pro-kimi25-thinking": ("pro", "kimik25thinking"),
+    "pplx-pro-nemotron-thinking": ("pro", "nv_nemotron_3_super_thinking"),
+    # Deep Research & Labs
+    "pplx-deep-research": ("pro", "pplx_alpha"),
+    "pplx-labs": ("pro", "pplx_beta"),
+}
+
+async def probe_model(client, mode, pref) -> bool:
+    """Send a simple query to test if a model_preference is valid.
+    Returns True if Perplexity returns a non-empty answer."""
+    try:
+        async for chunk in client.search("What is 2+2? Answer with just the number.", mode, pref, ["web"], "en-US"):
+            if chunk.get("error"):
+                return False
+            answer=chunk.get("answer", "")
+            if answer.strip():
+                return True
+        return False
+    except Exception:
+        return False
+
+
+@app.post("/admin/discover-models")
+async def discover_models(request: Request, _=Depends(verify_api_key)):
+    """Probe Perplexity for all working model identifiers.
+    Tests each candidate and returns which ones are valid.
+    WARNING: This sends many requests and may hit rate limits. Use sparingly."""
+    client=get_client()
+    await client.init()
+
+    results={"valid": {}, "invalid": [], "error": [], "skipped": []}
+    current_mm=get_model_map()
+
+    # Probe candidates
+    for name, (mode, pref) in _DISCOVERY_CANDIDATES.items():
+        # Skip if already in current map (save quota)
+        if name in current_mm and current_mm[name] == (mode, pref):
+            results["skipped"].append(name)
+            continue
+
+        try:
+            ok=await probe_model(client, mode, pref)
+            if ok:
+                results["valid"][name]=[mode, pref]
+                log.info(f"Discovery: {name} ({pref}) = VALID")
+            else:
+                results["invalid"].append(f"{name} ({pref})")
+                log.info(f"Discovery: {name} ({pref}) = invalid")
+        except Exception as e:
+            results["error"].append(f"{name}: {e}")
+
+        await asyncio.sleep(3)  # rate limit protection
+
+    # Merge valid discoveries into model map
+    if results["valid"]:
+        global MODEL_MAP
+        for name, (mode, pref) in results["valid"].items():
+            MODEL_MAP[name]=tuple([mode, pref])
+        # Also re-add skipped (already valid) models
+        save_model_map(MODEL_MAP)
+
+    return {
+        "status": "ok",
+        "discovered": len(results["valid"]),
+        "invalid": len(results["invalid"]),
+        "skipped": len(results["skipped"]),
+        "total_models": len(MODEL_MAP),
+        "details": results,
+    }
 
 
 # ─── MCP Server ────────────────────────────────────────────────────────────
