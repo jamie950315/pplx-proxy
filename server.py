@@ -751,7 +751,10 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
                 ctx_lines.append(f"Tool result: {content}")
         parts.append("Previous conversation:\n" + "\n".join(ctx_lines))
     if current_msg:
-        parts.append(current_msg)
+        if history:
+            parts.append(f"User's current request:\n{current_msg}")
+        else:
+            parts.append(current_msg)
 
     query="\n\n".join(parts)
     log.debug(f"CONTEXT QUERY ({len(query)}ch, {len(history)} hist items):\n{query[:1500]}")
