@@ -803,7 +803,7 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
                 "id": cid, "object": "chat.completion", "created": created, "model": model_name,
                 "system_fingerprint": None,
                 "choices": [{"index": 0, "message": msg, "finish_reason": "tool_calls", "logprobs": None}],
-                "usage": {"prompt_tokens": len(query)//4, "completion_tokens": len(full)//4, "total_tokens": (len(query)+len(full))//4},
+                "usage": {"prompt_tokens": len(query)//4, "completion_tokens": len(full)//4, "total_tokens": len(query)//4+len(full)//4},
             }
 
     msg={"role": "assistant", "content": full}
@@ -813,7 +813,7 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
         "id": cid, "object": "chat.completion", "created": created, "model": model_name,
         "system_fingerprint": None,
         "choices": [{"index": 0, "message": msg, "finish_reason": "stop", "logprobs": None}],
-        "usage": {"prompt_tokens": len(query)//4, "completion_tokens": len(full)//4, "total_tokens": (len(query)+len(full))//4},
+        "usage": {"prompt_tokens": len(query)//4, "completion_tokens": len(full)//4, "total_tokens": len(query)//4+len(full)//4},
     }
 
 
