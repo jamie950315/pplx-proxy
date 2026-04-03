@@ -109,24 +109,26 @@ Internal identifiers sourced from Perplexity's web frontend (April 2026).
 | `pplx-pro-sonar` | Sonar | `experimental` |
 | `pplx-pro-gpt5` | OpenAI GPT-5.4 | `gpt54` |
 | `pplx-pro-claude` | Anthropic Claude 4.6 Sonnet | `claude46sonnet` |
-| `pplx-pro-gemini` | Google Gemini 3.1 Pro | `gemini31pro_high` |
-| `pplx-pro-nemotron` | NVIDIA Nemotron 3 Super | `nv_nemotron_3_super` |
+| `pplx-pro-gemini` | Google Gemini 3.1 Pro (always thinking) | `gemini31pro_high` |
+| `pplx-pro-nemotron` | NVIDIA Nemotron 3 Super (always thinking) | `nv_nemotron_3_super` |
+| `pplx-pro-opus` | Anthropic Claude 4.6 Opus (**Max only**) | `claude46opus` |
 
-### Reasoning (Thinking)
+### Thinking / Reasoning
 
 | Model ID | Backend | Internal Pref |
 |----------|---------|---------------|
-| `pplx-reasoning-gpt5` | GPT-5.4 Thinking | `gpt54_thinking` |
-| `pplx-reasoning-claude` | Claude 4.6 Sonnet Thinking | `claude46sonnetthinking` |
-| `pplx-reasoning-gemini` | Gemini 3.1 Pro (always thinking) | `gemini31pro_high` |
-| `pplx-reasoning-nemotron` | Nemotron 3 Super (always thinking) | `nv_nemotron_3_super` |
-| `pplx-reasoning-opus` | Claude 4.6 Opus Thinking (**Max only**) | `claude46opusthinking` |
+| `pplx-pro-gpt5-thinking` | GPT-5.4 Thinking | `gpt54_thinking` |
+| `pplx-pro-claude-thinking` | Claude 4.6 Sonnet Thinking | `claude46sonnetthinking` |
+| `pplx-pro-opus-thinking` | Claude 4.6 Opus Thinking (**Max only**) | `claude46opusthinking` |
 
-### Deep Research
+> Gemini 3.1 Pro and Nemotron 3 Super have thinking permanently enabled — use their Pro Search IDs.
+
+### Deep Research & Labs
 
 | Model ID | Backend | Internal Pref |
 |----------|---------|---------------|
 | `pplx-deep-research` | Perplexity Alpha | `pplx_alpha` |
+| `pplx-labs` | Perplexity Labs (files & apps) | `pplx_beta` |
 
 Models can be added/removed at runtime via `POST /admin/update-models`.
 

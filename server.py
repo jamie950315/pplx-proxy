@@ -66,18 +66,22 @@ DEFAULT_HEADERS={
 
 # Default model map — overridden by .models.json if it exists
 _DEFAULT_MODEL_MAP={
+    # Pro Search
     "pplx-auto": ("pro", "pplx_pro"),
     "pplx-pro-sonar": ("pro", "experimental"),
     "pplx-pro-gpt5": ("pro", "gpt54"),
     "pplx-pro-claude": ("pro", "claude46sonnet"),
     "pplx-pro-gemini": ("pro", "gemini31pro_high"),
     "pplx-pro-nemotron": ("pro", "nv_nemotron_3_super"),
-    "pplx-reasoning-gpt5": ("pro", "gpt54_thinking"),
-    "pplx-reasoning-claude": ("pro", "claude46sonnetthinking"),
-    "pplx-reasoning-gemini": ("pro", "gemini31pro_high"),
-    "pplx-reasoning-nemotron": ("pro", "nv_nemotron_3_super"),
-    "pplx-reasoning-opus": ("pro", "claude46opusthinking"),
+    "pplx-pro-opus": ("pro", "claude46opus"),
+    # Thinking / Reasoning
+    "pplx-pro-gpt5-thinking": ("pro", "gpt54_thinking"),
+    "pplx-pro-claude-thinking": ("pro", "claude46sonnetthinking"),
+    "pplx-pro-opus-thinking": ("pro", "claude46opusthinking"),
+    # Always-thinking (Gemini/Nemotron thinking is always on)
+    # Deep Research & Labs
     "pplx-deep-research": ("pro", "pplx_alpha"),
+    "pplx-labs": ("pro", "pplx_beta"),
 }
 
 def load_model_map() -> dict:
@@ -497,9 +501,9 @@ if HAS_MCP:
         if not query or not query.strip():
             return "Error: query cannot be empty"
         mm=get_model_map()
-        shorthand={"gpt5": "pplx-reasoning-gpt5", "claude": "pplx-reasoning-claude",
-                    "gemini": "pplx-reasoning-gemini", "kimi": "pplx-reasoning-kimi",
-                    "grok": "pplx-reasoning-grok", "nemotron": "pplx-reasoning-nemotron"}
+        shorthand={"gpt5": "pplx-pro-gpt5-thinking", "claude": "pplx-pro-claude-thinking",
+                    "opus": "pplx-pro-opus-thinking", "gemini": "pplx-pro-gemini",
+                    "nemotron": "pplx-pro-nemotron"}
         if model == "default":
             mode, pref="reasoning", "pplx_reasoning"
         elif model in mm:
