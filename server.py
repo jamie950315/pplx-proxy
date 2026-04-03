@@ -908,14 +908,21 @@ async def session_keepalive_loop():
 
 @app.post("/admin/refresh-cookie")
 async def refresh_cookie_endpoint(request: Request, _=Depends(verify_api_key)):
-    """Manually inject a new cookie via POST body: {"session_token": "..."}"""
-    try:
-        body=await request.json()
-    except Exception:
-        raise HTTPException(400, "Invalid or empty JSON body")
-    token=body.get("session_token", "")
+    """Inject new cookie. Accepts JSON {"session_token": "..."} or plain text body."""
+    ct=request.headers.get("content-type", "")
+    token=""
+    if "json" in ct:
+        try:
+            body=await request.json()
+            token=body.get("session_token", "")
+        except Exception:
+            pass
     if not token:
-        return {"status": "error", "message": "Provide session_token in JSON body"}
+        # Try reading body as plain text
+        raw=await request.body()
+        token=raw.decode("utf-8", errors="ignore").strip()
+    if not token:
+        return {"status": "error", "message": "Send session token as plain text body or JSON {\"session_token\": \"...\"}"}
     cookies={"next-auth.session-token": token}
     save_cookies(cookies)
     global _client
