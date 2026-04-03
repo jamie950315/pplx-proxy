@@ -486,13 +486,12 @@ def _tools_to_xml(tools: list) -> str:
 
 _TOOL_CALL_RE=_re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", _re.DOTALL)
 
-import re as _clean_re
 
-_CITATION_RE=_clean_re.compile(r'\[\d+\]')
-_GROK_TAG_RE=_clean_re.compile(r'<grok:[^>]*>.*?</grok:[^>]*>', _clean_re.DOTALL)
-_GROK_SELF_RE=_clean_re.compile(r'<grok:[^>]*/>')
-_MULTI_SPACE=_clean_re.compile(r' {2,}')
-_MULTI_NL=_clean_re.compile(r'\n{3,}')
+_CITATION_RE=_re.compile(r'\[\d+\]')
+_GROK_TAG_RE=_re.compile(r'<grok:[^>]*>.*?</grok:[^>]*>', _re.DOTALL)
+_GROK_SELF_RE=_re.compile(r'<grok:[^>]*/>')
+_MULTI_SPACE=_re.compile(r' {2,}')
+_MULTI_NL=_re.compile(r'\n{3,}')
 
 def _clean_response(text: str, strip: bool=True) -> str:
     """Strip Perplexity citations and internal tags."""
@@ -510,8 +509,6 @@ def _clean_response(text: str, strip: bool=True) -> str:
     return text
 
 
-# Also match bare XML function calls without <tool_call> wrapper
-_BARE_XML_RE=_re.compile(r"<([a-z_][a-z0-9_]*)>\s*(?:<[a-z_].*?</\1>)", _re.DOTALL | _re.IGNORECASE)
 
 def _parse_xml_func(xml_str: str) -> list:
     """Parse XML into tool_calls list."""
@@ -792,7 +789,12 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
 
     # Check for tool calls in response
     if tools and isinstance(tools, list):
-        tool_calls, remaining=_parse_tool_calls(full)
+        _tn={t["function"]["name"] for t in tools if t.get("type")=="function"}
+        tool_calls, remaining=_parse_tool_calls(full, _tn)
+        tool_calls=_validate_tool_calls(tool_calls, tools)
+        if not tool_calls and full.strip().startswith("<"):
+            full=_strip_xml_wrapper(full)
+            full=_clean_response(full)
         if tool_calls:
             msg={"role": "assistant", "content": remaining if remaining else None, "tool_calls": tool_calls}
             if reasoning_content:
@@ -847,7 +849,12 @@ async def _stream_openai_with_tools(client, query, mode, model_pref, model_name,
     full=_clean_response(full)
 
     # Check for tool calls in buffered response
-    tool_calls, remaining=_parse_tool_calls(full)
+    _tn={t["function"]["name"] for t in (tools or []) if t.get("type")=="function"}
+    tool_calls, remaining=_parse_tool_calls(full, _tn)
+    tool_calls=_validate_tool_calls(tool_calls, tools or [])
+    if not tool_calls and full.strip().startswith("<"):
+        full=_strip_xml_wrapper(full)
+        full=_clean_response(full)
     if tool_calls:
         msg_delta={"tool_calls": []}
         for i, tc in enumerate(tool_calls):
@@ -906,6 +913,9 @@ async def _stream_openai(client, query, mode, model_pref, model_name, cid, creat
             e={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
                "choices": [{"index": 0, "delta": {"content": f"[Error: {chunk['error']}]"}, "finish_reason": None}]}
             yield f"data: {json.dumps(e)}\n\n"
+            stop={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
+                  "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+            yield f"data: {json.dumps(stop)}\n\n"
             break
 
         dt=chunk.get("delta", "")
@@ -941,8 +951,6 @@ async def _stream_openai(client, query, mode, model_pref, model_name, cid, creat
 
 
 # ─── Model Discovery ──────────────────────────────────────────────────────
-
-import re as _re
 
 # Patterns to extract version from known prefs and generate next versions
 _VERSION_PATTERNS=[
@@ -998,10 +1006,9 @@ async def discover_models(request: Request, _=Depends(verify_api_key)):
 
     mm=get_model_map()
 
-    base_models=dict(mm)  # all models are base models now (no thinking variants in map)
-    thinking_map={}
+    base_models=dict(mm)
 
-    report={"alive": [], "upgraded": {}, "dead": [], "skipped_thinking": list(thinking_map.values()), "probed": 0}
+    report={"alive": [], "upgraded": {}, "dead": [], "probed": 0}
 
     for model_id, (mode, pref) in base_models.items():
         # Match against version patterns
@@ -1052,19 +1059,7 @@ async def discover_models(request: Request, _=Depends(verify_api_key)):
                     MODEL_MAP[model_id]=(mode, new_pref)
                     upgrade={"old": pref, "new": new_pref}
 
-                    # Auto-upgrade thinking variant if exists
-                    if model_id in thinking_map:
-                        t_id=thinking_map[model_id]
-                        old_t_pref=mm[t_id][1]
-                        # Derive new thinking pref from new base pref
-                        if "_thinking" in old_t_pref:
-                            new_t_pref=new_pref+"_thinking" if not new_pref.endswith("_thinking") else new_pref
-                        else:
-                            new_t_pref=new_pref+"thinking"
-                        MODEL_MAP[t_id]=(mode, new_t_pref)
-                        upgrade["thinking_old"]=old_t_pref
-                        upgrade["thinking_new"]=new_t_pref
-                        log.info(f"Discovery: {t_id} auto-upgraded {old_t_pref} → {new_t_pref}")
+                    # Thinking variants auto-derived from _THINKING_MAP
 
                     report["upgraded"][model_id]=upgrade
                     log.info(f"Discovery: {model_id} upgraded {pref} → {new_pref}")
@@ -1100,7 +1095,7 @@ async def discover_models(request: Request, _=Depends(verify_api_key)):
         "upgraded": len(report["upgraded"]),
         "dead": len(report["dead"]),
         "probed": report["probed"],
-        "skipped_thinking": len(report["skipped_thinking"]),
+        
         "details": report,
     }
 
