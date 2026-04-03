@@ -16,9 +16,26 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);height:100vh
 .hdr button{border:none;padding:3px 8px;border-radius:4px;cursor:pointer;font:10px var(--font);color:var(--text)}
 .main{flex:1;display:flex;overflow:hidden}
 .chat{flex:1;display:flex;flex-direction:column;overflow:hidden}
-.dbg{width:360px;border-left:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
-.dbg-h{padding:5px 8px;border-bottom:1px solid var(--border);font-size:9px;color:var(--dim);display:flex;justify-content:space-between}
-.dbg-b{flex:1;overflow-y:auto;padding:5px;font-size:9px;white-space:pre-wrap;word-break:break-all;color:var(--dim)}
+.side{width:420px;border-left:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
+.tabs{display:flex;border-bottom:1px solid var(--border);flex-shrink:0}
+.tabs button{flex:1;padding:5px;font:9px var(--font);background:none;border:none;color:var(--dim);cursor:pointer;border-bottom:2px solid transparent}
+.tabs button.act{color:var(--accent);border-bottom-color:var(--accent)}
+.tab-body{flex:1;overflow-y:auto;display:none}
+.tab-body.act{display:block}
+.raw{padding:5px;font-size:9px;white-space:pre-wrap;word-break:break-all;color:var(--dim)}
+.fmt{padding:8px;font-size:10px}
+.fmt .sec{margin-bottom:10px}
+.fmt .sec-h{font-size:9px;color:var(--accent);font-weight:700;margin-bottom:4px;padding-bottom:2px;border-bottom:1px solid var(--border)}
+.fmt .row{display:flex;align-items:baseline;gap:6px;padding:2px 0;font-size:9px}
+.fmt .k{color:var(--dim);min-width:140px}
+.fmt .v{color:var(--text);word-break:break-all;flex:1}
+.fmt .v.ok{color:var(--green)}.fmt .v.err{color:var(--red)}.fmt .v.warn{color:var(--yellow)}
+.fmt .badge{display:inline-block;padding:1px 5px;border-radius:3px;font-size:8px;font-weight:700}
+.fmt .badge.pass{background:#3fb95022;color:var(--green)}.fmt .badge.fail{background:#f8514922;color:var(--red)}.fmt .badge.na{background:#8b949e22;color:var(--dim)}
+.fmt .summary{padding:8px;border-radius:6px;margin-bottom:8px;font-size:11px;font-weight:700;text-align:center}
+.fmt .summary.pass{background:#3fb95015;color:var(--green);border:1px solid #3fb95033}
+.fmt .summary.fail{background:#f8514915;color:var(--red);border:1px solid #f8514933}
+.fmt .summary.idle{background:var(--card);color:var(--dim);border:1px solid var(--border)}
 .msgs{flex:1;overflow-y:auto;padding:10px}
 .m{margin-bottom:8px;padding:8px 10px;border-radius:6px;max-width:85%;font-size:11px;line-height:1.5}
 .m.u{background:#1f6feb33;margin-left:auto;border:1px solid #1f6feb55}
@@ -33,8 +50,6 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);height:100vh
 .bar button{background:var(--accent);color:#fff;border:none;padding:5px 12px;border-radius:5px;cursor:pointer;font:10px var(--font);font-weight:600}
 .bar button:disabled{opacity:0.4}
 .bar .sec{background:var(--border)}
-.bg{display:inline-block;padding:1px 4px;border-radius:3px;font-size:8px;font-weight:600}
-.bg.ok{background:#3fb95033;color:var(--green)}.bg.tl{background:#58a6ff33;color:var(--accent)}
 </style>
 </head>
 <body>
@@ -56,15 +71,21 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);height:100vh
 <button class="sec" onclick="clr()">Clear</button>
 </div>
 </div>
-<div class="dbg">
-<div class="dbg-h"><span>Raw</span><span id="dm"></span></div>
-<div class="dbg-b" id="db"></div>
+<div class="side">
+<div class="tabs">
+<button class="act" onclick="switchTab(0)">Raw</button>
+<button onclick="switchTab(1)">Format ✓</button>
+</div>
+<div class="tab-body act" id="tab0"><div class="raw" id="db"></div></div>
+<div class="tab-body" id="tab1"><div class="fmt" id="fv">
+<div class="summary idle">Send a message to validate format</div>
+</div></div>
 </div>
 </div>
 <script>
 const B=location.origin,TOOLS=[
-{type:"function",function:{name:"get_weather",description:"Get current weather for a city",parameters:{type:"object",properties:{city:{type:"string",description:"City name"},units:{type:"string",enum:["celsius","fahrenheit"]}},required:["city"]}}},
-{type:"function",function:{name:"calculator",description:"Evaluate a math expression",parameters:{type:"object",properties:{expression:{type:"string",description:"Math expression"}},required:["expression"]}}},
+{type:"function",function:{name:"get_weather",description:"Get current weather for a city",parameters:{type:"object",properties:{city:{type:"string"},units:{type:"string",enum:["celsius","fahrenheit"]}},required:["city"]}}},
+{type:"function",function:{name:"calculator",description:"Evaluate a math expression",parameters:{type:"object",properties:{expression:{type:"string"}},required:["expression"]}}},
 {type:"function",function:{name:"search_web",description:"Search the web",parameters:{type:"object",properties:{query:{type:"string"},max_results:{type:"integer"}},required:["query"]}}},
 {type:"function",function:{name:"get_user",description:"Look up user by ID",parameters:{type:"object",properties:{user_id:{type:"integer"}},required:["user_id"]}}},
 {type:"function",function:{name:"send_email",description:"Send an email",parameters:{type:"object",properties:{to:{type:"string"},subject:{type:"string"},body:{type:"string"}},required:["to","subject","body"]}}}
@@ -75,7 +96,8 @@ $('inp').onkeydown=e=>{if(e.key==='Enter')go()};
 function L(t){$('db').textContent+=t+'\n';$('db').scrollTop=9e9}
 function E(s){return(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 function tglTools(){tl=!tl;$('tlb').style.background=tl?'var(--green)':'var(--border)';$('tlb').textContent=tl?'Tools ON':'Tools OFF'}
-function clr(){H=[];$('msgs').innerHTML='';$('db').textContent=''}
+function clr(){H=[];$('msgs').innerHTML='';$('db').textContent='';showFmt(null)}
+function switchTab(i){document.querySelectorAll('.tabs button').forEach((b,j)=>{b.classList.toggle('act',j===i)});document.querySelectorAll('.tab-body').forEach((b,j)=>{b.classList.toggle('act',j===i)})}
 function addM(r,c,x={}){
 let d=document.createElement('div');d.className='m '+(r==='user'?'u':r==='error'?'e':'a');
 let h='';
@@ -86,6 +108,127 @@ let ci=(c||'').match(/\[\d+\]/g);
 if(ci)h+=`<div class="w">⚠️ citations: ${ci.join(' ')}</div>`;
 if(x.fr)h+=`<div class="mt">${x.fr} | ${x.md||'?'} | ${x.ms||'?'}ms</div>`;
 d.innerHTML=h;$('msgs').appendChild(d);$('msgs').scrollTop=9e9;return d}
+
+// ── OpenAI Format Validator ──
+function validateOpenAI(data, isStream) {
+  const checks = [];
+  function chk(name, ok, val, required=true) {
+    checks.push({name, ok, val: val===undefined?'(missing)':val===null?'null':typeof val==='object'?JSON.stringify(val).slice(0,80):String(val).slice(0,80), required});
+  }
+  if (isStream) {
+    // Validate accumulated stream chunks
+    const chunks = data;
+    if (!chunks.length) { chk('has chunks', false, '0 chunks'); return checks; }
+    const c0 = chunks[0], cL = chunks[chunks.length-1];
+    chk('chunk[0].id', typeof c0.id==='string'&&c0.id.startsWith('chatcmpl-'), c0.id);
+    chk('chunk[0].object', c0.object==='chat.completion.chunk', c0.object);
+    chk('chunk[0].created', typeof c0.created==='number', c0.created);
+    chk('chunk[0].model', typeof c0.model==='string'&&c0.model.length>0, c0.model);
+    chk('chunk[0].system_fingerprint', 'system_fingerprint' in c0, c0.system_fingerprint, false);
+    chk('chunk[0].choices is array', Array.isArray(c0.choices), typeof c0.choices);
+    if (c0.choices?.[0]) {
+      const ch0 = c0.choices[0];
+      chk('chunk[0].choices[0].index', ch0.index===0, ch0.index);
+      chk('chunk[0].choices[0].delta', typeof ch0.delta==='object', typeof ch0.delta);
+      chk('chunk[0].delta.role', ch0.delta?.role==='assistant', ch0.delta?.role);
+      chk('chunk[0].choices[0].logprobs', 'logprobs' in ch0, ch0.logprobs, false);
+      chk('chunk[0].finish_reason', ch0.finish_reason===null, ch0.finish_reason);
+    }
+    // Last chunk
+    if (cL.choices?.[0]) {
+      const chL = cL.choices[0];
+      chk('last.finish_reason', ['stop','tool_calls','length'].includes(chL.finish_reason), chL.finish_reason);
+      chk('last.delta is empty', Object.keys(chL.delta||{}).length===0, JSON.stringify(chL.delta));
+    }
+    // Check consistent IDs
+    const ids = new Set(chunks.map(c=>c.id));
+    chk('consistent id across chunks', ids.size===1, `${ids.size} unique IDs`);
+    // Check content chunks have delta.content
+    const contentChunks = chunks.filter(c=>c.choices?.[0]?.delta?.content);
+    const toolChunks = chunks.filter(c=>c.choices?.[0]?.delta?.tool_calls);
+    chk('has content or tool_calls', contentChunks.length>0||toolChunks.length>0, `content:${contentChunks.length} tools:${toolChunks.length}`);
+    // Tool call format
+    if (toolChunks.length>0) {
+      const tc = toolChunks[0].choices[0].delta.tool_calls[0];
+      chk('tool_call.index', typeof tc.index==='number', tc.index);
+      chk('tool_call.id', typeof tc.id==='string', tc.id);
+      chk('tool_call.type', tc.type==='function', tc.type);
+      chk('tool_call.function.name', typeof tc.function?.name==='string', tc.function?.name);
+      chk('tool_call.function.arguments', typeof tc.function?.arguments==='string', tc.function?.arguments);
+    }
+    chk('ends with [DONE]', data._gotDone===true, data._gotDone?'yes':'no');
+  } else {
+    // Non-streaming
+    chk('id', typeof data.id==='string'&&data.id.startsWith('chatcmpl-'), data.id);
+    chk('object', data.object==='chat.completion', data.object);
+    chk('created', typeof data.created==='number', data.created);
+    chk('model', typeof data.model==='string'&&data.model.length>0, data.model);
+    chk('system_fingerprint', 'system_fingerprint' in data, data.system_fingerprint, false);
+    chk('choices is array', Array.isArray(data.choices)&&data.choices.length>0, `len=${data.choices?.length}`);
+    if (data.choices?.[0]) {
+      const c = data.choices[0];
+      chk('choices[0].index', c.index===0, c.index);
+      chk('choices[0].logprobs', 'logprobs' in c, c.logprobs, false);
+      chk('choices[0].finish_reason', ['stop','tool_calls','length','content_filter'].includes(c.finish_reason), c.finish_reason);
+      if (c.message) {
+        const m = c.message;
+        chk('message.role', m.role==='assistant', m.role);
+        chk('message.content type', m.content===null||typeof m.content==='string', typeof m.content);
+        if (c.finish_reason==='tool_calls') {
+          chk('message.tool_calls', Array.isArray(m.tool_calls)&&m.tool_calls.length>0, `len=${m.tool_calls?.length}`);
+          if (m.tool_calls?.[0]) {
+            const tc = m.tool_calls[0];
+            chk('tool_call.id', typeof tc.id==='string', tc.id);
+            chk('tool_call.type', tc.type==='function', tc.type);
+            chk('tool_call.function.name', typeof tc.function?.name==='string', tc.function?.name);
+            chk('tool_call.function.arguments', typeof tc.function?.arguments==='string', tc.function?.arguments);
+            try { JSON.parse(tc.function.arguments); chk('arguments is valid JSON', true, 'valid'); } catch(e) { chk('arguments is valid JSON', false, e.message); }
+          }
+          chk('content is null for tool_calls', m.content===null||m.content==='', String(m.content));
+        } else {
+          chk('message.content', typeof m.content==='string'&&m.content.length>0, `len=${m.content?.length}`);
+        }
+      } else { chk('message exists', false, 'missing'); }
+    }
+    if (data.usage) {
+      chk('usage.prompt_tokens', typeof data.usage.prompt_tokens==='number', data.usage.prompt_tokens);
+      chk('usage.completion_tokens', typeof data.usage.completion_tokens==='number', data.usage.completion_tokens);
+      chk('usage.total_tokens', typeof data.usage.total_tokens==='number', data.usage.total_tokens);
+    } else { chk('usage', false, 'missing', false); }
+  }
+  return checks;
+}
+
+function showFmt(checks) {
+  const fv = $('fv');
+  if (!checks) { fv.innerHTML='<div class="summary idle">Send a message to validate format</div>'; return; }
+  const pass = checks.filter(c=>c.ok).length;
+  const fail = checks.filter(c=>!c.ok&&c.required).length;
+  const warn = checks.filter(c=>!c.ok&&!c.required).length;
+  const total = checks.length;
+  const allPass = fail===0;
+  let html = `<div class="summary ${allPass?'pass':'fail'}">${allPass?'✅':'❌'} ${pass}/${total} checks passed${fail?' · '+fail+' failed':''}${warn?' · '+warn+' optional':''}}</div>`;
+  const groups = {};
+  checks.forEach(c => {
+    const cat = c.name.startsWith('chunk')||c.name.startsWith('last.')||c.name.startsWith('consistent')||c.name.startsWith('has content')||c.name.startsWith('ends') ? 'Streaming Protocol' :
+                c.name.startsWith('tool_call') ? 'Tool Calls' :
+                c.name.startsWith('message') || c.name.startsWith('content') ? 'Message' :
+                c.name.startsWith('usage') ? 'Usage' : 'Top-Level';
+    if (!groups[cat]) groups[cat] = [];
+    groups[cat].push(c);
+  });
+  for (const [cat, items] of Object.entries(groups)) {
+    html += `<div class="sec"><div class="sec-h">${cat}</div>`;
+    items.forEach(c => {
+      const cls = c.ok ? 'ok' : (c.required ? 'err' : 'warn');
+      const badge = c.ok ? '<span class="badge pass">PASS</span>' : (c.required ? '<span class="badge fail">FAIL</span>' : '<span class="badge na">WARN</span>');
+      html += `<div class="row">${badge} <span class="k">${E(c.name)}</span><span class="v ${cls}">${E(c.val)}</span></div>`;
+    });
+    html += '</div>';
+  }
+  fv.innerHTML = html;
+  switchTab(1);
+}
 
 async function go(){
 let t=$('inp').value.trim();if(!t)return;$('inp').value='';
@@ -106,14 +249,17 @@ let m=d.choices?.[0]?.message||{},fr=d.choices?.[0]?.finish_reason||'?';
 H.push({role:'assistant',content:m.content||(m.tool_calls?'[Called: '+m.tool_calls.map(t=>t.function?.name).join(',')+']':'')});
 addM('a',m.content,{rc:m.reasoning_content,tc:m.tool_calls,fr,md:d.model,ms});
 $('dm').textContent=fr+' | '+d.model+' | '+ms+'ms';
+showFmt(validateOpenAI(d, false));
 }else{
 let rd=r.body.getReader(),dc=new TextDecoder(),buf='',fc='',fr_='',tc=null,fn=null,rm=md;
+let allChunks=[],gotDone=false;
 let dv=addM('a','');L('\n=== STREAM ===');
 while(true){let{done,value}=await rd.read();if(done)break;
 buf+=dc.decode(value,{stream:true});let ls=buf.split('\n');buf=ls.pop();
 for(let l of ls){if(!l.startsWith('data: '))continue;let s=l.slice(6).trim();
-if(s==='[DONE]'){L('[DONE]');continue}
-try{let c=JSON.parse(s),dl=c.choices?.[0]?.delta||{},f=c.choices?.[0]?.finish_reason;rm=c.model||rm;
+if(s==='[DONE]'){L('[DONE]');gotDone=true;continue}
+try{let c=JSON.parse(s);allChunks.push(c);
+let dl=c.choices?.[0]?.delta||{},f=c.choices?.[0]?.finish_reason;rm=c.model||rm;
 if(dl.reasoning_content){fr_+=dl.reasoning_content;L('δ think: '+dl.reasoning_content.slice(0,50))}
 if(dl.content){fc+=dl.content;if(fc.length<100||fc.length%200<dl.content.length)L('δ text: '+dl.content.slice(0,60))}
 if(dl.tool_calls){tc=dl.tool_calls;L('δ tools: '+JSON.stringify(dl.tool_calls))}
@@ -126,8 +272,10 @@ if(fn)h+=`<div class="mt">${fn} | ${rm} | ${((Date.now()-t0)/1000).toFixed(1)}s<
 dv.innerHTML=h;$('msgs').scrollTop=9e9}
 H.push({role:'assistant',content:fc||(tc?'[Called: '+tc.map(t=>t.function?.name).join(',')+']':'')});
 $('dm').textContent=(fn||'?')+' | '+rm+' | '+fc.length+'ch';
+allChunks._gotDone=gotDone;
+showFmt(validateOpenAI(allChunks, true));
 }
-}catch(e){L('\n=== ERR ===\n'+e.message);addM('error',e.message)}
+}catch(e){L('\n=== ERR ===\n'+e.message);addM('error',e.message);showFmt(null)}
 $('st').textContent='ready';$('btn').disabled=false;$('inp').focus()}
 </script>
 </body>
