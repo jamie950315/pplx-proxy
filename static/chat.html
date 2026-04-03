@@ -61,6 +61,7 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);height:100vh
 <button id="tlb" onclick="tglTools()" style="background:var(--border)">Tools OFF</button>
 <input id="key" placeholder="API key" style="width:90px">
 <span style="font-size:9px;color:var(--dim)" id="st">ready</span>
+<span style="font-size:9px;color:var(--dim)" id="dm"></span>
 </div>
 <div class="main">
 <div class="chat">
@@ -248,8 +249,8 @@ L('\n=== RESP ('+ms+'ms) ===\n'+JSON.stringify(d,null,2));
 let m=d.choices?.[0]?.message||{},fr=d.choices?.[0]?.finish_reason||'?';
 H.push({role:'assistant',content:m.content||(m.tool_calls?'[Called: '+m.tool_calls.map(t=>t.function?.name).join(',')+']':'')});
 addM('a',m.content,{rc:m.reasoning_content,tc:m.tool_calls,fr,md:d.model,ms});
-$('dm').textContent=fr+' | '+d.model+' | '+ms+'ms';
 showFmt(validateOpenAI(d, false));
+$('dm').textContent=fr+' | '+d.model+' | '+ms+'ms';
 }else{
 let rd=r.body.getReader(),dc=new TextDecoder(),buf='',fc='',fr_='',tc=null,fn=null,rm=md;
 let allChunks=[],gotDone=false;
@@ -271,9 +272,9 @@ h+=`<div>${E(fc)}</div>`;
 if(fn)h+=`<div class="mt">${fn} | ${rm} | ${((Date.now()-t0)/1000).toFixed(1)}s</div>`;
 dv.innerHTML=h;$('msgs').scrollTop=9e9}
 H.push({role:'assistant',content:fc||(tc?'[Called: '+tc.map(t=>t.function?.name).join(',')+']':'')});
-$('dm').textContent=(fn||'?')+' | '+rm+' | '+fc.length+'ch';
 allChunks._gotDone=gotDone;
 showFmt(validateOpenAI(allChunks, true));
+$('dm').textContent=(fn||'?')+' | '+rm+' | '+fc.length+'ch';
 }
 }catch(e){L('\n=== ERR ===\n'+e.message);addM('error',e.message);showFmt(null)}
 $('st').textContent='ready';$('btn').disabled=false;$('inp').focus()}
