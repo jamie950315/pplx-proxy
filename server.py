@@ -442,9 +442,26 @@ async def _stream_openai(client, query, mode, model_pref, model_name, cid, creat
 
         dt=chunk.get("delta", "")
         if dt:
-            d={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
-               "choices": [{"index": 0, "delta": {"content": dt}, "finish_reason": None}]}
-            yield f"data: {json.dumps(d)}\n\n"
+            # Break large deltas into word-sized chunks for real streaming
+            if len(dt) > 100:
+                words=dt.split(" ")
+                buf=""
+                for w in words:
+                    buf+=(" " if buf else "") + w
+                    if len(buf) >= 20:
+                        d={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
+                           "choices": [{"index": 0, "delta": {"content": buf}, "finish_reason": None}]}
+                        yield f"data: {json.dumps(d)}\n\n"
+                        buf=""
+                        await asyncio.sleep(0.02)
+                if buf:
+                    d={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
+                       "choices": [{"index": 0, "delta": {"content": buf}, "finish_reason": None}]}
+                    yield f"data: {json.dumps(d)}\n\n"
+            else:
+                d={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
+                   "choices": [{"index": 0, "delta": {"content": dt}, "finish_reason": None}]}
+                yield f"data: {json.dumps(d)}\n\n"
 
         if chunk.get("done"):
             wr=chunk.get("web_results", [])
