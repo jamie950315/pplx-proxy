@@ -2,9 +2,10 @@
 
 Reverse proxy for [Perplexity.ai](https://www.perplexity.ai) — use your existing **Pro/Max subscription cookie** to access all models via standard APIs.
 
-Exposes two interfaces:
-- **OpenAI-compatible REST API** (`/v1/chat/completions`)
-- **MCP server** (Streamable HTTP + SSE)
+Exposes three interfaces:
+- **OpenAI-compatible REST API** (`/v1/chat/completions`) — streaming, tool calling, thinking
+- **MCP server** (Streamable HTTP + SSE) — 5 built-in tools
+- **Debug chat UI** (`/chat`) — test everything with real-time OpenAI format validation
 
 ## How It Works
 
@@ -14,13 +15,17 @@ No official API key needed — just your subscription.
 
 ## Features
 
-- **Account tier support**: free/pro/max — only exposes models your tier can access
-- **Auto-discovery**: background task checks model health every 24h, auto-upgrades when versions change
-- **Session keep-alive**: periodic pings prevent cookie expiry
-- **Push notifications**: [ntfy.sh](https://ntfy.sh) alerts on cookie expiry or model upgrades
-- **Dynamic model management**: add/remove models at runtime via admin API
-- **Full input validation**: proper error messages for every malformed request
-- **Zero hardcoded values**: every parameter lives in `.env`
+- **Full OpenAI format compliance** — `system_fingerprint`, `logprobs`, proper `usage` arithmetic, all fields per spec
+- **Tool calling** — OpenAI-style function calling via prompt injection with 3-layer false-positive defense
+- **Thinking/reasoning** — `thinking: true` or `reasoning_effort` param, reasoning streamed as `reasoning_content`
+- **Account tier support** — free/pro/max — only exposes models your tier can access
+- **Auto-discovery** — background task checks model health every 24h, auto-upgrades when versions change
+- **Response cleaning** — strips Perplexity citations `[1][2]`, `<grok:*>` tags, `<?xml?>` declarations, `<script>` tags
+- **Session keep-alive** — periodic pings prevent cookie expiry
+- **Push notifications** — [ntfy.sh](https://ntfy.sh) alerts on cookie expiry or model upgrades
+- **Debug chat UI** — `/chat` page with tools toggle, thinking toggle, streaming toggle, and **OpenAI format validator**
+- **Dynamic model management** — add/remove models at runtime via admin API
+- **Full input validation** — proper error messages for every malformed request
 
 ## Quick Start
 
@@ -36,6 +41,8 @@ cp .env.example .env
 venv/bin/uvicorn server:app --host 0.0.0.0 --port 8892
 ```
 
+Then open **http://localhost:8892/chat** to test with the debug UI.
+
 ## Getting Your Cookie
 
 1. Log in to [perplexity.ai](https://www.perplexity.ai)
@@ -43,42 +50,28 @@ venv/bin/uvicorn server:app --host 0.0.0.0 --port 8892
 3. Copy `next-auth.session-token`
 4. Set `PPLX_COOKIE=<value>` in `.env`
 
-## Models by Account Tier
+## Models
 
-### FREE ($0/mo)
+| Model ID | Backend | Tier | Thinking Variant |
+|----------|---------|------|-----------------|
+| `auto` | Perplexity Best | free+ | — |
+| `sonar` | Sonar | pro+ | — |
+| `gpt` | GPT-5.4 | pro+ | `gpt54_thinking` |
+| `sonnet` | Claude Sonnet 4.6 | pro+ | `claude46sonnetthinking` |
+| `gemini` | Gemini 3.1 Pro | pro+ | always on |
+| `nemotron` | Nemotron 3 Super | pro+ | always on |
+| `opus` | Claude Opus 4.6 | max | `claude46opusthinking` |
 
-| Model ID | Backend |
-|----------|---------|
-| `auto` | Perplexity Best (auto-select) |
-
-### PRO ($20/mo)
-
-| Model ID | Backend | Thinking |
-|----------|---------|----------|
-| `auto` | Perplexity Best | — |
-| `sonar` | Sonar | — |
-| `gpt` | GPT-5.4 | `gpt-thinking` |
-| `sonnet` | Claude Sonnet 4.6 | `sonnet-thinking` |
-| `gemini` | Gemini 3.1 Pro | always on |
-| `nemotron` | Nemotron 3 Super | always on |
-
-### MAX ($200/mo)
-
-Everything in PRO, plus:
-
-| Model ID | Backend | Thinking |
-|----------|---------|----------|
-| `opus` | Claude Opus 4.6 | `opus-thinking` |
-
-Using a model outside your tier returns `403` with a clear error message.
+Thinking variants are activated via `thinking: true` or `reasoning_effort` parameter — no separate model names needed.
 
 ## API Endpoints
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | `GET` | `/health` | No | Health check |
+| `GET` | `/chat` | No | **Debug chat UI with OpenAI format validator** |
 | `GET` | `/v1/models` | Yes | List tier-available models |
-| `POST` | `/v1/chat/completions` | Yes | Chat (streaming + non-streaming) |
+| `POST` | `/v1/chat/completions` | Yes | Chat (streaming + non-streaming + tools + thinking) |
 | `POST` | `/mcp/mcp` | No | MCP Streamable HTTP |
 | `GET` | `/sse/sse` | No | MCP SSE |
 | `GET` | `/admin/models` | Yes | Full model map |
@@ -91,11 +84,38 @@ Using a model outside your tier returns `403` with a clear error message.
 ### OpenAI API
 
 ```bash
+# Basic chat
 curl -X POST http://localhost:8892/v1/chat/completions \
   -H "Authorization: Bearer YOUR_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model": "gpt", "messages": [{"role": "user", "content": "Hello"}], "stream": true}'
+  -d '{"model": "sonnet", "messages": [{"role": "user", "content": "Hello"}], "stream": true}'
+
+# With thinking
+curl -X POST http://localhost:8892/v1/chat/completions \
+  -H "Authorization: Bearer YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "gpt", "messages": [{"role": "user", "content": "Analyze X"}], "thinking": true}'
+
+# With tool calling
+curl -X POST http://localhost:8892/v1/chat/completions \
+  -H "Authorization: Bearer YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "sonnet",
+    "messages": [{"role": "user", "content": "Weather in Tokyo"}],
+    "tools": [{"type": "function", "function": {"name": "get_weather", "description": "Get weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
+  }'
 ```
+
+### Debug Chat UI
+
+Open **http://localhost:8892/chat** (or `https://your-domain/chat`) in a browser:
+
+- Toggle **Tools ON/OFF** to test tool calling
+- Toggle **thinking** to test reasoning mode
+- Toggle **stream** for streaming vs non-streaming
+- **Raw tab**: shows full request/response JSON
+- **Format ✓ tab**: validates every response field against the OpenAI spec with PASS/FAIL badges
 
 ### MCP
 
@@ -114,18 +134,34 @@ claude mcp add pplx-proxy --transport http http://localhost:8892/mcp/mcp
 | `perplexity_research` | Deep Research |
 | `perplexity_models` | List available models for your tier |
 
+## Tool Calling
+
+Tool calling is implemented via prompt injection (Perplexity has no native tool calling API). The proxy appends a compact tool definition prompt to the query and parses XML responses back into OpenAI tool_calls format.
+
+**3-layer defense against false positives:**
+
+1. **Relevance heuristic**: tool prompt only injected if user message has keyword overlap with tool names/descriptions. "Hello" with tools → no tool prompt injected.
+2. **Schema validation**: parsed tool calls validated against definitions — function name must exist, required params must be present and non-empty.
+3. **XML cleanup**: if model wraps response in `<response>`, `<answer>` etc. but it's not a real tool call, XML is stripped and clean text is returned.
+
+Supports `tool_choice`: `auto` (default), `none` (suppress tools), `required` (force tool call).
+
+## OpenAI Format Compliance
+
+All responses strictly match the [OpenAI Chat Completions API spec](https://platform.openai.com/docs/api-reference/chat/object):
+
+- `id` (chatcmpl-*), `object`, `created`, `model`, `system_fingerprint` (null)
+- `choices[].index`, `choices[].logprobs` (null), `choices[].finish_reason`
+- `choices[].message.role`, `.content`, `.tool_calls`
+- `usage.total_tokens` = `prompt_tokens` + `completion_tokens`
+- Streaming: consistent `id`, `system_fingerprint` in every chunk, proper `[DONE]` termination
+- Tool calls: `id` (call_*), `type` (function), `function.name`, `function.arguments` (valid JSON string)
+
+**Use `/chat` to visually verify** — the Format ✓ tab runs 20+ checks per response.
+
 ## Auto-Discovery
 
-Every `PROBE_INTERVAL_HOURS` (default 24h), pplx-proxy checks if models are still alive. If one dies, it increments the version number (e.g., `gpt54` → `gpt55` → ... up to +1.0) and auto-upgrades. Thinking variants follow their base model automatically.
-
-| Model | Probe strategy |
-|-------|---------------|
-| `sonar` | alive check only |
-| `gpt` | gpt54 → gpt55...gpt64 (max 10), thinking auto-follows |
-| `sonnet` | claude46sonnet → claude47...claude56 (max 10), thinking auto-follows |
-| `opus` | claude46opus → claude47...claude56 (max 10), thinking auto-follows |
-| `gemini` | gemini31pro_high → gemini32...gemini41 (max 10) |
-| `nemotron` | nv_nemotron_3_super → nv_nemotron_4 (max 1) |
+Every `PROBE_INTERVAL_HOURS` (default 24h), pplx-proxy checks if models are still alive. If one dies, it increments the version number (e.g., `gpt54` → `gpt55` → ... up to +1.0) and auto-upgrades. Thinking variants are auto-derived from `_THINKING_MAP`.
 
 Manual trigger: `POST /admin/discover-models`
 
