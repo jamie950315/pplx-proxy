@@ -102,7 +102,7 @@ function addM(r,c,x={}){
 let d=document.createElement('div');d.className='m '+(r==='user'?'u':r==='error'?'e':'a');
 let h='';
 if(x.rc)h+=`<div class="th"><b>🧠 reasoning</b><br>${E(x.rc)}</div>`;
-if(x.tc)h+=`<div class="tc">🔧 tool_calls\n${x.tc.map(t=>'  '+t.function?.name+'('+t.function?.arguments+')').join('\n')}</div>`;
+if(x.tc)h+=`<div class="tc">🔧 tool_calls\n${x.tc.map(t=>'  '+E(t.function?.name)+'('+E(t.function?.arguments)+')').join('\n')}</div>`;
 h+=`<div>${E(c)}</div>`;
 let ci=(c||'').match(/\[\d+\]/g);
 if(ci)h+=`<div class="w">⚠️ citations: ${ci.join(' ')}</div>`;
@@ -266,7 +266,7 @@ if(dl.tool_calls){tc=dl.tool_calls;L('δ tools: '+JSON.stringify(dl.tool_calls))
 if(f){fn=f;L('finish: '+f)}
 }catch(e){L('err: '+e.message)}}
 let h='';if(fr_)h+=`<div class="th"><b>🧠 reasoning</b><br>${E(fr_)}</div>`;
-if(tc)h+=`<div class="tc">🔧 tool_calls\n${tc.map(t=>'  '+t.function?.name+'('+t.function?.arguments+')').join('\n')}</div>`;
+if(tc)h+=`<div class="tc">🔧 tool_calls\n${tc.map(t=>'  '+E(t.function?.name)+'('+E(t.function?.arguments)+')').join('\n')}</div>`;
 h+=`<div>${E(fc)}</div>`;
 if(fn)h+=`<div class="mt">${fn} | ${rm} | ${((Date.now()-t0)/1000).toFixed(1)}s</div>`;
 dv.innerHTML=h;$('msgs').scrollTop=9e9}
