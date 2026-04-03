@@ -31,7 +31,7 @@ Single FastAPI app (`server.py`, ~1440 lines) that:
 2. **Schema validation** (`_validate_tool_calls`): validates function name, required params present, no empty values
 3. **XML cleanup** (`_strip_xml_wrapper`): strips `<response>`, `<answer>` wrappers when not a tool call
 
-**Context Management**: system prompt / conversation history / current message separated. Empty assistant messages (from tool_calls) → `[done]` placeholder. Assistant messages truncated to 200 chars. Last 16 items (~8 turns) kept. Tool results formatted as `Result: {content}`.
+**Context Management**: system prompt / conversation history / current message separated. Assistant messages with tool_calls → `[Called tools: get_user({"user_id": 42})]`. Empty assistant messages → `[done]`. Assistant messages truncated to 600 chars. Tool results truncated to 400 chars. Last 16 items (~8 turns) kept. Current user message prefixed with `User's current request:` when history exists (prevents topic bleeding).
 
 **Response Cleaning** (`_clean_response`): strips `[1]` `[2]` citations, `<grok:*>` tags, `<?xml?>` declarations, `<response>` wrappers, `<script>` tags.
 
