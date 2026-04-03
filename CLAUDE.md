@@ -6,7 +6,7 @@
 
 ## Architecture
 
-Single FastAPI app (`server.py`, ~1440 lines) that:
+Single FastAPI app (`server.py`, ~1500 lines) that:
 
 1. Receives OpenAI-format or MCP tool call requests
 2. Translates to Perplexity's internal SSE (`POST /rest/sse/perplexity_ask`)
