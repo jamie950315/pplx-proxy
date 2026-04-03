@@ -726,6 +726,15 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
             tid=msg.get("tool_call_id", "")
             history.append(("tool", f"Result: {content[:400]}"))
 
+    # Deduplicate consecutive assistant messages (LibreChat branch artifacts)
+    deduped=[]
+    for role, content in history:
+        if deduped and role == "assistant" and deduped[-1][0] == "assistant":
+            deduped[-1]=(role, content)  # replace with latest
+        else:
+            deduped.append((role, content))
+    history=deduped
+
     # Keep only last 16 items (~8 turns) to prevent context overflow
     if len(history) > 16:
         history=history[-16:]
@@ -739,7 +748,10 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
     # Build query: system + history context + current request
     parts=[]
     if system_msg:
-        parts.append(system_msg)
+        # Truncate system prompt to prevent it from dominating Perplexity's search
+        if len(system_msg) > 500:
+            system_msg=system_msg[:500] + "..."
+        parts.append(f"[System instructions — do not search for this]\n{system_msg}")
     if history:
         ctx_lines=[]
         for role, content in history:
