@@ -69,15 +69,18 @@ _DEFAULT_MODEL_MAP={
     "pplx-auto": ("auto", "turbo"),
     "pplx-pro": ("pro", "pplx_pro"),
     "pplx-pro-sonar": ("pro", "experimental"),
-    "pplx-pro-gpt5": ("pro", "gpt52"),
-    "pplx-pro-claude": ("pro", "claude45sonnet"),
+    "pplx-pro-gpt5": ("pro", "gpt54"),
+    "pplx-pro-claude": ("pro", "claude46sonnet"),
     "pplx-pro-grok": ("pro", "grok41nonreasoning"),
+    "pplx-pro-gemini": ("pro", "gemini31pro"),
+    "pplx-pro-nemotron": ("pro", "nemotron3super"),
     "pplx-reasoning": ("reasoning", "pplx_reasoning"),
-    "pplx-reasoning-gpt5": ("reasoning", "gpt52_thinking"),
-    "pplx-reasoning-claude": ("reasoning", "claude45sonnetthinking"),
+    "pplx-reasoning-gpt5": ("reasoning", "gpt54_thinking"),
+    "pplx-reasoning-claude": ("reasoning", "claude46sonnetthinking"),
     "pplx-reasoning-gemini": ("reasoning", "gemini30pro"),
     "pplx-reasoning-kimi": ("reasoning", "kimik2thinking"),
     "pplx-reasoning-grok": ("reasoning", "grok41reasoning"),
+    "pplx-reasoning-nemotron": ("reasoning", "nemotron3super"),
     "pplx-deep-research": ("deep research", "pplx_alpha"),
 }
 
@@ -499,7 +502,8 @@ if HAS_MCP:
             return "Error: query cannot be empty"
         mm=get_model_map()
         shorthand={"gpt5": "pplx-reasoning-gpt5", "claude": "pplx-reasoning-claude",
-                    "gemini": "pplx-reasoning-gemini", "kimi": "pplx-reasoning-kimi", "grok": "pplx-reasoning-grok"}
+                    "gemini": "pplx-reasoning-gemini", "kimi": "pplx-reasoning-kimi",
+                    "grok": "pplx-reasoning-grok", "nemotron": "pplx-reasoning-nemotron"}
         if model == "default":
             mode, pref="reasoning", "pplx_reasoning"
         elif model in mm:
