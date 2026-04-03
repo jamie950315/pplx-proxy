@@ -31,7 +31,7 @@ PORT=int(os.getenv("PPLX_PROXY_PORT", "8892"))
 LOG_LEVEL=os.getenv("LOG_LEVEL", "INFO")
 COOKIE_FILE=Path(__file__).parent / ".cookie_cache.json"
 MODELS_FILE=Path(__file__).parent / ".models.json"
-DEFAULT_MODEL=os.getenv("DEFAULT_MODEL", "gpt5")
+DEFAULT_MODEL=os.getenv("DEFAULT_MODEL", "gpt")
 ACCOUNT_TYPE=os.getenv("ACCOUNT_TYPE", "pro").lower()  # free, pro, max
 PUBLIC_URL=os.getenv("PUBLIC_URL", "http://localhost:8892")
 PPLX_API_VERSION=os.getenv("PPLX_API_VERSION", "2.18")
@@ -70,8 +70,8 @@ DEFAULT_HEADERS={
 _ALL_MODELS={
     "auto": ("pro", "pplx_pro"),
     "sonar": ("pro", "experimental"),
-    "gpt5": ("pro", "gpt54"),
-    "gpt5-thinking": ("pro", "gpt54_thinking"),
+    "gpt": ("pro", "gpt54"),
+    "gpt-thinking": ("pro", "gpt54_thinking"),
     "gemini": ("pro", "gemini31pro_high"),
     "sonnet": ("pro", "claude46sonnet"),
     "sonnet-thinking": ("pro", "claude46sonnetthinking"),
@@ -83,10 +83,10 @@ _ALL_MODELS={
 # Model availability per account tier
 _TIER_MODELS={
     "free": {"auto"},
-    "pro": {"auto", "sonar", "gpt5", "gpt5-thinking",
+    "pro": {"auto", "sonar", "gpt", "gpt-thinking",
             "gemini", "sonnet", "sonnet-thinking",
             "nemotron"},
-    "max": {"auto", "sonar", "gpt5", "gpt5-thinking",
+    "max": {"auto", "sonar", "gpt", "gpt-thinking",
             "gemini", "sonnet", "sonnet-thinking",
             "nemotron", "opus", "opus-thinking"},
 }
@@ -731,10 +731,10 @@ if HAS_MCP:
         if not query or not query.strip():
             return "Error: query cannot be empty"
         mm=get_model_map()
-        shorthand={"gpt5": "gpt5-thinking", "claude": "sonnet-thinking", "opus": "opus-thinking", "gemini": "gemini", "nemotron": "nemotron"}
+        shorthand={"gpt": "gpt-thinking", "claude": "sonnet-thinking", "opus": "opus-thinking", "gemini": "gemini", "nemotron": "nemotron"}
         resolved=model
         if model == "default":
-            resolved="gpt5-thinking"
+            resolved="gpt-thinking"
         elif model in shorthand:
             resolved=shorthand[model]
         tier_err=check_tier(resolved)

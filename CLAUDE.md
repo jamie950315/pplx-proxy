@@ -78,7 +78,7 @@ All tools validate: empty query, invalid model, invalid sources, tier restrictio
 Only base models are probed. Thinking variants auto-follow.
 
 - `sonar` (`experimental`) → alive check only, no version pattern
-- `gpt5` (`gpt54`) → gpt55...gpt64 (max 10)
+- `gpt` (`gpt54`) → gpt55...gpt64 (max 10)
 - `sonnet` (`claude46sonnet`) → claude47...claude56 (max 10)
 - `opus` (`claude46opus`) → claude47...claude56 (max 10)
 - `gemini` (`gemini31pro_high`) → gemini32...gemini41 (max 10)
