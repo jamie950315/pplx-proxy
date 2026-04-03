@@ -1245,9 +1245,53 @@ if HAS_MCP:
         log.info("MCP streamable HTTP lifespan stopped")
 
     app.router.lifespan_context=_combined_lifespan
-    app.mount("/mcp", mcp_http_app)
-    app.mount("/sse", mcp_sse_app)
-    log.info("MCP mounted at /mcp (streamable HTTP) + /sse (SSE)")
+    # MCP Auth: API key in URL path
+    # With key: /{API_KEY}/mcp and /{API_KEY}/sse
+    # Without:  /mcp/mcp and /sse/sse (backward compat)
+    if API_KEY:
+        _mcp_prefix=f"/{API_KEY}"
+        _mcp_pfx_len=len(_mcp_prefix)
+
+        class _MCPAuthMiddleware:
+            """Intercepts /{KEY}/mcp|sse, validates key, calls MCP apps directly."""
+            def __init__(self, asgi_app):
+                self.app=asgi_app
+            async def __call__(self, scope, receive, send):
+                if scope["type"] in ("http", "websocket"):
+                    path=scope.get("path", "")
+                    # Authenticated MCP paths — route directly to MCP apps
+                    if path.startswith(_mcp_prefix + "/mcp"):
+                        s=dict(scope)
+                        s["path"]=path[_mcp_pfx_len:]
+                        if s.get("raw_path"):
+                            s["raw_path"]=s["raw_path"][_mcp_pfx_len:] if isinstance(s["raw_path"], bytes) else s["raw_path"]
+                        await mcp_http_app(s, receive, send)
+                        return
+                    if path.startswith(_mcp_prefix + "/sse") or path.startswith(_mcp_prefix + "/messages"):
+                        s=dict(scope)
+                        s["path"]=path[_mcp_pfx_len:]
+                        if s.get("raw_path"):
+                            s["raw_path"]=s["raw_path"][_mcp_pfx_len:] if isinstance(s["raw_path"], bytes) else s["raw_path"]
+                        await mcp_sse_app(s, receive, send)
+                        return
+                    # Allow /messages for SSE transport (session_id is the auth)
+                    if path.startswith("/messages"):
+                        await mcp_sse_app(scope, receive, send)
+                        return
+                    # Block bare /mcp and /sse without key
+                    if path.startswith("/mcp") or path.startswith("/sse"):
+                        from starlette.responses import JSONResponse as _JR
+                        await _JR({"error": {"message": "MCP requires authentication. Use /<api-key>/mcp or /<api-key>/sse", "type": "auth_error"}}, status_code=401)(scope, receive, send)
+                        return
+                await self.app(scope, receive, send)
+
+        app.add_middleware(_MCPAuthMiddleware)
+        log.info(f"MCP mounted with key auth: /{API_KEY[:8]}***/mcp + /{API_KEY[:8]}***/sse")
+    else:
+        app.mount("/mcp", mcp_http_app)
+        app.mount("/sse", mcp_sse_app)
+        log.info("MCP mounted at /mcp/mcp + /sse/sse [NO AUTH]")
+        log.warning("MCP has NO authentication! Set PPLX_PROXY_API_KEY to secure it.")
 
 
 # ─── Model Management ──────────────────────────────────────────────────

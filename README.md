@@ -72,8 +72,8 @@ Thinking variants are activated via `thinking: true` or `reasoning_effort` param
 | `GET` | `/chat` | No | **Debug chat UI with OpenAI format validator** |
 | `GET` | `/v1/models` | Yes | List tier-available models |
 | `POST` | `/v1/chat/completions` | Yes | Chat (streaming + non-streaming + tools + thinking) |
-| `POST` | `/mcp/mcp` | No | MCP Streamable HTTP |
-| `GET` | `/sse/sse` | No | MCP SSE |
+| `POST` | `/<api-key>/mcp` | Key in URL | MCP Streamable HTTP |
+| `GET` | `/<api-key>/sse` | Key in URL | MCP SSE |
 | `GET` | `/admin/models` | Yes | Full model map |
 | `POST` | `/admin/update-models` | Yes | Add/replace models |
 | `POST` | `/admin/refresh-cookie` | Yes | Inject new session token |
@@ -119,10 +119,17 @@ Open **http://localhost:8892/chat** (or `https://your-domain/chat`) in a browser
 
 ### MCP
 
+The API key is part of the URL path for MCP authentication:
+
 ```bash
 # Claude Code
-claude mcp add pplx-proxy --transport http http://localhost:8892/mcp/mcp
+claude mcp add pplx-proxy --transport http http://localhost:8892/YOUR_API_KEY/mcp
+
+# SSE transport
+# Connect to http://localhost:8892/YOUR_API_KEY/sse
 ```
+
+Without `PPLX_PROXY_API_KEY` set, MCP falls back to unauthenticated `/mcp/mcp` and `/sse/sse`.
 
 **MCP Tools:**
 
