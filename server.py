@@ -212,9 +212,10 @@ class PerplexityClient:
                 asyncio.create_task(notify_cookie_expired(f"Perplexity returned HTTP {resp.status_code}"))
             return
 
-        last_answer=""
+        full_answer=""
         backend_uuid=None
         web_results=[]
+        seen_len=0  # track cumulative answer length to deduplicate
 
         async for line in resp.aiter_lines(delimiter=b"\r\n\r\n"):
             content=line.decode("utf-8") if isinstance(line, bytes) else line
@@ -229,33 +230,38 @@ class PerplexityClient:
             except json.JSONDecodeError:
                 continue
 
-            if "text" in chunk and chunk["text"]:
-                try:
-                    text_parsed=json.loads(chunk["text"])
-                    if isinstance(text_parsed, list):
-                        for step in text_parsed:
-                            if step.get("step_type") == "FINAL":
-                                fc=step.get("content", {})
-                                if "answer" in fc:
-                                    ad=json.loads(fc["answer"])
-                                    chunk["answer"]=ad.get("answer", "")
-                                    chunk["chunks"]=ad.get("chunks", [])
-                    chunk["text"]=text_parsed
-                except (json.JSONDecodeError, TypeError, KeyError):
-                    pass
-
             if "backend_uuid" in chunk:
                 backend_uuid=chunk["backend_uuid"]
             if "web_results" in chunk:
                 web_results=chunk["web_results"]
 
-            current_answer=chunk.get("answer", "")
-            if current_answer and len(current_answer) > len(last_answer):
-                delta=current_answer[len(last_answer):]
-                last_answer=current_answer
-                yield {"delta": delta, "answer": current_answer, "backend_uuid": backend_uuid, "web_results": web_results, "done": False}
+            # Extract streaming text from blocks[].markdown_block
+            blocks=chunk.get("blocks", [])
+            for block in blocks:
+                usage=block.get("intended_usage", "")
+                if "markdown" not in usage:
+                    continue
+                mb=block.get("markdown_block", {})
+                if not mb:
+                    continue
+                progress=mb.get("progress", "")
+                chunks=mb.get("chunks", [])
+                if not chunks:
+                    continue
+                if progress == "DONE":
+                    # Final: full cumulative text
+                    full_answer="".join(chunks)
+                else:
+                    # Incremental: extract only new text
+                    chunk_text="".join(chunks)
+                    cumulative=full_answer + chunk_text
+                    if len(cumulative) > seen_len:
+                        delta=cumulative[seen_len:]
+                        full_answer=cumulative
+                        seen_len=len(cumulative)
+                        yield {"delta": delta, "answer": full_answer, "backend_uuid": backend_uuid, "web_results": web_results, "done": False}
 
-        yield {"delta": "", "answer": last_answer, "backend_uuid": backend_uuid, "web_results": web_results, "done": True}
+        yield {"delta": "", "answer": full_answer, "backend_uuid": backend_uuid, "web_results": web_results, "done": True}
 
 
 # ─── Cookie Management ──────────────────────────���──────────────────────────
