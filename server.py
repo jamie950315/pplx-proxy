@@ -66,7 +66,6 @@ DEFAULT_HEADERS={
 
 # Default model map — overridden by .models.json if it exists
 _DEFAULT_MODEL_MAP={
-    "pplx-auto": ("pro", "pplx_pro"),
     "pplx-sonar": ("pro", "experimental"),
     "pplx-gpt5": ("pro", "gpt54"),
     "pplx-gpt5-thinking": ("pro", "gpt54_thinking"),
@@ -76,8 +75,6 @@ _DEFAULT_MODEL_MAP={
     "pplx-opus": ("pro", "claude46opus"),
     "pplx-opus-thinking": ("pro", "claude46opusthinking"),
     "pplx-nemotron": ("pro", "nv_nemotron_3_super"),
-    "pplx-deep-research": ("pro", "pplx_alpha"),
-    "pplx-labs": ("pro", "pplx_beta"),
 }
 
 def load_model_map() -> dict:
@@ -489,7 +486,7 @@ async def discover_models(request: Request, _=Depends(verify_api_key)):
     """Smart model discovery:
     1. Skip thinking variants (they follow their base model)
     2. Check if each base model still works
-    3. If dead, increment version until found or +2.0 reached
+    3. If dead, increment version until found or +1.0 reached
     4. Auto-upgrade thinking variant along with base
     """
     client=get_client()
@@ -547,7 +544,7 @@ async def discover_models(request: Request, _=Depends(verify_api_key)):
 
             while True:
                 ma, mi=_increment_version(ma, mi)
-                if _version_distance(orig_ma, orig_mi, ma, mi) > 2.0:
+                if _version_distance(orig_ma, orig_mi, ma, mi) > 1.0:
                     break
                 new_pref=template.format(prefix=prefix, ma=ma, mi=mi, suffix=suffix)
                 report["probed"]+=1
@@ -579,13 +576,13 @@ async def discover_models(request: Request, _=Depends(verify_api_key)):
                 await asyncio.sleep(2)
 
             if not found:
-                report["dead"].append({"model": model_id, "pref": pref, "reason": "no valid version within +2.0"})
+                report["dead"].append({"model": model_id, "pref": pref, "reason": "no valid version within +1.0"})
 
         elif len(groups) == 3:
             prefix, gen_s, suffix=groups
             orig_gen=int(gen_s)
             found=False
-            for gen in range(orig_gen+1, orig_gen+3):
+            for gen in range(orig_gen+1, orig_gen+2):
                 new_pref=template.format(prefix=prefix, ma=gen, suffix=suffix)
                 report["probed"]+=1
                 if await probe_model(client, new_pref):
@@ -785,6 +782,7 @@ async def get_models_admin(_=Depends(verify_api_key)):
 # ─── Session Keep-Alive ────────────────────────────────────────────────────
 
 KEEPALIVE_HOURS=int(os.getenv("KEEPALIVE_HOURS", "6"))
+PROBE_INTERVAL_HOURS=int(os.getenv("PROBE_INTERVAL_HOURS", "24"))
 NTFY_TOPIC=os.getenv("NTFY_TOPIC", "pplx-proxy")
 NTFY_URL=os.getenv("NTFY_URL", "https://ntfy.sh")
 _last_ntfy_ts=0.0
@@ -868,9 +866,67 @@ async def refresh_cookie_endpoint(request: Request, _=Depends(verify_api_key)):
     return {"status": "ok", "message": "Cookie updated and client reset", "models_loaded": len(MODEL_MAP)}
 
 
+async def auto_discover_loop():
+    """Background task: run model discovery every PROBE_INTERVAL_HOURS."""
+    log.info(f"Auto-discovery enabled: every {PROBE_INTERVAL_HOURS}h")
+    while True:
+        await asyncio.sleep(PROBE_INTERVAL_HOURS * 3600)
+        log.info("Scheduled model discovery starting...")
+        try:
+            client=get_client()
+            await client.init()
+            mm=get_model_map()
+            thinking_map={}
+            base_models={}
+            for mid, (mode, pref) in mm.items():
+                if mid.endswith("-thinking"):
+                    thinking_map[mid.replace("-thinking", "")]=mid
+                else:
+                    base_models[mid]=(mode, pref)
+            for model_id, (mode, pref) in base_models.items():
+                matched=False
+                for pattern, template in _VERSION_PATTERNS:
+                    m=pattern.match(pref)
+                    if m:
+                        matched=True
+                        break
+                if not matched:
+                    continue
+                ok=await probe_model(client, pref)
+                if ok:
+                    continue
+                # Dead — try upgrading
+                groups=m.groups()
+                if len(groups)==4:
+                    prefix,oma_s,omi_s,suffix=groups
+                    oma,omi=int(oma_s),int(omi_s)
+                    ma,mi=oma,omi
+                    while True:
+                        ma,mi=_increment_version(ma,mi)
+                        if _version_distance(oma,omi,ma,mi)>1.0:
+                            break
+                        new_pref=template.format(prefix=prefix,ma=ma,mi=mi,suffix=suffix)
+                        if await probe_model(client, new_pref):
+                            MODEL_MAP[model_id]=(mode, new_pref)
+                            if model_id in thinking_map:
+                                t_id=thinking_map[model_id]
+                                old_tp=mm[t_id][1]
+                                new_tp=new_pref+("_thinking" if "_thinking" in old_tp else "thinking")
+                                MODEL_MAP[t_id]=(mode, new_tp)
+                            save_model_map(MODEL_MAP)
+                            log.info(f"Auto-discovery: {model_id} upgraded {pref} → {new_pref}")
+                            await notify_cookie_expired(f"Model {model_id} auto-upgraded: {pref} → {new_pref}")
+                            break
+                        await asyncio.sleep(2)
+                await asyncio.sleep(2)
+        except Exception as e:
+            log.error(f"Auto-discovery error: {e}")
+
+
 @app.on_event("startup")
 async def startup():
     asyncio.create_task(session_keepalive_loop())
+    asyncio.create_task(auto_discover_loop())
     log.info(f"pplx-proxy started on port {PORT}")
 
 
