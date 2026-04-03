@@ -381,11 +381,9 @@ async def chat_ui():
 
 @app.get("/debug")
 async def debug_page():
-    """Serve debug chat interface."""
-    p=Path(__file__).parent / "debug.html"
-    if p.exists():
-        return HTMLResponse(p.read_text())
-    return HTMLResponse("<h1>debug.html not found</h1>", status_code=404)
+    """Redirect to /chat."""
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse("/chat")
 
 @app.get("/health")
 async def health():
@@ -744,6 +742,9 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
         parts.append(current_msg)
 
     query="\n\n".join(parts)
+
+    if not query.strip():
+        raise HTTPException(400, "No valid message content after processing. Ensure at least one user message has non-empty content.")
 
     # Tool calling: only inject if message seems tool-relevant
     if tools and isinstance(tools, list) and len(tools) > 0 and tool_choice != "none":
