@@ -9,8 +9,10 @@ User=jamie
 WorkingDirectory=/home/jamie/pplx-proxy
 EnvironmentFile=/home/jamie/pplx-proxy/.env
 ExecStart=/home/jamie/pplx-proxy/venv/bin/uvicorn server:app --host 0.0.0.0 --port 8892 --log-level info
-Restart=on-failure
-RestartSec=5
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=300
+StartLimitBurst=10
 StandardOutput=journal
 StandardError=journal
 
