@@ -487,26 +487,39 @@ async def probe_model(client, pref) -> bool:
 @app.post("/admin/discover-models")
 async def discover_models(request: Request, _=Depends(verify_api_key)):
     """Smart model discovery:
-    1. Check if each current model still works
-    2. If dead, increment version until found or +2.0 reached
-    3. If +2.0 exceeded, mark provider as unavailable
+    1. Skip thinking variants (they follow their base model)
+    2. Check if each base model still works
+    3. If dead, increment version until found or +2.0 reached
+    4. Auto-upgrade thinking variant along with base
     """
     client=get_client()
     await client.init()
 
     mm=get_model_map()
-    report={"alive": [], "upgraded": {}, "dead": [], "probed": 0}
 
-    for model_id, (mode, pref) in list(mm.items()):
-        # Skip non-versioned models (pplx_pro, experimental, etc.)
+    # Split into base models and thinking variants
+    thinking_map={}  # base_id → thinking_id
+    base_models={}   # base_id → (mode, pref)
+    for mid, (mode, pref) in mm.items():
+        if mid.endswith("-thinking"):
+            base_id=mid.replace("-thinking", "")
+            thinking_map[base_id]=mid
+        else:
+            base_models[mid]=(mode, pref)
+
+    report={"alive": [], "upgraded": {}, "dead": [], "skipped_thinking": list(thinking_map.values()), "probed": 0}
+
+    for model_id, (mode, pref) in base_models.items():
+        # Match against version patterns
         matched=False
         for pattern, template in _VERSION_PATTERNS:
             m=pattern.match(pref)
             if m:
                 matched=True
                 break
+
         if not matched:
-            # Non-versioned — just check alive
+            # Non-versioned (pplx_pro, experimental, etc.) — just check alive
             report["probed"]+=1
             ok=await probe_model(client, pref)
             if ok:
@@ -516,7 +529,7 @@ async def discover_models(request: Request, _=Depends(verify_api_key)):
             await asyncio.sleep(2)
             continue
 
-        # Versioned model — check if still alive
+        # Versioned — check if alive
         report["probed"]+=1
         ok=await probe_model(client, pref)
         if ok:
@@ -524,14 +537,14 @@ async def discover_models(request: Request, _=Depends(verify_api_key)):
             await asyncio.sleep(2)
             continue
 
-        # Dead — try incrementing version
+        # Dead — search for next version
         groups=m.groups()
         if len(groups) == 4:
             prefix, orig_ma_s, orig_mi_s, suffix=groups
             orig_ma, orig_mi=int(orig_ma_s), int(orig_mi_s)
             ma, mi=orig_ma, orig_mi
-
             found=False
+
             while True:
                 ma, mi=_increment_version(ma, mi)
                 if _version_distance(orig_ma, orig_mi, ma, mi) > 2.0:
@@ -539,40 +552,50 @@ async def discover_models(request: Request, _=Depends(verify_api_key)):
                 new_pref=template.format(prefix=prefix, ma=ma, mi=mi, suffix=suffix)
                 report["probed"]+=1
                 log.info(f"Discovery: {model_id} dead, trying {new_pref}...")
-                new_ok=await probe_model(client, new_pref)
-                await asyncio.sleep(2)
-                if new_ok:
-                    report["upgraded"][model_id]={"old": pref, "new": new_pref}
-                    log.info(f"Discovery: {model_id} upgraded {pref} → {new_pref}")
-                    # Update in-place
+                if await probe_model(client, new_pref):
+                    # Upgrade base
                     global MODEL_MAP
                     MODEL_MAP[model_id]=(mode, new_pref)
+                    upgrade={"old": pref, "new": new_pref}
+
+                    # Auto-upgrade thinking variant if exists
+                    if model_id in thinking_map:
+                        t_id=thinking_map[model_id]
+                        old_t_pref=mm[t_id][1]
+                        # Derive new thinking pref from new base pref
+                        if "_thinking" in old_t_pref:
+                            new_t_pref=new_pref+"_thinking" if not new_pref.endswith("_thinking") else new_pref
+                        else:
+                            new_t_pref=new_pref+"thinking"
+                        MODEL_MAP[t_id]=(mode, new_t_pref)
+                        upgrade["thinking_old"]=old_t_pref
+                        upgrade["thinking_new"]=new_t_pref
+                        log.info(f"Discovery: {t_id} auto-upgraded {old_t_pref} → {new_t_pref}")
+
+                    report["upgraded"][model_id]=upgrade
+                    log.info(f"Discovery: {model_id} upgraded {pref} → {new_pref}")
                     found=True
                     break
+                await asyncio.sleep(2)
 
             if not found:
-                report["dead"].append({"model": model_id, "pref": pref, "reason": f"no valid version within +2.0"})
-                log.info(f"Discovery: {model_id} ({pref}) — provider dead")
+                report["dead"].append({"model": model_id, "pref": pref, "reason": "no valid version within +2.0"})
 
         elif len(groups) == 3:
-            # nv_nemotron style: single version number
             prefix, gen_s, suffix=groups
             orig_gen=int(gen_s)
             found=False
             for gen in range(orig_gen+1, orig_gen+3):
                 new_pref=template.format(prefix=prefix, ma=gen, suffix=suffix)
                 report["probed"]+=1
-                new_ok=await probe_model(client, new_pref)
-                await asyncio.sleep(2)
-                if new_ok:
-                    report["upgraded"][model_id]={"old": pref, "new": new_pref}
+                if await probe_model(client, new_pref):
                     MODEL_MAP[model_id]=(mode, new_pref)
+                    report["upgraded"][model_id]={"old": pref, "new": new_pref}
                     found=True
                     break
+                await asyncio.sleep(2)
             if not found:
                 report["dead"].append({"model": model_id, "pref": pref, "reason": "no next gen found"})
-
-        await asyncio.sleep(1)
 
     if report["upgraded"]:
         save_model_map(MODEL_MAP)
@@ -583,8 +606,10 @@ async def discover_models(request: Request, _=Depends(verify_api_key)):
         "upgraded": len(report["upgraded"]),
         "dead": len(report["dead"]),
         "probed": report["probed"],
+        "skipped_thinking": len(report["skipped_thinking"]),
         "details": report,
     }
+
 
 
 
