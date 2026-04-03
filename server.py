@@ -560,8 +560,9 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
         except (ValueError, TypeError):
             raise HTTPException(500, f"Corrupted model entry for {model_name}. Fix via /admin/update-models")
 
-    # Build query from messages — keep last 10 turns, truncate long assistant messages
-    parts=[]
+    # Build query — extract system, history, and current user message separately
+    system_msg=""
+    history=[]
     for msg in messages:
         role=msg.get("role", "user")
         content=msg.get("content") or ""
@@ -571,19 +572,43 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
         if not content:
             continue
         if role == "system":
-            parts.append(f"[System]: {content}")
+            system_msg=content
         elif role == "user":
-            parts.append(content)
+            history.append(("user", content))
         elif role == "assistant":
-            if len(content) > 500:
-                content=content[:500] + "..."
-            parts.append(f"[Assistant]: {content}")
+            # Aggressively truncate assistant messages in history
+            if len(content) > 300:
+                content=content[:300] + "..."
+            history.append(("assistant", content))
         elif role == "tool":
-            parts.append(f"[Tool Result]: {content}")
+            history.append(("tool", content[:200]))
 
-    # Keep last 12 parts max to avoid context overflow
-    if len(parts) > 12:
-        parts=parts[-12:]
+    # Keep only last 8 turns (16 messages) to prevent context overflow
+    if len(history) > 8:
+        history=history[-8:]
+
+    # Separate current user message from history
+    current_msg=""
+    if history and history[-1][0] == "user":
+        current_msg=history[-1][1]
+        history=history[:-1]
+
+    # Build query: system + history context + current request
+    parts=[]
+    if system_msg:
+        parts.append(system_msg)
+    if history:
+        ctx_lines=[]
+        for role, content in history:
+            if role == "user":
+                ctx_lines.append(f"User: {content}")
+            elif role == "assistant":
+                ctx_lines.append(f"Assistant: {content}")
+            elif role == "tool":
+                ctx_lines.append(f"Tool result: {content}")
+        parts.append("Previous conversation:\n" + "\n".join(ctx_lines))
+    if current_msg:
+        parts.append(current_msg)
 
     query="\n\n".join(parts)
 
@@ -593,7 +618,7 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
         if tool_defs:
             tool_prompt=_build_tool_prompt(tool_defs, tool_choice)
             if tool_prompt:
-                query=f"{query}\n\n---\n{tool_prompt}"
+                query=f"{query}\n\n{tool_prompt}"
 
     client=get_client()
     cid=f"chatcmpl-{uuid4().hex[:12]}"
@@ -652,59 +677,69 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
 
 
 async def _stream_openai_with_tools(client, query, mode, model_pref, model_name, cid, created, sources, language):
-    """Stream with tool call detection: buffer response, check for tool_calls, then emit."""
+    """Stream with tool call detection.
+    Thinking chunks stream immediately. Text is buffered to detect <tool_call> XML.
+    Once response is complete: emit tool_calls OR stream the buffered text."""
+    # Send role delta immediately
+    init={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
+          "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
+    yield f"data: {json.dumps(init)}\n\n"
+
     full=""
-    thinking_parts=[]
     async for chunk in client.search(query, mode, model_pref, sources, language):
         if chunk.get("error"):
-            e={"id": f"chatcmpl-{uuid4().hex[:12]}", "object": "chat.completion.chunk", "created": int(time.time()), "model": model_name,
+            e={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
                "choices": [{"index": 0, "delta": {"content": f"[Error: {chunk['error']}]"}, "finish_reason": None}]}
             yield f"data: {json.dumps(e)}\n\n"
             yield "data: [DONE]\n\n"
             return
+
+        # Stream thinking immediately (not buffered)
         if chunk.get("thinking"):
-            thinking_parts.append(chunk["thinking"])
+            t={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
+               "choices": [{"index": 0, "delta": {"reasoning_content": chunk["thinking"]+"\n"}, "finish_reason": None}]}
+            yield f"data: {json.dumps(t)}\n\n"
             continue
+
         if chunk.get("done"):
             full=chunk.get("answer", full)
             break
         full=chunk.get("answer", full)
 
-    cid=f"chatcmpl-{uuid4().hex[:12]}"
-    created=int(time.time())
+    # Clean
+    full=_clean_response(full)
 
-    # Check for tool calls
+    # Check for tool calls in buffered response
     tool_calls, remaining=_parse_tool_calls(full)
     if tool_calls:
-        # Emit as tool_calls in a single chunk
-        msg_delta={"role": "assistant", "tool_calls": []}
+        msg_delta={"tool_calls": []}
         for i, tc in enumerate(tool_calls):
             msg_delta["tool_calls"].append({
                 "index": i, "id": tc["id"], "type": "function",
                 "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]},
             })
-        init={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
-              "choices": [{"index": 0, "delta": msg_delta, "finish_reason": None}]}
-        yield f"data: {json.dumps(init)}\n\n"
+        d={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
+           "choices": [{"index": 0, "delta": msg_delta, "finish_reason": None}]}
+        yield f"data: {json.dumps(d)}\n\n"
+        if remaining:
+            d2={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
+                "choices": [{"index": 0, "delta": {"content": remaining}, "finish_reason": None}]}
+            yield f"data: {json.dumps(d2)}\n\n"
         stop={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
               "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}
         yield f"data: {json.dumps(stop)}\n\n"
-        yield "data: [DONE]\n\n"
     else:
-        # No tool calls — emit buffered text as stream
-        init={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
-              "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
-        yield f"data: {json.dumps(init)}\n\n"
-        # Emit content in chunks
-        for i in range(0, len(full), 50):
-            chunk_text=full[i:i+50]
+        # No tool calls — emit buffered text as progressive stream
+        for i in range(0, len(full), 80):
+            ct=full[i:i+80]
             d={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
-               "choices": [{"index": 0, "delta": {"content": chunk_text}, "finish_reason": None}]}
+               "choices": [{"index": 0, "delta": {"content": ct}, "finish_reason": None}]}
             yield f"data: {json.dumps(d)}\n\n"
+            await asyncio.sleep(0.01)
         stop={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
               "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
         yield f"data: {json.dumps(stop)}\n\n"
-        yield "data: [DONE]\n\n"
+    yield "data: [DONE]\n\n"
 
 
 async def _stream_openai(client, query, mode, model_pref, model_name, cid, created, sources, language):
