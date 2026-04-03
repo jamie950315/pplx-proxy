@@ -456,9 +456,11 @@ _MULTI_NL=_clean_re.compile(r'\n{3,}')
 
 def _clean_response(text: str, strip: bool=True) -> str:
     """Strip Perplexity citations and internal tags."""
+    text=_re.sub(r'<[?]xml[^?]*[?]>', '', text)
     text=_CITATION_RE.sub('', text)
     text=_GROK_TAG_RE.sub('', text)
     text=_GROK_SELF_RE.sub('', text)
+    text=_re.sub(r'</?response[^>]*>', '', text)
     if strip:
         text=_MULTI_SPACE.sub(' ', text)
         text=_MULTI_NL.sub('\n\n', text)
@@ -496,7 +498,7 @@ def _parse_xml_func(xml_str: str) -> list:
         pass
     return calls
 
-def _parse_tool_calls(text: str) -> tuple:
+def _parse_tool_calls(text: str, tool_names: set=None) -> tuple:
     # 1. Try <tool_call> wrapped format first
     matches=_TOOL_CALL_RE.findall(text)
     if matches:
@@ -507,9 +509,12 @@ def _parse_tool_calls(text: str) -> tuple:
         if tool_calls:
             return tool_calls, remaining
 
-    # 2. Try bare XML: response starts with or is primarily XML function calls
-    stripped=text.strip()
-    if stripped.startswith("<") and not stripped.startswith("<p") and not stripped.startswith("<h"):
+    # 2. Try bare XML: only match known tool names
+    stripped=re.sub(r"<[?]xml[^?]*[?]>", "", text).strip()
+    if tool_names and stripped.startswith("<"):
+        _m=re.match(r"<([a-z_][a-z0-9_]*)>", stripped)
+        if not (_m and _m.group(1) in tool_names):
+            return [], text
         calls=_parse_xml_func(stripped)
         if calls:
             # Remove the XML from text to get remaining
@@ -648,7 +653,7 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
         # With tools: buffer response to detect tool calls, then emit appropriately
         if tools and isinstance(tools, list) and len(tools) > 0:
             return StreamingResponse(
-                _stream_openai_with_tools(client, query, mode, model_pref, model_name, cid, created, sources, language),
+                _stream_openai_with_tools(client, query, mode, model_pref, model_name, cid, created, sources, language, tools),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
@@ -696,7 +701,7 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
     }
 
 
-async def _stream_openai_with_tools(client, query, mode, model_pref, model_name, cid, created, sources, language):
+async def _stream_openai_with_tools(client, query, mode, model_pref, model_name, cid, created, sources, language, tools=None):
     """Stream with tool call detection.
     Thinking chunks stream immediately. Text is buffered to detect <tool_call> XML.
     Once response is complete: emit tool_calls OR stream the buffered text."""
