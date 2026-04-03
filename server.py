@@ -405,7 +405,7 @@ async def list_models(_=Depends(verify_api_key)):
     models=[]
     for mid, (mode, pref) in mm.items():
         models.append({"id": mid, "object": "model", "created": 1700000000, "owned_by": "perplexity", "mode": mode, "internal_pref": pref})
-    return {"object": "list", "data": models, "default_model": DEFAULT_MODEL, "account_type": ACCOUNT_TYPE}
+    return {"object": "list", "data": models}
 
 
 # ─── Tool Calling Support ──────────────────────────────────────────────────
@@ -801,7 +801,8 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
                 msg["reasoning_content"]=reasoning_content
             return {
                 "id": cid, "object": "chat.completion", "created": created, "model": model_name,
-                "choices": [{"index": 0, "message": msg, "finish_reason": "tool_calls"}],
+                "system_fingerprint": None,
+                "choices": [{"index": 0, "message": msg, "finish_reason": "tool_calls", "logprobs": None}],
                 "usage": {"prompt_tokens": len(query)//4, "completion_tokens": len(full)//4, "total_tokens": (len(query)+len(full))//4},
             }
 
@@ -810,7 +811,8 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
         msg["reasoning_content"]=reasoning_content
     return {
         "id": cid, "object": "chat.completion", "created": created, "model": model_name,
-        "choices": [{"index": 0, "message": msg, "finish_reason": "stop"}],
+        "system_fingerprint": None,
+        "choices": [{"index": 0, "message": msg, "finish_reason": "stop", "logprobs": None}],
         "usage": {"prompt_tokens": len(query)//4, "completion_tokens": len(full)//4, "total_tokens": (len(query)+len(full))//4},
     }
 
@@ -820,23 +822,23 @@ async def _stream_openai_with_tools(client, query, mode, model_pref, model_name,
     Thinking chunks stream immediately. Text is buffered to detect <tool_call> XML.
     Once response is complete: emit tool_calls OR stream the buffered text."""
     # Send role delta immediately
-    init={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
-          "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
+    init={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
+          "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None, "logprobs": None}]}
     yield f"data: {json.dumps(init)}\n\n"
 
     full=""
     async for chunk in client.search(query, mode, model_pref, sources, language):
         if chunk.get("error"):
-            e={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
-               "choices": [{"index": 0, "delta": {"content": f"[Error: {chunk['error']}]"}, "finish_reason": None}]}
+            e={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
+               "choices": [{"index": 0, "delta": {"content": f"[Error: {chunk['error']}]"}, "finish_reason": None, "logprobs": None}]}
             yield f"data: {json.dumps(e)}\n\n"
             yield "data: [DONE]\n\n"
             return
 
         # Stream thinking immediately (not buffered)
         if chunk.get("thinking"):
-            t={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
-               "choices": [{"index": 0, "delta": {"reasoning_content": chunk["thinking"]+"\n"}, "finish_reason": None}]}
+            t={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
+               "choices": [{"index": 0, "delta": {"reasoning_content": chunk["thinking"]+"\n"}, "finish_reason": None, "logprobs": None}]}
             yield f"data: {json.dumps(t)}\n\n"
             continue
 
@@ -862,15 +864,15 @@ async def _stream_openai_with_tools(client, query, mode, model_pref, model_name,
                 "index": i, "id": tc["id"], "type": "function",
                 "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]},
             })
-        d={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
-           "choices": [{"index": 0, "delta": msg_delta, "finish_reason": None}]}
+        d={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
+           "choices": [{"index": 0, "delta": msg_delta, "finish_reason": None, "logprobs": None}]}
         yield f"data: {json.dumps(d)}\n\n"
         if remaining:
-            d2={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
-                "choices": [{"index": 0, "delta": {"content": remaining}, "finish_reason": None}]}
+            d2={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
+                "choices": [{"index": 0, "delta": {"content": remaining}, "finish_reason": None, "logprobs": None}]}
             yield f"data: {json.dumps(d2)}\n\n"
-        stop={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
-              "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}
+        stop={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
+              "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls", "logprobs": None}]}
         yield f"data: {json.dumps(stop)}\n\n"
     else:
         # No tool calls — emit buffered text as progressive stream
@@ -886,35 +888,35 @@ async def _stream_openai_with_tools(client, query, mode, model_pref, model_name,
                     end=space+1
             ct=full[pos:end]
             pos=end
-            d={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
-               "choices": [{"index": 0, "delta": {"content": ct}, "finish_reason": None}]}
+            d={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
+               "choices": [{"index": 0, "delta": {"content": ct}, "finish_reason": None, "logprobs": None}]}
             yield f"data: {json.dumps(d)}\n\n"
             await asyncio.sleep(0.03)
-        stop={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
-              "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+        stop={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
+              "choices": [{"index": 0, "delta": {}, "finish_reason": "stop", "logprobs": None}]}
         yield f"data: {json.dumps(stop)}\n\n"
     yield "data: [DONE]\n\n"
 
 
 async def _stream_openai(client, query, mode, model_pref, model_name, cid, created, sources, language):
-    init={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
-          "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
+    init={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
+          "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None, "logprobs": None}]}
     yield f"data: {json.dumps(init)}\n\n"
 
     async for chunk in client.search(query, mode, model_pref, sources, language):
         # Stream thinking content as reasoning_content deltas
         if chunk.get("thinking"):
-            t={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
-               "choices": [{"index": 0, "delta": {"reasoning_content": chunk["thinking"]+"\n"}, "finish_reason": None}]}
+            t={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
+               "choices": [{"index": 0, "delta": {"reasoning_content": chunk["thinking"]+"\n"}, "finish_reason": None, "logprobs": None}]}
             yield f"data: {json.dumps(t)}\n\n"
             continue
 
         if chunk.get("error"):
-            e={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
-               "choices": [{"index": 0, "delta": {"content": f"[Error: {chunk['error']}]"}, "finish_reason": None}]}
+            e={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
+               "choices": [{"index": 0, "delta": {"content": f"[Error: {chunk['error']}]"}, "finish_reason": None, "logprobs": None}]}
             yield f"data: {json.dumps(e)}\n\n"
-            stop={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
-                  "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+            stop={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
+                  "choices": [{"index": 0, "delta": {}, "finish_reason": "stop", "logprobs": None}]}
             yield f"data: {json.dumps(stop)}\n\n"
             break
 
@@ -922,8 +924,8 @@ async def _stream_openai(client, query, mode, model_pref, model_name, cid, creat
         if dt:
             dt=_clean_response(dt, strip=False)
             if dt:
-                d={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
-                   "choices": [{"index": 0, "delta": {"content": dt}, "finish_reason": None}]}
+                d={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
+                   "choices": [{"index": 0, "delta": {"content": dt}, "finish_reason": None, "logprobs": None}]}
                 yield f"data: {json.dumps(d)}\n\n"
 
         if chunk.get("done"):
@@ -933,12 +935,12 @@ async def _stream_openai(client, query, mode, model_pref, model_name, cid, creat
                 for i, w in enumerate(wr[:10]):
                     url=w.get("url", w) if isinstance(w, dict) else str(w)
                     cites+=f"[{i+1}] {url}\n"
-                c={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
-                   "choices": [{"index": 0, "delta": {"content": cites}, "finish_reason": None}]}
+                c={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
+                   "choices": [{"index": 0, "delta": {"content": cites}, "finish_reason": None, "logprobs": None}]}
                 yield f"data: {json.dumps(c)}\n\n"
 
-            stop={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
-                  "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+            stop={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
+                  "choices": [{"index": 0, "delta": {}, "finish_reason": "stop", "logprobs": None}]}
             yield f"data: {json.dumps(stop)}\n\n"
             break
 
