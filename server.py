@@ -453,57 +453,40 @@ async def _stream_openai(client, query, mode, model_pref, model_name, cid, creat
 
 
 
-# ─── Model Discovery ───────────────────────────────────────────────────────
-
 # ─── Model Discovery ──────────────────────────────────────────────────────
 
-def generate_candidates(known_prefs: set) -> dict:
-    """Generate ALL possible model_preference strings from known naming patterns.
-    Scans every single-digit major.minor version. Only unknown prefs are returned."""
-    candidates={}
+import re as _re
 
-    def add(pref):
-        if pref not in known_prefs:
-            candidates[pref]=("pro", pref)
+# Patterns to extract version from known prefs and generate next versions
+_VERSION_PATTERNS=[
+    # gpt54 → major=5, minor=4
+    (_re.compile(r"^(gpt)(\d)(\d)((?:_thinking)?)$"), "{prefix}{ma}{mi}{suffix}"),
+    # claude46sonnet → major=4, minor=6
+    (_re.compile(r"^(claude)(\d)(\d)(sonnet(?:thinking)?)$"), "{prefix}{ma}{mi}{suffix}"),
+    (_re.compile(r"^(claude)(\d)(\d)(opus(?:thinking)?)$"), "{prefix}{ma}{mi}{suffix}"),
+    # gemini31pro_high → major=3, minor=1
+    (_re.compile(r"^(gemini)(\d)(\d)(pro(?:_high)?)$"), "{prefix}{ma}{mi}{suffix}"),
+    # grok41nonreasoning → major=4, minor=1
+    (_re.compile(r"^(grok)(\d)(\d)((?:non)?reasoning)$"), "{prefix}{ma}{mi}{suffix}"),
+    # nv_nemotron_3_super → gen=3
+    (_re.compile(r"^(nv_nemotron_)(\d)(_super|_ultra)$"), "{prefix}{ma}{suffix}"),
+]
 
-    for ma in range(10):
-        for mi in range(10):
-            v=f"{ma}{mi}"
-            # OpenAI
-            add(f"gpt{v}")
-            add(f"gpt{v}_thinking")
-            # Anthropic Sonnet
-            add(f"claude{v}sonnet")
-            add(f"claude{v}sonnetthinking")
-            # Anthropic Opus
-            add(f"claude{v}opus")
-            add(f"claude{v}opusthinking")
-            # Google Gemini
-            add(f"gemini{v}pro")
-            add(f"gemini{v}pro_high")
-            # xAI Grok
-            add(f"grok{v}nonreasoning")
-            add(f"grok{v}reasoning")
+def _increment_version(major: int, minor: int) -> tuple:
+    """Increment version: 5.4 → 5.5, 5.9 → 6.0"""
+    minor+=1
+    if minor >= 10:
+        minor=0
+        major+=1
+    return major, minor
 
-    # Kimi (non-numeric pattern)
-    for v in ["k1","k15","k2","k25","k3","k35","k4","k45","k5"]:
-        add(f"kimi{v}")
-        add(f"kimi{v}thinking")
-
-    # NVIDIA Nemotron
-    for gen in range(1, 10):
-        add(f"nv_nemotron_{gen}_super")
-        add(f"nv_nemotron_{gen}_ultra")
-
-    # Perplexity internal
-    for p in ["pplx_pro","pplx_alpha","pplx_beta","pplx_gamma","pplx_delta","pplx_reasoning","experimental","turbo"]:
-        add(p)
-
-    return candidates
+def _version_distance(orig_ma, orig_mi, cur_ma, cur_mi) -> float:
+    """Calculate version distance: e.g., 5.4 → 7.4 = 2.0"""
+    return (cur_ma - orig_ma) + (cur_mi - orig_mi) / 10.0
 
 
 async def probe_model(client, pref) -> bool:
-    """Test if a model_preference is valid by sending a trivial query."""
+    """Test if a model_preference is valid."""
     try:
         async for chunk in client.search("2+2=?", "pro", pref, ["web"], "en-US"):
             if chunk.get("error"):
@@ -515,62 +498,108 @@ async def probe_model(client, pref) -> bool:
         return False
 
 
-def pref_to_name(pref: str) -> str:
-    """Convert internal pref to friendly model ID."""
-    if pref.startswith("pplx_") or pref in ("experimental", "turbo"):
-        return f"pplx-{pref.replace('_','-')}"
-    name=pref
-    for suffix, repl in [("_thinking", "-thinking"), ("thinking", "-thinking"),
-                         ("nonreasoning", ""), ("reasoning", "-thinking"),
-                         ("_high", "-high")]:
-        if name.endswith(suffix):
-            name=name[:-len(suffix)]+repl
-            break
-    return f"pplx-{name}"
-
-
 @app.post("/admin/discover-models")
 async def discover_models(request: Request, _=Depends(verify_api_key)):
-    """Probe Perplexity for all working model identifiers.
-    Generates every possible version number for known naming patterns,
-    skips already-known prefs, and probes the rest."""
+    """Smart model discovery:
+    1. Check if each current model still works
+    2. If dead, increment version until found or +2.0 reached
+    3. If +2.0 exceeded, mark provider as unavailable
+    """
     client=get_client()
     await client.init()
 
-    known_prefs={v[1] for v in get_model_map().values()}
-    candidates=generate_candidates(known_prefs)
-    log.info(f"Discovery: {len(candidates)} unknown candidates to probe ({len(known_prefs)} already known)")
+    mm=get_model_map()
+    report={"alive": [], "upgraded": {}, "dead": [], "probed": 0}
 
-    results={"valid": {}, "probed": 0, "invalid": 0}
-
-    for pref, (mode, _) in candidates.items():
-        results["probed"]+=1
-        try:
+    for model_id, (mode, pref) in list(mm.items()):
+        # Skip non-versioned models (pplx_pro, experimental, etc.)
+        matched=False
+        for pattern, template in _VERSION_PATTERNS:
+            m=pattern.match(pref)
+            if m:
+                matched=True
+                break
+        if not matched:
+            # Non-versioned — just check alive
+            report["probed"]+=1
             ok=await probe_model(client, pref)
             if ok:
-                name=pref_to_name(pref)
-                results["valid"][name]=[mode, pref]
-                log.info(f"Discovery: {pref} → VALID ({name})")
+                report["alive"].append(model_id)
             else:
-                results["invalid"]+=1
-        except Exception as e:
-            log.warning(f"Discovery error {pref}: {e}")
-        await asyncio.sleep(3)
+                report["dead"].append({"model": model_id, "pref": pref, "reason": "non-versioned, no upgrade path"})
+            await asyncio.sleep(2)
+            continue
 
-    if results["valid"]:
-        global MODEL_MAP
-        for name, (mode, pref) in results["valid"].items():
-            MODEL_MAP[name]=(mode, pref)
+        # Versioned model — check if still alive
+        report["probed"]+=1
+        ok=await probe_model(client, pref)
+        if ok:
+            report["alive"].append(model_id)
+            await asyncio.sleep(2)
+            continue
+
+        # Dead — try incrementing version
+        groups=m.groups()
+        if len(groups) == 4:
+            prefix, orig_ma_s, orig_mi_s, suffix=groups
+            orig_ma, orig_mi=int(orig_ma_s), int(orig_mi_s)
+            ma, mi=orig_ma, orig_mi
+
+            found=False
+            while True:
+                ma, mi=_increment_version(ma, mi)
+                if _version_distance(orig_ma, orig_mi, ma, mi) > 2.0:
+                    break
+                new_pref=template.format(prefix=prefix, ma=ma, mi=mi, suffix=suffix)
+                report["probed"]+=1
+                log.info(f"Discovery: {model_id} dead, trying {new_pref}...")
+                new_ok=await probe_model(client, new_pref)
+                await asyncio.sleep(2)
+                if new_ok:
+                    report["upgraded"][model_id]={"old": pref, "new": new_pref}
+                    log.info(f"Discovery: {model_id} upgraded {pref} → {new_pref}")
+                    # Update in-place
+                    global MODEL_MAP
+                    MODEL_MAP[model_id]=(mode, new_pref)
+                    found=True
+                    break
+
+            if not found:
+                report["dead"].append({"model": model_id, "pref": pref, "reason": f"no valid version within +2.0"})
+                log.info(f"Discovery: {model_id} ({pref}) — provider dead")
+
+        elif len(groups) == 3:
+            # nv_nemotron style: single version number
+            prefix, gen_s, suffix=groups
+            orig_gen=int(gen_s)
+            found=False
+            for gen in range(orig_gen+1, orig_gen+3):
+                new_pref=template.format(prefix=prefix, ma=gen, suffix=suffix)
+                report["probed"]+=1
+                new_ok=await probe_model(client, new_pref)
+                await asyncio.sleep(2)
+                if new_ok:
+                    report["upgraded"][model_id]={"old": pref, "new": new_pref}
+                    MODEL_MAP[model_id]=(mode, new_pref)
+                    found=True
+                    break
+            if not found:
+                report["dead"].append({"model": model_id, "pref": pref, "reason": "no next gen found"})
+
+        await asyncio.sleep(1)
+
+    if report["upgraded"]:
         save_model_map(MODEL_MAP)
 
     return {
         "status": "ok",
-        "new_models": len(results["valid"]),
-        "probed": results["probed"],
-        "invalid": results["invalid"],
-        "total_models": len(MODEL_MAP),
-        "discovered": results["valid"],
+        "alive": len(report["alive"]),
+        "upgraded": len(report["upgraded"]),
+        "dead": len(report["dead"]),
+        "probed": report["probed"],
+        "details": report,
     }
+
 
 
 
