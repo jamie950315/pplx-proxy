@@ -413,6 +413,46 @@ async def list_models(_=Depends(verify_api_key)):
 import xml.etree.ElementTree as _ET
 import re as _re
 
+def _should_inject_tools(user_msg: str, tools: list, tool_choice: str) -> bool:
+    """Heuristic: only inject tool prompt if user message seems tool-relevant.
+    Prevents false tool calls for greetings, casual chat, etc."""
+    if tool_choice == "required":
+        return True  # forced
+    if tool_choice == "none":
+        return False
+    if not tools or not user_msg:
+        return False
+    
+    msg_lower = user_msg.lower()
+    # Skip tool injection for very short/casual messages
+    if len(msg_lower) < 8 and not any(w in msg_lower for w in ("calc", "look", "find", "get", "send", "search", "fetch", "weather", "user", "email", "math")):
+        return False
+    
+    # Check if any tool keyword appears in the message
+    for tool in tools:
+        fn = tool.get("function", {})
+        name = fn.get("name", "").lower().replace("_", " ")
+        desc = fn.get("description", "").lower()
+        params = fn.get("parameters", {}).get("properties", {})
+        
+        # Check tool name keywords
+        for word in name.split():
+            if len(word) > 2 and word in msg_lower:
+                return True
+        # Check description keywords
+        for word in desc.split():
+            if len(word) > 3 and word in msg_lower:
+                return True
+        # Check parameter names as keywords
+        for pname in params:
+            pname_clean = pname.lower().replace("_", " ")
+            for word in pname_clean.split():
+                if len(word) > 2 and word in msg_lower:
+                    return True
+    
+    return False
+
+
 def _build_tool_prompt(tool_defs: str, tool_choice: str="auto") -> str:
     if tool_choice == "none":
         return ""
@@ -529,6 +569,73 @@ def _parse_tool_calls(text: str, tool_names: set=None) -> tuple:
     return [], text
 
 
+def _validate_tool_calls(tool_calls: list, tools: list) -> list:
+    """Validate parsed tool calls against tool definitions.
+    Returns only valid calls. Rejects calls with:
+    - Function name not in tool list
+    - Missing required parameters
+    - Empty arguments for tools that have required params
+    """
+    if not tools:
+        return tool_calls
+    
+    # Build schema map: {name: {required: set, properties: dict}}
+    schemas = {}
+    for t in tools:
+        if t.get("type") != "function":
+            continue
+        fn = t.get("function", {})
+        name = fn.get("name")
+        if not name:
+            continue
+        params = fn.get("parameters", {})
+        schemas[name] = {
+            "required": set(params.get("required", [])),
+            "properties": params.get("properties", {}),
+        }
+    
+    valid = []
+    for tc in tool_calls:
+        fn_name = tc["function"]["name"]
+        # Check function exists
+        if fn_name not in schemas:
+            log.warning(f"Tool call rejected: unknown function '{fn_name}'")
+            continue
+        # Parse arguments
+        try:
+            args = json.loads(tc["function"]["arguments"])
+        except (json.JSONDecodeError, TypeError):
+            log.warning(f"Tool call rejected: invalid JSON arguments for '{fn_name}'")
+            continue
+        # Check required params
+        schema = schemas[fn_name]
+        missing = schema["required"] - set(args.keys())
+        if missing:
+            log.warning(f"Tool call rejected: '{fn_name}' missing required params: {missing}")
+            continue
+        # Check no empty string values for required params
+        empty_required = [k for k in schema["required"] if k in args and args[k] in ("", None)]
+        if empty_required:
+            log.warning(f"Tool call rejected: '{fn_name}' has empty required params: {empty_required}")
+            continue
+        valid.append(tc)
+    
+    return valid
+
+
+def _strip_xml_wrapper(text: str) -> str:
+    """Strip XML wrapper tags from content that isn't a tool call.
+    Handles cases where model wraps response in <response>, <answer>, etc."""
+    import re as _sre
+    stripped = text.strip()
+    # Strip <?xml ?> declaration
+    stripped = _sre.sub(r'<[?]xml[^?]*[?]>\s*', '', stripped)
+    # Strip common wrapper tags: <response>, <answer>, <output>, <result>
+    for tag in ("response", "answer", "output", "result", "reply"):
+        stripped = _sre.sub(rf'^\s*<{tag}[^>]*>\s*', '', stripped)
+        stripped = _sre.sub(rf'\s*</{tag}>\s*$', '', stripped)
+    return stripped.strip()
+
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, _=Depends(verify_api_key)):
@@ -608,7 +715,9 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
                 content=content[:200] + "..."
             history.append(("assistant", content))
         elif role == "tool":
-            history.append(("tool", content[:150]))
+            # Format tool results clearly for the model
+            tid=msg.get("tool_call_id", "")
+            history.append(("tool", f"Result: {content[:150]}"))
 
     # Keep only last 16 items (~8 turns) to prevent context overflow
     if len(history) > 16:
@@ -639,13 +748,14 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
 
     query="\n\n".join(parts)
 
-    # Tool calling: append at end, keep it short
+    # Tool calling: only inject if message seems tool-relevant
     if tools and isinstance(tools, list) and len(tools) > 0 and tool_choice != "none":
-        tool_defs=_tools_to_xml(tools)
-        if tool_defs:
-            tool_prompt=_build_tool_prompt(tool_defs, tool_choice)
-            if tool_prompt:
-                query=f"{query}\n\n{tool_prompt}"
+        if _should_inject_tools(current_msg, tools, tool_choice):
+            tool_defs=_tools_to_xml(tools)
+            if tool_defs:
+                tool_prompt=_build_tool_prompt(tool_defs, tool_choice)
+                if tool_prompt:
+                    query=f"{query}\n\n{tool_prompt}"
 
     client=get_client()
     cid=f"chatcmpl-{uuid4().hex[:12]}"
