@@ -71,24 +71,24 @@ _ALL_MODELS={
     "auto": ("pro", "pplx_pro"),
     "sonar": ("pro", "experimental"),
     "gpt": ("pro", "gpt54"),
-    "gpt-thinking": ("pro", "gpt54_thinking"),
     "gemini": ("pro", "gemini31pro_high"),
     "sonnet": ("pro", "claude46sonnet"),
-    "sonnet-thinking": ("pro", "claude46sonnetthinking"),
     "opus": ("pro", "claude46opus"),
-    "opus-thinking": ("pro", "claude46opusthinking"),
     "nemotron": ("pro", "nv_nemotron_3_super"),
+}
+
+# Thinking variants — activated via thinking=true parameter
+_THINKING_MAP={
+    "gpt": ("pro", "gpt54_thinking"),
+    "sonnet": ("pro", "claude46sonnetthinking"),
+    "opus": ("pro", "claude46opusthinking"),
 }
 
 # Model availability per account tier
 _TIER_MODELS={
     "free": {"auto"},
-    "pro": {"auto", "sonar", "gpt", "gpt-thinking",
-            "gemini", "sonnet", "sonnet-thinking",
-            "nemotron"},
-    "max": {"auto", "sonar", "gpt", "gpt-thinking",
-            "gemini", "sonnet", "sonnet-thinking",
-            "nemotron", "opus", "opus-thinking"},
+    "pro": {"auto", "sonar", "gpt", "gemini", "sonnet", "nemotron"},
+    "max": {"auto", "sonar", "gpt", "gemini", "sonnet", "nemotron", "opus"},
 }
 
 def _default_model_map() -> dict:
@@ -445,7 +445,7 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
     sources=body.get("sources", ["web"])
     tools=body.get("tools", None)
     tool_choice=body.get("tool_choice", "auto")
-    reasoning_effort=body.get("reasoning_effort", None)  # low/medium/high — ignored by Perplexity
+    thinking=body.get("thinking", False)  # toggle thinking mode
 
     # Validate messages
     if messages is None:
@@ -474,17 +474,15 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
     if model_name not in mm:
         raise HTTPException(400, f"Unknown model: {model_name}. Available: {list(mm.keys())}")
 
-    # reasoning_effort: auto-upgrade to thinking model if "high" and thinking variant exists
-    if reasoning_effort in ("high",) and not model_name.endswith("-thinking"):
-        thinking_name=f"{model_name}-thinking"
-        if thinking_name in mm:
-            model_name=thinking_name
-            log.info(f"reasoning_effort=high → auto-upgraded to {model_name}")
-
-    try:
-        mode, model_pref=mm[model_name]
-    except (ValueError, TypeError):
-        raise HTTPException(500, f"Corrupted model entry for {model_name}. Fix via /admin/update-models")
+    # Thinking mode: switch to thinking variant if enabled
+    if thinking and model_name in _THINKING_MAP:
+        mode, model_pref=_THINKING_MAP[model_name]
+        log.info(f"thinking=true → {model_name} using {model_pref}")
+    else:
+        try:
+            mode, model_pref=mm[model_name]
+        except (ValueError, TypeError):
+            raise HTTPException(500, f"Corrupted model entry for {model_name}. Fix via /admin/update-models")
 
     parts=[]
     for msg in messages:
@@ -725,15 +723,8 @@ async def discover_models(request: Request, _=Depends(verify_api_key)):
 
     mm=get_model_map()
 
-    # Split into base models and thinking variants
-    thinking_map={}  # base_id → thinking_id
-    base_models={}   # base_id → (mode, pref)
-    for mid, (mode, pref) in mm.items():
-        if mid.endswith("-thinking"):
-            base_id=mid.replace("-thinking", "")
-            thinking_map[base_id]=mid
-        else:
-            base_models[mid]=(mode, pref)
+    base_models=dict(mm)  # all models are base models now (no thinking variants in map)
+    thinking_map={}
 
     report={"alive": [], "upgraded": {}, "dead": [], "skipped_thinking": list(thinking_map.values()), "probed": 0}
 
@@ -908,7 +899,7 @@ if HAS_MCP:
         shorthand={"gpt": "gpt-thinking", "claude": "sonnet-thinking", "opus": "opus-thinking", "gemini": "gemini", "nemotron": "nemotron"}
         resolved=model
         if model == "default":
-            resolved="gpt-thinking"
+            resolved="gpt"
         elif model in shorthand:
             resolved=shorthand[model]
         tier_err=check_tier(resolved)
@@ -1155,11 +1146,7 @@ async def auto_discover_loop():
                         new_pref=template.format(prefix=prefix,ma=ma,mi=mi,suffix=suffix)
                         if await probe_model(client, new_pref):
                             MODEL_MAP[model_id]=(mode, new_pref)
-                            if model_id in thinking_map:
-                                t_id=thinking_map[model_id]
-                                old_tp=mm[t_id][1]
-                                new_tp=new_pref+("_thinking" if "_thinking" in old_tp else "thinking")
-                                MODEL_MAP[t_id]=(mode, new_tp)
+                            # Thinking variants auto-derived from _THINKING_MAP, no separate upgrade needed
                             save_model_map(MODEL_MAP)
                             log.info(f"Auto-discovery: {model_id} upgraded {pref} → {new_pref}")
                             await notify_cookie_expired(f"Model {model_id} auto-upgraded: {pref} → {new_pref}")
