@@ -16,7 +16,7 @@ from typing import Optional, AsyncGenerator
 from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException, Depends
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from curl_cffi import requests as cffi_requests
@@ -378,6 +378,14 @@ async def chat_ui():
     if p.exists():
         return _FileResponse(p, media_type="text/html")
     raise HTTPException(404, "chat.html not found")
+
+@app.get("/debug")
+async def debug_page():
+    """Serve debug chat interface."""
+    p=Path(__file__).parent / "debug.html"
+    if p.exists():
+        return HTMLResponse(p.read_text())
+    return HTMLResponse("<h1>debug.html not found</h1>", status_code=404)
 
 @app.get("/health")
 async def health():

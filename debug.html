@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>pplx-proxy debug</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#e6edf3;--dim:#8b949e;--accent:#58a6ff;--green:#3fb950;--red:#f85149;--yellow:#d29922;--thinking:#1f2937;--font:'SF Mono',Consolas,monospace}
+body{font-family:var(--font);background:var(--bg);color:var(--text);height:100vh;display:flex;flex-direction:column}
+.header{padding:10px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;flex-shrink:0;flex-wrap:wrap}
+.header h1{font-size:13px;color:var(--accent)}
+.header select,.header input{background:var(--card);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font:11px var(--font)}
+.header label{font-size:11px;color:var(--dim);display:flex;align-items:center;gap:4px}
+.header input[type=checkbox]{width:auto}
+.main{flex:1;display:flex;overflow:hidden}
+.chat-panel{flex:1;display:flex;flex-direction:column;overflow:hidden}
+.debug-panel{width:400px;border-left:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
+.debug-header{padding:6px 12px;border-bottom:1px solid var(--border);font-size:10px;color:var(--dim);display:flex;justify-content:space-between}
+.debug-body{flex:1;overflow-y:auto;padding:8px;font-size:10px;white-space:pre-wrap;word-break:break-all;color:var(--dim)}
+.messages{flex:1;overflow-y:auto;padding:16px}
+.msg{margin-bottom:10px;padding:10px 14px;border-radius:8px;max-width:85%;font-size:12px;line-height:1.5}
+.msg.user{background:#1f6feb33;margin-left:auto;border:1px solid #1f6feb55}
+.msg.assistant{background:var(--card);border:1px solid var(--border)}
+.msg.error{background:#f8514922;border:1px solid #f8514955;color:var(--red)}
+.msg .thinking{background:var(--thinking);padding:8px;border-radius:4px;margin-bottom:8px;font-size:10px;color:var(--yellow);border-left:3px solid var(--yellow);white-space:pre-wrap}
+.msg .thinking-label{font-size:9px;color:var(--dim);margin-bottom:2px;text-transform:uppercase}
+.msg .tool-calls{background:#3fb95011;padding:8px;border-radius:4px;margin-bottom:8px;font-size:10px;color:var(--green);border-left:3px solid var(--green)}
+.msg .meta{font-size:9px;color:var(--dim);margin-top:4px}
+.msg .citations{font-size:10px;color:var(--red);margin-top:4px}
+.msg .content{white-space:pre-wrap}
+.input-bar{padding:10px 16px;border-top:1px solid var(--border);display:flex;gap:8px;flex-shrink:0}
+.input-bar input{flex:1;background:var(--card);border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:6px;font:12px var(--font)}
+.input-bar button{background:var(--accent);color:#fff;border:none;padding:8px 14px;border-radius:6px;cursor:pointer;font:11px var(--font);font-weight:600}
+.input-bar button:disabled{opacity:0.4}
+.badge{display:inline-block;padding:1px 5px;border-radius:3px;font-size:9px;font-weight:600}
+.badge.ok{background:#3fb95033;color:var(--green)}
+.badge.tool{background:#58a6ff33;color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>pplx-proxy debug</h1>
+  <select id="model"><option value="gpt">gpt</option><option value="sonnet" selected>sonnet</option><option value="gemini">gemini</option><option value="nemotron">nemotron</option><option value="sonar">sonar</option><option value="auto">auto</option></select>
+  <label><input type="checkbox" id="thinking"> thinking</label>
+  <label><input type="checkbox" id="stream" checked> stream</label>
+  <input id="api_key" placeholder="API key" value="" style="width:100px">
+  <span id="status" style="font-size:10px;color:var(--dim)">ready</span>
+</div>
+<div class="main">
+  <div class="chat-panel">
+    <div class="messages" id="messages"></div>
+    <div class="input-bar">
+      <input id="input" placeholder="Type a message..." autofocus>
+      <button id="send" onclick="sendMessage()">Send</button>
+      <button onclick="clearChat()" style="background:var(--border)">Clear</button>
+    </div>
+  </div>
+  <div class="debug-panel">
+    <div class="debug-header"><span>Raw Response</span><span id="debug-meta"></span></div>
+    <div class="debug-body" id="debug"></div>
+  </div>
+</div>
+<script>
+let history=[];
+const $=id=>document.getElementById(id);
+const BASE=window.location.origin;
+
+$('input').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey)sendMessage()});
+
+function log(t){$('debug').textContent+=t+'\n';$('debug').scrollTop=$('debug').scrollHeight}
+function esc(s){return(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+
+function addMsg(role,content,extra={}){
+  let div=document.createElement('div');
+  div.className='msg '+role;
+  let html='';
+  if(extra.reasoning_content)
+    html+=`<div class="thinking"><div class="thinking-label">🧠 reasoning_content</div>${esc(extra.reasoning_content)}</div>`;
+  if(extra.tool_calls)
+    html+=`<div class="tool-calls">🔧 tool_calls:\n${extra.tool_calls.map(tc=>`  ${tc.function.name}(${tc.function.arguments})`).join('\n')}</div>`;
+  let c=content||'';
+  let cites=c.match(/\[\d+\]/g);
+  html+=`<div class="content">${esc(c)}</div>`;
+  if(cites) html+=`<div class="citations">⚠️ citations: ${cites.join(' ')}</div>`;
+  if(extra.finish_reason)
+    html+=`<div class="meta">finish: <span class="badge ${extra.finish_reason==='stop'?'ok':'tool'}">${extra.finish_reason}</span> | model: ${extra.model||'?'} | ${(c||'').length}ch</div>`;
+  div.innerHTML=html;
+  $('messages').appendChild(div);
+  $('messages').scrollTop=$('messages').scrollHeight;
+  return div;
+}
+
+function clearChat(){history=[];$('messages').innerHTML='';$('debug').textContent='';log('cleared\n')}
+
+async function sendMessage(){
+  let text=$('input').value.trim();
+  if(!text)return;
+  $('input').value='';
+  let model=$('model').value, thinking=$('thinking').checked, stream=$('stream').checked, apiKey=$('api_key').value;
+  history.push({role:'user',content:text});
+  addMsg('user',text);
+  let body={model,messages:[...history],stream,thinking};
+  log('\n>>> '+JSON.stringify(body,null,2));
+  $('status').textContent='...';
+  $('send').disabled=true;
+  let headers={'Content-Type':'application/json'};
+  if(apiKey)headers['Authorization']='Bearer '+apiKey;
+  try{
+    let resp=await fetch(BASE+'/v1/chat/completions',{method:'POST',headers,body:JSON.stringify(body)});
+    if(!resp.ok){let e=await resp.text();throw new Error(`HTTP ${resp.status}: ${e}`)}
+    if(!stream){
+      let d=await resp.json();
+      log('\n<<< '+JSON.stringify(d,null,2));
+      let msg=d.choices?.[0]?.message||{};
+      history.push({role:'assistant',content:msg.content||''});
+      addMsg('assistant',msg.content,{reasoning_content:msg.reasoning_content,tool_calls:msg.tool_calls,finish_reason:d.choices?.[0]?.finish_reason,model:d.model});
+    }else{
+      let reader=resp.body.getReader(),decoder=new TextDecoder(),buf='',fc='',fr='',tc=null,rmodel=model;
+      let msgDiv=addMsg('assistant','');
+      while(true){
+        let{done,value}=await reader.read();
+        if(done)break;
+        buf+=decoder.decode(value,{stream:true});
+        let lines=buf.split('\n');buf=lines.pop();
+        for(let line of lines){
+          if(!line.startsWith('data: '))continue;
+          let raw=line.slice(6).trim();
+          if(raw==='[DONE]'){log('[DONE]');continue}
+          try{
+            let ck=JSON.parse(raw),d=ck.choices?.[0]?.delta||{},f=ck.choices?.[0]?.finish_reason;
+            rmodel=ck.model||rmodel;
+            if(d.reasoning_content){fr+=d.reasoning_content;log('δ think: '+d.reasoning_content.slice(0,50))}
+            if(d.content)fc+=d.content;
+            if(d.tool_calls){tc=d.tool_calls;log('δ tools: '+JSON.stringify(tc))}
+            if(f)log('finish: '+f);
+            let html='';
+            if(fr)html+=`<div class="thinking"><div class="thinking-label">🧠 reasoning_content</div>${esc(fr)}</div>`;
+            if(tc)html+=`<div class="tool-calls">🔧 ${tc.map(t=>`${t.function?.name}(${t.function?.arguments})`).join('\n')}</div>`;
+            let cites=fc.match(/\[\d+\]/g);
+            html+=`<div class="content">${esc(fc)}</div>`;
+            if(cites)html+=`<div class="citations">⚠️ ${cites.join(' ')}</div>`;
+            if(f)html+=`<div class="meta">finish: <span class="badge ${f==='stop'?'ok':'tool'}">${f}</span> | ${rmodel} | ${fc.length}ch</div>`;
+            msgDiv.innerHTML=html;
+            $('messages').scrollTop=$('messages').scrollHeight;
+          }catch(e){log('parse err: '+e.message)}
+        }
+      }
+      history.push({role:'assistant',content:fc});
+    }
+  }catch(e){log('\nERROR: '+e.message);addMsg('error',e.message)}
+  $('status').textContent='ready';$('send').disabled=false;$('input').focus();
+}
+</script>
+</body>
+</html>
