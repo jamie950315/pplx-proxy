@@ -569,8 +569,10 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
         if isinstance(content, list):
             text_parts=[ct.get("text", "") for ct in content if ct.get("type") == "text"]
             content=" ".join(text_parts)
-        # Skip empty messages (common after tool_calls)
-        if not content or not content.strip():
+        # Handle empty assistant messages (common after tool_calls)
+        if role == "assistant" and (not content or not content.strip()):
+            content="[done]"
+        elif not content or not content.strip():
             continue
         if role == "system":
             system_msg=content
