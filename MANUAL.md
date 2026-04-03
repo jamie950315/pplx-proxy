@@ -563,8 +563,10 @@ This gives the model clear context about what tools were invoked.
 
 To prevent Perplexity's input from growing too large:
 
+- System prompts are truncated to **500 characters** and labeled so Perplexity does not search for them.
 - Assistant messages are truncated to **600 characters**.
 - Tool results are truncated to **400 characters**.
+- Consecutive same-role messages are deduplicated (keeps the last one) — this handles LibreChat-style branching artifacts.
 - Only the **last 16 items** (~8 turns) of history are kept.
 
 ### Topic Separation
