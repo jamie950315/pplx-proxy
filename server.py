@@ -66,22 +66,18 @@ DEFAULT_HEADERS={
 
 # Default model map — overridden by .models.json if it exists
 _DEFAULT_MODEL_MAP={
-    "pplx-auto": ("auto", "turbo"),
-    "pplx-pro": ("pro", "pplx_pro"),
+    "pplx-auto": ("pro", "pplx_pro"),
     "pplx-pro-sonar": ("pro", "experimental"),
     "pplx-pro-gpt5": ("pro", "gpt54"),
     "pplx-pro-claude": ("pro", "claude46sonnet"),
-    "pplx-pro-grok": ("pro", "grok41nonreasoning"),
-    "pplx-pro-gemini": ("pro", "gemini31pro"),
-    "pplx-pro-nemotron": ("pro", "nemotron3super"),
-    "pplx-reasoning": ("reasoning", "pplx_reasoning"),
-    "pplx-reasoning-gpt5": ("reasoning", "gpt54_thinking"),
-    "pplx-reasoning-claude": ("reasoning", "claude46sonnetthinking"),
-    "pplx-reasoning-gemini": ("reasoning", "gemini30pro"),
-    "pplx-reasoning-kimi": ("reasoning", "kimik2thinking"),
-    "pplx-reasoning-grok": ("reasoning", "grok41reasoning"),
-    "pplx-reasoning-nemotron": ("reasoning", "nemotron3super"),
-    "pplx-deep-research": ("deep research", "pplx_alpha"),
+    "pplx-pro-gemini": ("pro", "gemini31pro_high"),
+    "pplx-pro-nemotron": ("pro", "nv_nemotron_3_super"),
+    "pplx-reasoning-gpt5": ("pro", "gpt54_thinking"),
+    "pplx-reasoning-claude": ("pro", "claude46sonnetthinking"),
+    "pplx-reasoning-gemini": ("pro", "gemini31pro_high"),
+    "pplx-reasoning-nemotron": ("pro", "nv_nemotron_3_super"),
+    "pplx-reasoning-opus": ("pro", "claude46opusthinking"),
+    "pplx-deep-research": ("pro", "pplx_alpha"),
 }
 
 def load_model_map() -> dict:
