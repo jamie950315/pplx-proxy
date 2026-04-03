@@ -382,7 +382,7 @@ async def chat_ui():
     """Debug chat interface."""
     p=_StaticPath(__file__).parent / "static" / "chat.html"
     if p.exists():
-        return _FileResponse(p, media_type="text/html")
+        return _FileResponse(p, media_type="text/html", headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache"})
     raise HTTPException(404, "chat.html not found")
 
 @app.get("/debug")
@@ -754,6 +754,7 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
         parts.append(current_msg)
 
     query="\n\n".join(parts)
+    log.debug(f"CONTEXT QUERY ({len(query)}ch, {len(history)} hist items):\n{query[:1500]}")
 
     if not query.strip():
         raise HTTPException(400, "No valid message content after processing. Ensure at least one user message has non-empty content.")
