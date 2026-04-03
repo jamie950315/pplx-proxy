@@ -794,6 +794,9 @@ if HAS_MCP:
     async def _combined_lifespan(a):
         async with mcp_http_app.router.lifespan_context(mcp_http_app):
             log.info("MCP streamable HTTP lifespan started")
+            asyncio.create_task(session_keepalive_loop())
+            asyncio.create_task(auto_discover_loop())
+            log.info(f"pplx-proxy started on port {PORT}")
             yield
         log.info("MCP streamable HTTP lifespan stopped")
 
@@ -993,11 +996,7 @@ async def auto_discover_loop():
             log.error(f"Auto-discovery error: {e}")
 
 
-@app.on_event("startup")
-async def startup():
-    asyncio.create_task(session_keepalive_loop())
-    asyncio.create_task(auto_discover_loop())
-    log.info(f"pplx-proxy started on port {PORT}")
+# startup tasks moved into _combined_lifespan above
 
 
 # ─── Entrypoint ────────────────────────────────────────────────────────────
