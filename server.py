@@ -1124,7 +1124,19 @@ except ImportError:
     log.warning("mcp package not installed, MCP endpoints disabled.")
 
 if HAS_MCP:
-    mcp=FastMCP("pplx-proxy", instructions="Perplexity Pro Search reverse proxy.")
+    # Configure MCP transport security — allow external domain
+    from urllib.parse import urlparse as _urlparse
+    _pub_host=_urlparse(PUBLIC_URL).hostname or ""
+    _mcp_security=None
+    if _pub_host and _pub_host not in ("localhost", "127.0.0.1"):
+        from mcp.server.transport_security import TransportSecuritySettings
+        _mcp_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*", f"{_pub_host}:*", _pub_host],
+            allowed_origins=["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*", f"https://{_pub_host}:*", f"https://{_pub_host}"],
+        )
+        log.info(f"MCP allowed hosts: localhost + {_pub_host}")
+    mcp=FastMCP("pplx-proxy", instructions="Perplexity Pro Search reverse proxy.", transport_security=_mcp_security)
 
     @mcp.tool()
     async def perplexity_search(query: str, model: str="default", sources: str="web", language: str="en-US") -> str:
@@ -1276,7 +1288,8 @@ if HAS_MCP:
                         return
                     # Allow /messages for SSE transport (session_id is the auth)
                     if path.startswith("/messages"):
-                        await mcp_sse_app(scope, receive, send)
+                        s=dict(scope)
+                        await mcp_sse_app(s, receive, send)
                         return
                     # Block bare /mcp and /sse without key
                     if path.startswith("/mcp") or path.startswith("/sse"):
