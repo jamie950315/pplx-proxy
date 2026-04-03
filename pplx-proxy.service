@@ -1,0 +1,18 @@
+[Unit]
+Description=pplx-proxy - Perplexity Pro reverse proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jamie
+WorkingDirectory=/home/jamie/pplx-proxy
+EnvironmentFile=/home/jamie/pplx-proxy/.env
+ExecStart=/home/jamie/pplx-proxy/venv/bin/uvicorn server:app --host 0.0.0.0 --port 8892 --log-level info
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
