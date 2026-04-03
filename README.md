@@ -184,6 +184,7 @@ Manual trigger: `POST /admin/discover-models`
 | `KEEPALIVE_HOURS` | `6` | Session ping interval |
 | `PROBE_INTERVAL_HOURS` | `24` | Auto-discovery interval |
 | `NTFY_TOPIC` | `pplx-proxy` | ntfy.sh topic |
+| `NTFY_URL` | `https://ntfy.sh` | ntfy server URL |
 | `NTFY_COOLDOWN_SECS` | `3600` | Min interval between alerts |
 | `PUBLIC_URL` | `http://localhost:8892` | URL in ntfy messages |
 | `PPLX_API_VERSION` | `2.18` | Perplexity internal API ver |
