@@ -71,9 +71,11 @@ pplx-proxy.service   # systemd unit
 - `POST /admin/refresh-cookie` — inject new token
 - `POST /admin/discover-models` — manual discovery run
 
-**MCP** (no auth, MCP session):
-- `POST /mcp/mcp` — Streamable HTTP
-- `GET /sse/sse` — SSE transport
+**MCP** (API key in URL path):
+- `POST /<api-key>/mcp` — Streamable HTTP
+- `GET /<api-key>/sse` — SSE transport
+- `POST /messages/?session_id=...` — SSE message relay (session_id is auth)
+- Without `PPLX_PROXY_API_KEY`: falls back to `/mcp/mcp` + `/sse/sse` (no auth)
 
 ## OpenAI Format Compliance
 
