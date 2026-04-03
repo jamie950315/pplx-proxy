@@ -6,7 +6,7 @@
 
 ## Architecture
 
-Single FastAPI app (`server.py`) that:
+Single FastAPI app (`server.py`, ~1440 lines) that:
 
 1. Receives OpenAI-format or MCP tool call requests
 2. Translates to Perplexity's internal SSE (`POST /rest/sse/perplexity_ask`)
@@ -22,14 +22,26 @@ Single FastAPI app (`server.py`) that:
 - `max`: all models including Opus
 - Tier filtering applies to API, MCP, model listing, and discovery
 
-**Model Map**: dict of `{model_id: (mode, internal_pref)}`. Loaded from `.models.json` (persisted) or defaults. Filtered by tier at runtime. All models use `mode="copilot"` (Perplexity Pro Search).
+**Model Map**: dict of `{model_id: (mode, internal_pref)}`. Loaded from `.models.json` (persisted) or defaults. Filtered by tier at runtime.
 
-**Auto-Discovery**: every `PROBE_INTERVAL_HOURS`, checks if models are alive. Dead models get version-incremented (e.g., `gpt54` → `gpt55`) up to +1.0. Thinking variants auto-follow base model. Sends ntfy on upgrade.
+**Thinking Variants**: activated via `thinking: true` or `reasoning_effort != "none"`. Maps from `_THINKING_MAP` (e.g., `gpt → gpt54_thinking`, `sonnet → claude46sonnetthinking`). Perplexity does NOT expose internal thinking blocks — `reasoning_content` is populated from search steps (queries, URLs, plan goals).
+
+**Tool Calling**: implemented via prompt injection (Perplexity has no native tool calling). 3-layer defense against false positives:
+1. **Relevance heuristic** (`_should_inject_tools`): only inject tool prompt if user message has keyword overlap with tool names/descriptions
+2. **Schema validation** (`_validate_tool_calls`): validates function name, required params present, no empty values
+3. **XML cleanup** (`_strip_xml_wrapper`): strips `<response>`, `<answer>` wrappers when not a tool call
+
+**Context Management**: system prompt / conversation history / current message separated. Empty assistant messages (from tool_calls) → `[done]` placeholder. Assistant messages truncated to 200 chars. Last 16 items (~8 turns) kept. Tool results formatted as `Result: {content}`.
+
+**Response Cleaning** (`_clean_response`): strips `[1]` `[2]` citations, `<grok:*>` tags, `<?xml?>` declarations, `<response>` wrappers, `<script>` tags.
+
+**Auto-Discovery**: every `PROBE_INTERVAL_HOURS`, checks if models are alive. Dead models get version-incremented (e.g., `gpt54` → `gpt55`) up to +1.0. Sends ntfy on upgrade.
 
 ## File Structure
 
 ```
 server.py            # Everything: FastAPI, Perplexity client, MCP, admin, discovery
+static/chat.html     # Debug chat UI with OpenAI format validator
 inject_cookie.sh     # Helper to inject cookie + restart
 test.sh              # Smoke test
 pplx-proxy.service   # systemd unit
@@ -47,12 +59,14 @@ pplx-proxy.service   # systemd unit
 
 ## Endpoints
 
-**Public**: `GET /health`
+**Public**:
+- `GET /health` — health check
+- `GET /chat` — debug chat UI with OpenAI format validator (test tool calling, streaming, thinking, format compliance)
 
 **Auth required** (Bearer token):
-- `GET /v1/models` — tier-filtered model list
-- `POST /v1/chat/completions` — OpenAI chat
-- `GET /admin/models` — full model map
+- `GET /v1/models` — tier-filtered model list (OpenAI-compatible format)
+- `POST /v1/chat/completions` — chat (streaming + non-streaming, tool calling, thinking)
+- `GET /admin/models` — full model map with internal details
 - `POST /admin/update-models` — modify models
 - `POST /admin/refresh-cookie` — inject new token
 - `POST /admin/discover-models` — manual discovery run
@@ -60,6 +74,16 @@ pplx-proxy.service   # systemd unit
 **MCP** (no auth, MCP session):
 - `POST /mcp/mcp` — Streamable HTTP
 - `GET /sse/sse` — SSE transport
+
+## OpenAI Format Compliance
+
+All responses strictly follow the OpenAI Chat Completions spec:
+
+**Non-streaming**: `id` (chatcmpl-*), `object` (chat.completion), `created`, `model`, `system_fingerprint` (null), `choices[].index`, `choices[].logprobs` (null), `choices[].finish_reason`, `choices[].message.role`, `choices[].message.content`, `choices[].message.tool_calls`, `usage.prompt_tokens`, `usage.completion_tokens`, `usage.total_tokens` (always = prompt + completion)
+
+**Streaming**: `object` (chat.completion.chunk), consistent `id` across all chunks, `system_fingerprint` in every chunk, `logprobs` in every choice, first chunk has `delta.role=assistant`, last chunk has `finish_reason` + empty `delta`, ends with `data: [DONE]`
+
+**Debug page**: `GET /chat` has a "Format ✓" tab that validates every response against the OpenAI spec in real-time with PASS/FAIL badges per field.
 
 ## MCP Tools
 
@@ -75,7 +99,7 @@ All tools validate: empty query, invalid model, invalid sources, tier restrictio
 
 ## Discovery Probe Strategy
 
-Only base models are probed. Thinking variants auto-follow.
+Only base models are probed. Thinking variants auto-derived from `_THINKING_MAP`.
 
 - `sonar` (`experimental`) → alive check only, no version pattern
 - `gpt` (`gpt54`) → gpt55...gpt64 (max 10)
@@ -102,6 +126,9 @@ Only base models are probed. Thinking variants auto-follow.
 ## Common Tasks
 
 ```bash
+# Test format compliance visually
+open http://localhost:8892/chat
+
 # Add model
 curl -X POST /admin/update-models -d '{"models":{"new":["pro","pref"]},"merge":true}'
 
