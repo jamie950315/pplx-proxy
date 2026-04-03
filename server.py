@@ -368,7 +368,7 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
         raise HTTPException(400, "messages must be an array")
     if len(messages) == 0:
         raise HTTPException(400, "messages array is empty")
-    VALID_ROLES={"system", "user", "assistant"}
+    VALID_ROLES={"system", "user", "assistant", "tool"}
     for i, msg in enumerate(messages):
         if not isinstance(msg, dict):
             raise HTTPException(400, f"messages[{i}] must be an object")
@@ -377,7 +377,8 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
             raise HTTPException(400, f"messages[{i}] missing required field: role")
         if role not in VALID_ROLES:
             raise HTTPException(400, f"messages[{i}] invalid role: '{role}'. Must be one of: {sorted(VALID_ROLES)}")
-        if "content" not in msg:
+        # content can be null/missing for assistant (tool_calls) and tool messages
+        if "content" not in msg and role not in ("assistant", "tool"):
             raise HTTPException(400, f"messages[{i}] missing required field: content")
 
     mm=get_model_map()
@@ -395,7 +396,7 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
     parts=[]
     for msg in messages:
         role=msg.get("role", "user")
-        content=msg.get("content", "")
+        content=msg.get("content") or ""
         if isinstance(content, list):
             text_parts=[c.get("text", "") for c in content if c.get("type") == "text"]
             content=" ".join(text_parts)
@@ -405,6 +406,8 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
             parts.append(content)
         elif role == "assistant":
             parts.append(f"[Assistant]: {content}")
+        elif role == "tool":
+            parts.append(f"[Tool Result]: {content}")
     query="\n\n".join(parts)
 
     client=get_client()
