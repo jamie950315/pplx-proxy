@@ -215,7 +215,8 @@ class PerplexityClient:
         full_answer=""
         backend_uuid=None
         web_results=[]
-        seen_len=0  # track cumulative answer length to deduplicate
+        seen_len=0
+        _seen_thinking=set()  # dedup thinking content
 
         async for line in resp.aiter_lines(delimiter=b"\r\n\r\n"):
             content=line.decode("utf-8") if isinstance(line, bytes) else line
@@ -235,10 +236,49 @@ class PerplexityClient:
             if "web_results" in chunk:
                 web_results=chunk["web_results"]
 
-            # Extract streaming text from blocks[].markdown_block
+            # Extract thinking content from search/plan blocks
             blocks=chunk.get("blocks", [])
             for block in blocks:
                 usage=block.get("intended_usage", "")
+
+                # Thinking: search steps
+                if usage == "pro_search_steps":
+                    pb=block.get("plan_block", {})
+                    for step in pb.get("steps", []):
+                        st=step.get("step_type", "")
+                        if st == "SEARCH_WEB":
+                            queries=[q.get("query","") for q in step.get("search_web_content",{}).get("queries",[])]
+                            for q in queries:
+                                if q and q not in _seen_thinking:
+                                    _seen_thinking.add(q)
+                                    yield {"thinking": f"Searching: {q}", "done": False}
+                        elif st == "READ_RESULTS":
+                            urls=[u for u in step.get("read_results_content",{}).get("urls",[]) if u]
+                            for u in urls[:3]:
+                                if u not in _seen_thinking:
+                                    _seen_thinking.add(u)
+                                    yield {"thinking": f"Reading: {u}", "done": False}
+
+                # Thinking: plan goals
+                if usage == "plan":
+                    pb=block.get("plan_block", {})
+                    for goal in pb.get("goals", []):
+                        desc=goal.get("description", "")
+                        if desc and desc not in _seen_thinking:
+                            _seen_thinking.add(desc)
+                            yield {"thinking": desc, "done": False}
+
+                # Thinking: web results (capture as they arrive)
+                if usage == "web_results":
+                    wb=block.get("web_result_block", {})
+                    results=wb.get("web_results", [])
+                    for r in results[:8]:
+                        url=r.get("url","")
+                        name=r.get("name","")
+                        if url and url not in _seen_thinking:
+                            _seen_thinking.add(url)
+                            yield {"thinking": f"Found: [{name}]({url})", "done": False}
+
                 if "markdown" not in usage:
                     continue
                 mb=block.get("markdown_block", {})
@@ -530,28 +570,38 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
         )
 
     full=""
+    thinking_parts=[]
     async for chunk in client.search(query, mode, model_pref, sources, language):
         if chunk.get("error"):
             raise HTTPException(502, chunk)
+        if chunk.get("thinking"):
+            thinking_parts.append(chunk["thinking"])
+            continue
         if chunk.get("done"):
             full=chunk.get("answer", full)
             break
         full=chunk.get("answer", full)
+    reasoning_content="\n".join(thinking_parts) if thinking_parts else None
 
     # Check for tool calls in response
     if tools and isinstance(tools, list):
         tool_calls, remaining=_parse_tool_calls(full)
         if tool_calls:
             msg={"role": "assistant", "content": remaining if remaining else None, "tool_calls": tool_calls}
+            if reasoning_content:
+                msg["reasoning_content"]=reasoning_content
             return {
                 "id": cid, "object": "chat.completion", "created": created, "model": model_name,
                 "choices": [{"index": 0, "message": msg, "finish_reason": "tool_calls"}],
                 "usage": {"prompt_tokens": len(query)//4, "completion_tokens": len(full)//4, "total_tokens": (len(query)+len(full))//4},
             }
 
+    msg={"role": "assistant", "content": full}
+    if reasoning_content:
+        msg["reasoning_content"]=reasoning_content
     return {
         "id": cid, "object": "chat.completion", "created": created, "model": model_name,
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": full}, "finish_reason": "stop"}],
+        "choices": [{"index": 0, "message": msg, "finish_reason": "stop"}],
         "usage": {"prompt_tokens": len(query)//4, "completion_tokens": len(full)//4, "total_tokens": (len(query)+len(full))//4},
     }
 
@@ -559,6 +609,7 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
 async def _stream_openai_with_tools(client, query, mode, model_pref, model_name, cid, created, sources, language):
     """Stream with tool call detection: buffer response, check for tool_calls, then emit."""
     full=""
+    thinking_parts=[]
     async for chunk in client.search(query, mode, model_pref, sources, language):
         if chunk.get("error"):
             e={"id": f"chatcmpl-{uuid4().hex[:12]}", "object": "chat.completion.chunk", "created": int(time.time()), "model": model_name,
@@ -566,6 +617,9 @@ async def _stream_openai_with_tools(client, query, mode, model_pref, model_name,
             yield f"data: {json.dumps(e)}\n\n"
             yield "data: [DONE]\n\n"
             return
+        if chunk.get("thinking"):
+            thinking_parts.append(chunk["thinking"])
+            continue
         if chunk.get("done"):
             full=chunk.get("answer", full)
             break
@@ -614,6 +668,13 @@ async def _stream_openai(client, query, mode, model_pref, model_name, cid, creat
     yield f"data: {json.dumps(init)}\n\n"
 
     async for chunk in client.search(query, mode, model_pref, sources, language):
+        # Stream thinking content as reasoning_content deltas
+        if chunk.get("thinking"):
+            t={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
+               "choices": [{"index": 0, "delta": {"reasoning_content": chunk["thinking"]+"\n"}, "finish_reason": None}]}
+            yield f"data: {json.dumps(t)}\n\n"
+            continue
+
         if chunk.get("error"):
             e={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
                "choices": [{"index": 0, "delta": {"content": f"[Error: {chunk['error']}]"}, "finish_reason": None}]}
