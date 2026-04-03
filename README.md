@@ -49,18 +49,18 @@ venv/bin/uvicorn server:app --host 0.0.0.0 --port 8892
 
 | Model ID | Backend |
 |----------|---------|
-| `pplx-auto` | Perplexity Best (auto-select) |
+| `auto` | Perplexity Best (auto-select) |
 
 ### PRO ($20/mo)
 
 | Model ID | Backend | Thinking |
 |----------|---------|----------|
-| `pplx-auto` | Perplexity Best | — |
-| `pplx-sonar` | Sonar | — |
-| `pplx-gpt5` | GPT-5.4 | `pplx-gpt5-thinking` |
-| `pplx-claude` | Claude Sonnet 4.6 | `pplx-claude-thinking` |
-| `pplx-gemini` | Gemini 3.1 Pro | always on |
-| `pplx-nemotron` | Nemotron 3 Super | always on |
+| `auto` | Perplexity Best | — |
+| `sonar` | Sonar | — |
+| `gpt5` | GPT-5.4 | `gpt5-thinking` |
+| `sonnet` | Claude Sonnet 4.6 | `sonnet-thinking` |
+| `gemini` | Gemini 3.1 Pro | always on |
+| `nemotron` | Nemotron 3 Super | always on |
 
 ### MAX ($200/mo)
 
@@ -68,7 +68,7 @@ Everything in PRO, plus:
 
 | Model ID | Backend | Thinking |
 |----------|---------|----------|
-| `pplx-opus` | Claude Opus 4.6 | `pplx-opus-thinking` |
+| `opus` | Claude Opus 4.6 | `opus-thinking` |
 
 Using a model outside your tier returns `403` with a clear error message.
 
@@ -94,7 +94,7 @@ Using a model outside your tier returns `403` with a clear error message.
 curl -X POST http://localhost:8892/v1/chat/completions \
   -H "Authorization: Bearer YOUR_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model": "pplx-gpt5", "messages": [{"role": "user", "content": "Hello"}], "stream": true}'
+  -d '{"model": "gpt5", "messages": [{"role": "user", "content": "Hello"}], "stream": true}'
 ```
 
 ### MCP
@@ -120,12 +120,12 @@ Every `PROBE_INTERVAL_HOURS` (default 24h), pplx-proxy checks if models are stil
 
 | Model | Probe strategy |
 |-------|---------------|
-| `pplx-sonar` | alive check only |
-| `pplx-gpt5` | gpt54 → gpt55...gpt64 (max 10), thinking auto-follows |
-| `pplx-claude` | claude46sonnet → claude47...claude56 (max 10), thinking auto-follows |
-| `pplx-opus` | claude46opus → claude47...claude56 (max 10), thinking auto-follows |
-| `pplx-gemini` | gemini31pro_high → gemini32...gemini41 (max 10) |
-| `pplx-nemotron` | nv_nemotron_3_super → nv_nemotron_4 (max 1) |
+| `sonar` | alive check only |
+| `gpt5` | gpt54 → gpt55...gpt64 (max 10), thinking auto-follows |
+| `sonnet` | claude46sonnet → claude47...claude56 (max 10), thinking auto-follows |
+| `opus` | claude46opus → claude47...claude56 (max 10), thinking auto-follows |
+| `gemini` | gemini31pro_high → gemini32...gemini41 (max 10) |
+| `nemotron` | nv_nemotron_3_super → nv_nemotron_4 (max 1) |
 
 Manual trigger: `POST /admin/discover-models`
 
@@ -136,7 +136,7 @@ Manual trigger: `POST /admin/discover-models`
 | `PPLX_COOKIE` | — | Session token (**required**) |
 | `PPLX_PROXY_API_KEY` | — | Bearer auth (empty = no auth) |
 | `ACCOUNT_TYPE` | `pro` | `free`, `pro`, or `max` |
-| `DEFAULT_MODEL` | `pplx-gpt5` | Default when not specified |
+| `DEFAULT_MODEL` | `gpt5` | Default when not specified |
 | `PPLX_PROXY_PORT` | `8892` | Listen port |
 | `KEEPALIVE_HOURS` | `6` | Session ping interval |
 | `PROBE_INTERVAL_HOURS` | `24` | Auto-discovery interval |

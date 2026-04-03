@@ -17,7 +17,7 @@ Single FastAPI app (`server.py`) that:
 ## Key Concepts
 
 **Account Tiers** (`ACCOUNT_TYPE` in .env):
-- `free`: only `pplx-auto`
+- `free`: only `auto`
 - `pro`: all models except Opus
 - `max`: all models including Opus
 - Tier filtering applies to API, MCP, model listing, and discovery
@@ -77,12 +77,12 @@ All tools validate: empty query, invalid model, invalid sources, tier restrictio
 
 Only base models are probed. Thinking variants auto-follow.
 
-- `pplx-sonar` (`experimental`) → alive check only, no version pattern
-- `pplx-gpt5` (`gpt54`) → gpt55...gpt64 (max 10)
-- `pplx-claude` (`claude46sonnet`) → claude47...claude56 (max 10)
-- `pplx-opus` (`claude46opus`) → claude47...claude56 (max 10)
-- `pplx-gemini` (`gemini31pro_high`) → gemini32...gemini41 (max 10)
-- `pplx-nemotron` (`nv_nemotron_3_super`) → nv_nemotron_4 (max 1)
+- `sonar` (`experimental`) → alive check only, no version pattern
+- `gpt5` (`gpt54`) → gpt55...gpt64 (max 10)
+- `sonnet` (`claude46sonnet`) → claude47...claude56 (max 10)
+- `opus` (`claude46opus`) → claude47...claude56 (max 10)
+- `gemini` (`gemini31pro_high`) → gemini32...gemini41 (max 10)
+- `nemotron` (`nv_nemotron_3_super`) → nv_nemotron_4 (max 1)
 
 ## Code Style
 
