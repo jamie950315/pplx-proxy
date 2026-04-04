@@ -167,7 +167,7 @@ class PerplexityClient:
         self,
         query: str,
         mode: str="auto",
-        model_pref: str="turbo",
+        model_pref: str="pplx_pro",
         sources: list=None,
         language: str="en-US",
         follow_up_uuid: str=None,
@@ -646,14 +646,13 @@ def _validate_tool_calls(tool_calls: list, tools: list) -> list:
 def _strip_xml_wrapper(text: str) -> str:
     """Strip XML wrapper tags from content that isn't a tool call.
     Handles cases where model wraps response in <response>, <answer>, etc."""
-    import re as _sre
     stripped = text.strip()
     # Strip <?xml ?> declaration
-    stripped = _sre.sub(r'<[?]xml[^?]*[?]>\s*', '', stripped)
+    stripped = re.sub(r'<[?]xml[^?]*[?]>\s*', '', stripped)
     # Strip common wrapper tags: <response>, <answer>, <output>, <result>
     for tag in ("response", "answer", "output", "result", "reply"):
-        stripped = _sre.sub(rf'^\s*<{tag}[^>]*>\s*', '', stripped)
-        stripped = _sre.sub(rf'\s*</{tag}>\s*$', '', stripped)
+        stripped = re.sub(rf'^\s*<{tag}[^>]*>\s*', '', stripped)
+        stripped = re.sub(rf'\s*</{tag}>\s*$', '', stripped)
     return stripped.strip()
 
 
@@ -698,6 +697,11 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
     history=[]
     for msg in messages:
         role=msg.get("role","user")
+        # Detect user messages that are actually system prompts
+        if role=="user":
+            _ct=(msg.get("content") or "")[:200].lower()
+            if any(kw in _ct for kw in ["you are ", "you must ", "your role", "ccsearch", "加載", "技能", "available_skills", "<skill"]):
+                role="system"
         content=msg.get("content") or ""
         if role=="system":
             system_msg=content
