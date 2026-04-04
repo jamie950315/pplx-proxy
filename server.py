@@ -768,16 +768,38 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
             msg_id=f"msg_{uuid4().hex[:8]}"
             yield f"event: response.output_item.added\ndata: {json.dumps({'type': 'message', 'id': msg_id, 'role': 'assistant'})}\n\n"
 
+            # Start reasoning summary part
+            yield f"event: response.reasoning_summary_part.added\ndata: {json.dumps({'type': 'reasoning_summary_part', 'item_id': msg_id})}\n\n"
+
             full=""
+            _thinking_parts=[]
+            _thinking_done=False
             async for ch in client.search(query, mode, model_pref, ["web"], "en-US"):
                 if ch.get("error"):
                     yield f"event: error\ndata: {json.dumps({'error': ch['error']})}\n\n"
                     break
                 if ch.get("thinking"):
-                    continue  # Skip thinking in Responses format
+                    t=ch["thinking"]
+                    # Emit as reasoning summary delta (OpenAI Responses API format)
+                    _thinking_parts.append(t)
+                    evt={"type": "response.reasoning_summary_text.delta", "item_id": msg_id, "delta": t+"\n"}
+                    yield f"event: response.reasoning_summary_text.delta\ndata: {json.dumps(evt)}\n\n"
+                    continue
                 if ch.get("done"):
                     full=ch.get("answer", full)
+                    # Close reasoning if still open
+                    if not _thinking_done:
+                        _thinking_done=True
+                        think_full="\n".join(_thinking_parts)
+                        yield f"event: response.reasoning_summary_text.done\ndata: {json.dumps({'type': 'response.reasoning_summary_text.done', 'item_id': msg_id, 'text': think_full})}\n\n"
+                        yield f"event: response.reasoning_summary_part.done\ndata: {json.dumps({'type': 'reasoning_summary_part', 'item_id': msg_id})}\n\n"
                     break
+                # Close reasoning summary on first content chunk
+                if not _thinking_done:
+                    _thinking_done=True
+                    think_full="\n".join(_thinking_parts)
+                    yield f"event: response.reasoning_summary_text.done\ndata: {json.dumps({'type': 'response.reasoning_summary_text.done', 'item_id': msg_id, 'text': think_full})}\n\n"
+                    yield f"event: response.reasoning_summary_part.done\ndata: {json.dumps({'type': 'reasoning_summary_part', 'item_id': msg_id})}\n\n"
                 # Stream delta
                 delta=ch.get("delta", "")
                 if delta:
