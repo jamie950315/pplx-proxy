@@ -814,29 +814,28 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
         current_msg=history[-1][1]
         history=history[:-1]
 
-    parts=[]
+    # Build query as JSON for clear block separation
+    query_obj={}
     if system_msg:
-        # Only extract language preference, strip everything else
         _lang=None
         for _l in system_msg.splitlines():
             _ls=_l.strip().lstrip("- ")
             if _re.search(r"(?i)(traditional chinese|繁體|zh-tw|reply in|respond in|回覆|回答.*語言)", _ls):
                 _lang=_ls[:100]
                 break
+        instructions=[]
         if _lang:
-            parts.append(f"[Reply language: {_lang}]")
-        parts.append("[You have built-in web search. Answer directly. Never say you cannot access data or need tools.]")
+            instructions.append(_lang)
+        instructions.append("You have built-in web search. Answer directly. Never say you cannot access data or need tools.")
+        query_obj["instructions"]=instructions
     if history:
-        ctx_lines=[]
-        for role,content in history:
-            prefix="User" if role=="user" else "Assistant"
-            ctx_lines.append(f"{prefix}: {content}")
-        parts.append("Previous conversation:\n"+"\n".join(ctx_lines))
+        query_obj["history"]=[{"role": r, "content": ct} for r, ct in history]
     if current_msg:
-        if history: parts.append(f"User\'s current request:\n{current_msg}")
-        else: parts.append(current_msg)
+        query_obj["query"]=current_msg
+    elif not history:
+        query_obj["query"]=""
 
-    query="\n\n".join(parts)
+    query=json.dumps(query_obj, ensure_ascii=False)
     if not query.strip():
         raise HTTPException(400, "Empty query after processing")
 
@@ -1082,37 +1081,28 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
         history=history[:-1]
 
     # Build query: system + history context + current request
-    parts=[]
+    # Build query as JSON for clear block separation
+    query_obj={}
     if system_msg:
-        # Extract ONLY language preference from system prompt.
-        # Perplexity searches ALL query text — any AI/chatbot/tool/role text
-        # pollutes search results with AI tutorial pages.
         _lang=None
         for _l in system_msg.splitlines():
             _ls=_l.strip().lstrip("- ")
             if _re.search(r"(?i)(traditional chinese|繁體|zh-tw|reply in|respond in|回覆|回答.*語言)", _ls):
                 _lang=_ls[:100]
                 break
+        instructions=[]
         if _lang:
-            parts.append(f"[Reply language: {_lang}]")
-        parts.append("[You have built-in web search. Answer questions directly using search results. Never say you cannot access data or need external tools.]")
+            instructions.append(_lang)
+        instructions.append("You have built-in web search. Answer questions directly using search results. Never say you cannot access data or need external tools.")
+        query_obj["instructions"]=instructions
     if history:
-        ctx_lines=[]
-        for role, content in history:
-            if role == "user":
-                ctx_lines.append(f"User: {content}")
-            elif role == "assistant":
-                ctx_lines.append(f"Assistant: {content}")
-            elif role == "tool":
-                ctx_lines.append(f"Tool result: {content}")
-        parts.append("Previous conversation:\n" + "\n".join(ctx_lines))
+        query_obj["history"]=[{"role": r, "content": ct} for r, ct in history]
     if current_msg:
-        if history:
-            parts.append(f"User's current request:\n{current_msg}")
-        else:
-            parts.append(current_msg)
+        query_obj["query"]=current_msg
+    elif not history:
+        query_obj["query"]=""
 
-    query="\n\n".join(parts)
+    query=json.dumps(query_obj, ensure_ascii=False)
     log.debug(f"CONTEXT QUERY ({len(query)}ch, {len(history)} hist items):\n{query[:1500]}")
 
     if not query.strip():
