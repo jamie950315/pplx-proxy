@@ -138,11 +138,22 @@ def _load_whitelist() -> list:
     return patterns
 
 def _filter_system_prompt(system_msg: str) -> list:
-    """Filter system prompt: only lines matching a whitelist pattern survive."""
+    """Filter system prompt: only lines matching a whitelist pattern survive.
+    Pre-processes <skill> XML tags to extract their inner text as standalone lines."""
     whitelist=_load_whitelist()
+
+    # Pre-process: extract text inside <skill> tags (LobeHub wraps custom prompts in XML)
+    # Handles multi-line: <skill name="...">line1\nline2\n...</skill>
+    import re as _sp_re
+    # First extract all <skill>...</skill> blocks and replace with their inner text
+    _processed=_sp_re.sub(r"<skill[^>]*>(.*?)</skill>", lambda m: m.group(1), system_msg, flags=_sp_re.DOTALL)
+    # Also strip any remaining XML tags (orphan opening/closing tags)
+    _processed=_sp_re.sub(r"</?[a-zA-Z_][^>]*>", "", _processed)
+    _expanded=_processed.splitlines()
+
     kept=[]
-    for line in system_msg.splitlines():
-        ls=line.strip().lstrip("- ")
+    for line in _expanded:
+        ls=line.strip().lstrip("- *")
         if not ls:
             continue
         if whitelist and any(p.search(ls) for p in whitelist):
