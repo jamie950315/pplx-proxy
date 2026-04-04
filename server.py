@@ -845,6 +845,12 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
         raise HTTPException(400, f"Unknown model: {model_name}")
     mode, model_pref=mm[model_name]
 
+    # Quota fallback: auto-downgrade when Pro quota exhausted
+    if _rate_limit.get("remaining_pro") is not None and _rate_limit["remaining_pro"] <= 0 and model_name != "auto":
+        log.warning(f"Pro quota exhausted (remaining_pro={_rate_limit['remaining_pro']}), falling back {model_name}→auto")
+        mode, model_pref=mm.get("auto", ("pro", "pplx_pro"))
+        model_name="auto"
+
     client=get_client()
     resp_id=f"resp_{uuid4().hex[:12]}"
     created=int(time.time())
@@ -1006,6 +1012,12 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
             mode, model_pref=mm[model_name]
         except (ValueError, TypeError):
             raise HTTPException(500, f"Corrupted model entry for {model_name}. Fix via /admin/update-models")
+
+    # Quota fallback: auto-downgrade when Pro quota exhausted
+    if _rate_limit.get("remaining_pro") is not None and _rate_limit["remaining_pro"] <= 0 and model_name != "auto":
+        log.warning(f"Pro quota exhausted (remaining_pro={_rate_limit['remaining_pro']}), falling back {model_name}→auto")
+        mode, model_pref=mm.get("auto", ("pro", "pplx_pro"))
+        model_name="auto"
 
     # Build query — extract system, history, and current user message separately
     system_msg=""
