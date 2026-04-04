@@ -1,0 +1,15 @@
+# System prompt blacklist — one regex pattern per line
+# Lines matching ANY pattern are stripped before sending to Perplexity
+# Empty lines and lines starting with # are ignored
+#
+# === Identity / Role-play ===
+(?i)(you are|your role|your name|personal assistant|AI agent|jarvis|lobe)
+#
+# === Tool / Skill references ===
+(?i)(ccsearch|brave|llm-context|perplexity|fetch.*page)
+(?i)(技能|加載|skill|available_skills|<skill)
+(?i)(must.*use.*tool|proactively use|must.*search)
+#
+# === LobeHub default prompt noise ===
+(?i)(current model:|today's date:)
+(?i)(<available_skills|</available_skills)

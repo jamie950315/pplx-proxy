@@ -107,9 +107,64 @@ def _remaining_notice() -> str:
     rp = _rate_limit["remaining_pro"]
     return f"\n\n[Remaining Pro Search: {rp}]"
 
+# ─── Prompt Blacklist (file-based, hot-reloadable) ──────────────────────────
+
+_BLACKLIST_FILE=Path(__file__).parent / ".prompt_blacklist.txt"
+_blacklist_cache={"patterns": [], "mtime": 0}
+
+def _load_blacklist() -> list:
+    """Load regex patterns from .prompt_blacklist.txt. Hot-reloads on file change."""
+    try:
+        mtime=_BLACKLIST_FILE.stat().st_mtime
+    except FileNotFoundError:
+        return []
+    if mtime == _blacklist_cache["mtime"]:
+        return _blacklist_cache["patterns"]
+    patterns=[]
+    try:
+        for line in _BLACKLIST_FILE.read_text().splitlines():
+            line=line.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                patterns.append(re.compile(line))
+            except re.error as e:
+                log.warning(f"Invalid blacklist regex: {line!r} — {e}")
+        _blacklist_cache["patterns"]=patterns
+        _blacklist_cache["mtime"]=mtime
+        log.info(f"Loaded {len(patterns)} blacklist patterns from {_BLACKLIST_FILE}")
+    except Exception as e:
+        log.warning(f"Failed to load blacklist: {e}")
+    return patterns
+
+def _filter_system_prompt(system_msg: str) -> list:
+    """Filter system prompt lines using blacklist. Returns list of instruction strings."""
+    blacklist=_load_blacklist()
+    kept=[]
+    for line in system_msg.splitlines():
+        ls=line.strip().lstrip("- ")
+        if not ls:
+            continue
+        blocked=False
+        for pat in blacklist:
+            if pat.search(ls):
+                blocked=True
+                break
+        if not blocked:
+            kept.append(ls)
+    # Always append search instruction
+    kept.append("You have built-in web search. Answer questions directly using search results. Never say you cannot access data or need external tools.")
+    return kept
+
+
+
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(message)s")
 log=logging.getLogger("pplx-proxy")
+
+
+# ─── Prompt Blacklist ──────────────────────────────────────────────────────
+
 
 # ─── Perplexity Client ─────────────────────────────────────────────────────
 
@@ -808,17 +863,7 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
     # Build query as JSON for clear block separation
     query_obj={}
     if system_msg:
-        _lang=None
-        for _l in system_msg.splitlines():
-            _ls=_l.strip().lstrip("- ")
-            if _re.search(r"(?i)(traditional chinese|繁體|zh-tw|reply in|respond in|回覆|回答.*語言)", _ls):
-                _lang=_ls[:100]
-                break
-        instructions=[]
-        if _lang:
-            instructions.append(_lang)
-        instructions.append("You have built-in web search. Answer directly. Never say you cannot access data or need tools.")
-        query_obj["instructions"]=instructions
+        query_obj["instructions"]=_filter_system_prompt(system_msg)
     if history:
         query_obj["history"]=[{"role": r, "content": ct} for r, ct in history]
     if current_msg:
@@ -1073,17 +1118,7 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
     # Build query as JSON for clear block separation
     query_obj={}
     if system_msg:
-        _lang=None
-        for _l in system_msg.splitlines():
-            _ls=_l.strip().lstrip("- ")
-            if _re.search(r"(?i)(traditional chinese|繁體|zh-tw|reply in|respond in|回覆|回答.*語言)", _ls):
-                _lang=_ls[:100]
-                break
-        instructions=[]
-        if _lang:
-            instructions.append(_lang)
-        instructions.append("You have built-in web search. Answer questions directly using search results. Never say you cannot access data or need external tools.")
-        query_obj["instructions"]=instructions
+        query_obj["instructions"]=_filter_system_prompt(system_msg)
     if history:
         query_obj["history"]=[{"role": r, "content": ct} for r, ct in history]
     if current_msg:
