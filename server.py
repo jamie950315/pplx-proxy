@@ -156,6 +156,8 @@ def _filter_system_prompt(system_msg: str) -> list:
         ls=line.strip().lstrip("- *")
         if not ls:
             continue
+        if len(ls) > 150:
+            continue  # Skip long lines (skill descriptions, XML noise)
         if whitelist and any(p.search(ls) for p in whitelist):
             kept.append(ls)
     # Always append search instruction
