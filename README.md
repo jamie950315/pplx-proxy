@@ -49,7 +49,7 @@ Then open **http://localhost:8892/chat** to test with the debug UI.
 
 1. Log in to [perplexity.ai](https://www.perplexity.ai)
 2. F12 → **Application** → **Cookies** → `www.perplexity.ai`
-3. Copy `next-auth.session-token`
+3. Copy `__Secure-next-auth.session-token`
 4. Set `PPLX_COOKIE=<value>` in `.env`
 
 ## Models
