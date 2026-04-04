@@ -345,7 +345,7 @@ def load_cookies() -> dict:
             cookies=json.loads(PPLX_COOKIE)
             return cookies
         except json.JSONDecodeError:
-            return {"next-auth.session-token": PPLX_COOKIE}
+            return {"__Secure-next-auth.session-token": PPLX_COOKIE}
 
     return {}
 
@@ -1678,7 +1678,7 @@ async def refresh_cookie_endpoint(request: Request, _=Depends(verify_api_key)):
         token=raw.decode("utf-8", errors="ignore").strip()
     if not token:
         return {"status": "error", "message": "Send session token as plain text body or JSON {\"session_token\": \"...\"}"}
-    cookies={"next-auth.session-token": token}
+    cookies={"__Secure-next-auth.session-token": token}
     save_cookies(cookies)
     global _client
     if _client:
