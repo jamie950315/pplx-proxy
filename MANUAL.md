@@ -167,7 +167,7 @@ curl -X POST http://localhost:8892/v1/chat/completions \
 | GET | `/chat` | No | Debug chat UI |
 | GET | `/v1/models` | Bearer | List available models |
 | POST | `/v1/chat/completions` | Bearer | Chat completions |
-| POST | `/v1/responses` | Bearer | OpenAI Responses API compatibility |
+| POST | `/v1/responses` | Bearer | OpenAI Responses API compatibility (streaming with reasoning) |
 | POST | `/{api_key}/mcp` | URL key | MCP Streamable HTTP |
 | GET | `/{api_key}/sse` | URL key | MCP SSE transport |
 | GET | `/admin/models` | Bearer | Full model map |
@@ -425,6 +425,24 @@ In streaming mode, reasoning chunks arrive before content chunks with `delta.rea
 | `opus` | `claude46opusthinking` |
 | `gemini` | Always on |
 | `nemotron` | Always on |
+
+### Responses API (`/v1/responses`)
+
+The `/v1/responses` endpoint provides OpenAI Responses API compatibility, primarily used by LobeHub when "built-in web search" is enabled. It accepts the same input format as OpenAI's Responses API and returns results in the same format.
+
+When streaming is enabled, the endpoint emits these SSE events in order:
+
+1. `response.created` — response object with status `in_progress`
+2. `response.output_item.added` — assistant message item
+3. `response.reasoning_summary_part.added` — reasoning block starts
+4. `response.reasoning_summary_text.delta` — search step info (Found URLs, search queries), repeated per step
+5. `response.reasoning_summary_text.done` — full reasoning text
+6. `response.reasoning_summary_part.done` — reasoning block ends
+7. `response.output_text.delta` — answer text chunks, repeated
+8. `response.output_text.done` — full answer text
+9. `response.completed` — final response with output and usage
+
+The `developer` role is accepted and mapped to `system` internally. Web search tools (`web_search_preview`) are silently ignored since `search_focus: "internet"` is always active.
 
 ---
 
