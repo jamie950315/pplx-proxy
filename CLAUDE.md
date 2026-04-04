@@ -28,8 +28,6 @@ Single FastAPI app (`server.py`, ~1750 lines) that:
 
 **Thinking Variants**: activated via `thinking: true` or `reasoning_effort != "none"`. Maps from `_THINKING_MAP` (e.g., `gpt → gpt54_thinking`, `sonnet → claude46sonnetthinking`). Perplexity does NOT expose internal thinking blocks — `reasoning_content` is populated from search steps (queries, URLs, plan goals).
 
-**Tool Calling**: implemented via prompt injection (Perplexity has no native tool calling). 3-layer defense against false positives:
-1. **Relevance heuristic** (`_should_inject_tools`): only inject tool prompt if user message has keyword overlap with tool names/descriptions
 
 **Context Management**: system prompt / conversation history / current message separated. Empty assistant messages → `[done]`. Total query capped at 96K chars (~32K tokens). Consecutive same-role messages deduped (keeps last — fixes LibreChat branch artifacts). System prompts filtered via whitelist (.prompt_whitelist.txt).
 
@@ -61,11 +59,10 @@ pplx-proxy.service   # systemd unit
 
 **Public**:
 - `GET /health` — health check
-- `GET /chat` — debug chat UI with OpenAI format validator (test tool calling, streaming, thinking, format compliance)
 
 **Auth required** (Bearer token):
 - `GET /v1/models` — tier-filtered model list (OpenAI-compatible format)
-- `POST /v1/chat/completions` — chat (streaming + non-streaming, thinking)
+- `POST /v1/chat/completions` — chat (streaming + non-streaming, thinking). `tools` parameter silently ignored.
 - `POST /v1/responses` — OpenAI Responses API compatibility (translates to chat/completions internally, used by LobeHub web search mode)
 - `GET /admin/models` — full model map with internal details
 - `POST /admin/update-models` — modify models
@@ -352,41 +349,6 @@ Client Response
 **Key special handling:**
 - Consecutive assistant dedup (branch artifacts)
 - Topic separation prefix
-
----
-
-### Scenario 5: Tool Calling (any client) → `/v1/chat/completions`
-
-**Input format:**
-```json
-{"model":"sonnet", "messages":[
-  {"role":"user", "content":"Look up user 42"}
-], "tools":[
-  {"type":"function", "function":{"name":"get_user", "description":"Look up user", "parameters":{...}}}
-]}
-```
-
-**Processing:**
-1. Non-function tools filtered out at source (`web_search_preview` etc. removed)
-2. **Relevance heuristic** (`_should_inject_tools`): checks if user message keywords overlap with tool names/descriptions. "Look up user" overlaps with "get_user"/"Look up user" → inject tool prompt
-3. Tool definitions converted to XML schema, appended to query
-4. Sent to Perplexity (model sees tool definitions via prompt injection)
-5. Response parsed: if contains `<function_call>` XML → extracted as `tool_calls`
-6. **Schema validation**: tool name must exist, required params must be present
-7. **False-positive defense**: if model wraps normal text in `<response>` XML → stripped
-8. Response returned with `finish_reason: "tool_calls"` and `tool_calls` array
-
-**For tool results (follow-up):**
-```json
-{"messages":[
-  {"role":"user", "content":"Look up user 42"},
-  {"role":"assistant", "content":null, "tool_calls":[{"id":"call_x", "function":{"name":"get_user", "arguments":"{\"user_id\":42}"}}]},
-  {"role":"tool", "tool_call_id":"call_x", "content":"{\"name\":\"Alice\"}"},
-  {"role":"user", "content":"What is their name?"}
-]}
-```
-- Assistant message with `tool_calls` → formatted as `[Called tools: get_user({"user_id":42})]`
-- Tool result → formatted as `Result: {"name":"Alice"}` (truncated to 400ch)
 
 ---
 

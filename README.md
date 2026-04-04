@@ -145,17 +145,6 @@ Without `PPLX_PROXY_API_KEY` set, MCP falls back to unauthenticated `/mcp/mcp` a
 | `perplexity_research` | Deep Research |
 | `perplexity_models` | List available models for your tier |
 
-## Tool Calling
-
-Tool calling is implemented via prompt injection (Perplexity has no native tool calling API). The proxy appends a compact tool definition prompt to the query and parses XML responses back into OpenAI tool_calls format.
-
-**3-layer defense against false positives:**
-
-1. **Relevance heuristic**: tool prompt only injected if user message has keyword overlap with tool names/descriptions. "Hello" with tools → no tool prompt injected.
-2. **Schema validation**: parsed tool calls validated against definitions — function name must exist, required params must be present and non-empty.
-3. **XML cleanup**: if model wraps response in `<response>`, `<answer>` etc. but it's not a real tool call, XML is stripped and clean text is returned.
-
-Supports `tool_choice`: `auto` (default), `none` (suppress tools), `required` (force tool call).
 
 ## OpenAI Format Compliance
 
@@ -163,7 +152,6 @@ All responses strictly match the [OpenAI Chat Completions API spec](https://plat
 
 - `id` (chatcmpl-*), `object`, `created`, `model`, `system_fingerprint` (null)
 - `choices[].index`, `choices[].logprobs` (null), `choices[].finish_reason`
-- `choices[].message.role`, `.content`, `.tool_calls`
 - `usage.total_tokens` = `prompt_tokens` + `completion_tokens`
 - Streaming: consistent `id`, `system_fingerprint` in every chunk, proper `[DONE]` termination
 - Tool calls: `id` (call_*), `type` (function), `function.name`, `function.arguments` (valid JSON string)

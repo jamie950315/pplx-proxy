@@ -15,7 +15,6 @@ A comprehensive guide to installing, configuring, and using pplx-proxy — a sel
 7. [API Reference](#7-api-reference)
 8. [Chat Completions API](#8-chat-completions-api)
 9. [Streaming](#9-streaming)
-10. [Tool Calling](#10-tool-calling)
 11. [Thinking / Reasoning](#11-thinking--reasoning)
 12. [MCP Server Integration](#12-mcp-server-integration)
 13. [Debug Chat UI](#13-debug-chat-ui)
@@ -300,89 +299,6 @@ Key guarantees:
 
 ---
 
-## 10. Tool Calling
-
-pplx-proxy supports OpenAI-style function calling. Since Perplexity has no native tool calling API, this is implemented via prompt injection — a tool schema prompt is appended to the query when the user's message appears relevant to the available tools.
-
-### Basic Example
-
-```bash
-curl -X POST http://localhost:8892/v1/chat/completions \
-  -H "Authorization: Bearer YOUR_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "sonnet",
-    "messages": [{"role": "user", "content": "Look up user 42"}],
-    "tools": [{
-      "type": "function",
-      "function": {
-        "name": "get_user",
-        "description": "Look up user by ID",
-        "parameters": {
-          "type": "object",
-          "properties": {"user_id": {"type": "integer"}},
-          "required": ["user_id"]
-        }
-      }
-    }]
-  }'
-```
-
-When the model decides to call a tool, the response includes `tool_calls`:
-
-```json
-{
-  "choices": [{
-    "message": {
-      "role": "assistant",
-      "content": null,
-      "tool_calls": [{
-        "id": "call_abc123",
-        "type": "function",
-        "function": {
-          "name": "get_user",
-          "arguments": "{\"user_id\": 42}"
-        }
-      }]
-    },
-    "finish_reason": "tool_calls"
-  }]
-}
-```
-
-### Providing Tool Results
-
-After executing the tool yourself, send the result back:
-
-```json
-{
-  "model": "sonnet",
-  "messages": [
-    {"role": "user", "content": "Look up user 42"},
-    {"role": "assistant", "content": null, "tool_calls": [
-      {"id": "call_abc123", "type": "function", "function": {"name": "get_user", "arguments": "{\"user_id\": 42}"}}
-    ]},
-    {"role": "tool", "tool_call_id": "call_abc123", "content": "{\"name\": \"Alice\", \"email\": \"alice@example.com\"}"},
-    {"role": "user", "content": "What is their email?"}
-  ]
-}
-```
-
-### False-Positive Prevention
-
-A 3-layer defense prevents the model from calling tools when it shouldn't:
-
-1. **Relevance heuristic** — tool prompt is only injected if the user's message shares keywords with tool names or descriptions. Saying "Hello" with tools attached will not trigger tool injection.
-2. **Schema validation** — parsed tool calls are checked against definitions: function name must exist, required parameters must be present, values must be non-empty.
-3. **XML cleanup** — if the model wraps a normal text response in XML tags (a common false-positive pattern), the tags are stripped and clean text is returned.
-
-### tool_choice
-
-- `auto` (default) — model decides whether to call tools
-- `none` — tool prompt is suppressed entirely
-- `required` — model is instructed to always call a tool
-
----
 
 ## 11. Thinking / Reasoning
 
@@ -528,7 +444,6 @@ Visit `/chat` in your browser for an interactive test interface.
 
 **Non-streaming:** `id` format, `object` value, `created` type, `model` presence, `system_fingerprint`, `logprobs`, `finish_reason`, `role`, `content`, and `usage` arithmetic.
 
-**Streaming:** all of the above plus consistent `id` across chunks, `delta.role` in first chunk, `finish_reason` in last chunk, empty `delta` in final chunk, content or tool_calls present, and `[DONE]` termination.
 
 ---
 
@@ -590,7 +505,6 @@ Given a multi-turn conversation, the proxy:
 
 ### Assistant Messages with Tool Calls
 
-When a previous assistant turn has `tool_calls` but no text content, the proxy extracts the tool call information and formats it as:
 
 ```
 Assistant: [Called tools: get_user({"user_id": 42})]
@@ -603,10 +517,10 @@ This gives the model clear context about what tools were invoked.
 To prevent Perplexity's input from growing too large:
 
 - System prompts are truncated to **500 characters** and labeled so Perplexity does not search for them.
-- Assistant messages are truncated to **600 characters**.
+- Total query capped at **96K characters** (~32K tokens).
 - Tool results are truncated to **400 characters**.
 - Consecutive same-role messages are deduplicated (keeps the last one) — this handles LibreChat-style branching artifacts.
-- Only the **last 16 items** (~8 turns) of history are kept.
+- 
 
 ### Topic Separation
 
@@ -712,7 +626,7 @@ Hard-refresh the `/chat` page (Ctrl+Shift+R). The page has no-cache headers but 
 - **Tool calling is best-effort** (~95% for relevant queries) via prompt injection, not native API.
 - **No tool execution in debug UI** — `/chat` tools are for format testing only.
 - **Citation stripping** removes `[N]` patterns, which may affect content like `array[0]`.
-- **Context window**: last 16 items, assistant messages truncated to 600 chars.
+- **Context window**: 96K char total query limit (~32K tokens).
 - **Perplexity API changes** may break the proxy without notice. Auto-discovery catches model changes.
 - **Single session** — one cookie per instance. Multiple instances with the same cookie may conflict.
 
