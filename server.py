@@ -1218,7 +1218,7 @@ if HAS_MCP:
             return "Error: query cannot be empty"
         client=get_client()
         r=""
-        async for c in client.search(query, "auto", "turbo", ["web"], language):
+        async for c in client.search(query, "concise", "pplx_pro", ["web"], language):
             if c.get("error"): return f"Error: {c['error']}"
             if c.get("done"): r=c.get("answer", r); break
             r=c.get("answer", r)
@@ -1227,23 +1227,24 @@ if HAS_MCP:
     @mcp.tool()
     async def perplexity_reason(query: str, model: str="default", language: str="en-US") -> str:
         """Reasoning: Step-by-step reasoning through complex problems.
-        Model: default, pplx-reasoning-gpt5, pplx-reasoning-claude, pplx-reasoning-gemini, pplx-reasoning-kimi, pplx-reasoning-grok, or shorthand: gpt5, claude, gemini, kimi, grok."""
+        Model: default (gpt thinking), gpt, sonnet, opus, gemini, nemotron, claude (alias for sonnet)."""
         if not query or not query.strip():
             return "Error: query cannot be empty"
         mm=get_model_map()
-        shorthand={"gpt": "gpt-thinking", "claude": "sonnet-thinking", "opus": "opus-thinking", "gemini": "gemini", "nemotron": "nemotron"}
-        resolved=model
-        if model == "default":
-            resolved="gpt"
-        elif model in shorthand:
-            resolved=shorthand[model]
-        tier_err=check_tier(resolved)
+        # Map shorthand to base model, then look up thinking variant
+        shorthand={"claude": "sonnet", "default": "gpt"}
+        base=shorthand.get(model, model)
+        tier_err=check_tier(base)
         if tier_err:
             return f"Error: {tier_err}"
-        if resolved not in mm:
-            avail=["default"] + list(shorthand.keys()) + [k for k in mm if "thinking" in k]
+        if base not in mm:
+            avail=["default","gpt","sonnet","opus","gemini","nemotron","claude"]
             return f"Error: Unknown reasoning model '{model}'. Available: {avail}"
-        mode, pref=mm[resolved]
+        # Prefer thinking variant if available
+        if base in _THINKING_MAP:
+            mode, pref=_THINKING_MAP[base]
+        else:
+            mode, pref=mm[base]
         client=get_client()
         r=""
         async for ch in client.search(query, mode, pref, ["web"], language):
