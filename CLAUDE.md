@@ -175,3 +175,241 @@ If models start saying "I can't access real-time data" again:
 1. Check `search_focus: "internet"` is in the request params (line ~194 in `search()` method)
 2. Check server logs for the query text — if it contains system prompt content (role-play, tool refs, AI agent descriptions), the filter is broken
 3. Check if system prompt content is arriving as `role: user` and bypassing the filter
+
+## Request Processing Pipeline — How Content Flows Through the Proxy
+
+### Overview
+
+All requests arrive at one of two endpoints, get processed through a shared pipeline, and are sent to Perplexity's internal SSE API. The key challenge: Perplexity does NOT accept OpenAI-format message arrays — it takes a single `query_str` text blob. The proxy must flatten conversations into text while filtering content that pollutes search results.
+
+```
+Client Request
+  ↓
+Endpoint Router (/v1/chat/completions OR /v1/responses)
+  ↓
+Message Extraction & Role Normalization
+  ↓
+System Prompt Detection & Reclassification
+  ↓
+System Prompt Filter (strip everything except language preference)
+  ↓
+History Processing (truncation, dedup, topic separation)
+  ↓
+Query Assembly (system instruction + history + current request)
+  ↓
+Tool Injection (if tools provided and relevant)
+  ↓
+Perplexity SSE Request (search_focus=internet, model_preference, etc.)
+  ↓
+Response Parsing (blocks: markdown, web_results, thinking, finance_widget)
+  ↓
+Response Cleaning (strip citations [1][2], XML wrappers, script tags)
+  ↓
+Format Conversion (OpenAI chat.completion OR Responses API format)
+  ↓
+Client Response
+```
+
+---
+
+### Scenario 1: curl / Generic OpenAI Client → `/v1/chat/completions`
+
+**Input format:**
+```json
+{"model":"sonnet", "messages":[
+  {"role":"system", "content":"Reply in Chinese"},
+  {"role":"user", "content":"NVDA stock price"}
+], "stream":false}
+```
+
+**Processing:**
+1. Auth: Bearer token checked against `PPLX_PROXY_API_KEY`
+2. Messages parsed: `system` → `system_msg`, `user` → `history[]`
+3. System prompt filter: only language preference kept
+4. Query assembled: `[Reply language: ...]\n[You have built-in web search...]\n\nNVDA stock price`
+5. Sent to Perplexity with `search_focus: "internet"`, `model_preference: "claude46sonnet"`
+6. Response parsed from SSE blocks, cleaned, returned as `chat.completion` JSON
+
+**Simplest path — no special handling needed.**
+
+---
+
+### Scenario 2: LobeHub (Web Search OFF) → `/v1/chat/completions`
+
+**Input format (3 messages with developer role):**
+```json
+{"model":"sonnet", "stream":true, "messages":[
+  {"role":"developer", "content":"You are Lobe, an AI Agent...<available_skills>...(21KB)"},
+  {"role":"user", "content":"- You are Jarvis...- You must use ccsearch tool...(2.6KB)"},
+  {"role":"user", "content":"NVDA stock price (22B)"}
+]}
+```
+
+**Processing:**
+1. Auth: Bearer token checked
+2. Role normalization: `developer` → `system`
+3. **System prompt detection on user messages**: second message starts with `"you are "` and contains `"ccsearch"` → reclassified as `system`
+4. Now we have: `system`(21KB) + `system`(2.6KB) + `user`(22B)
+5. Multiple system messages concatenated into one `system_msg`
+6. **System prompt filter**: 23.6KB of system prompt → scanned line by line → only language preference line kept (e.g., "Always reply in Traditional Chinese") → everything else stripped
+7. Query assembled: `[Reply language: Always reply in Traditional Chinese...]\n[You have built-in web search...]\n\nNVDA stock price`
+8. **Consecutive assistant dedup** applies if regeneration branches exist
+9. Sent to Perplexity, response streamed as SSE `chat.completion.chunk` events
+
+**Key special handling:**
+- `developer` role mapping
+- System-prompt-like user message detection
+- Aggressive system prompt stripping (23.6KB → ~100 chars)
+- Consecutive assistant branch dedup
+
+---
+
+### Scenario 3: LobeHub (Web Search ON) → `/v1/responses`
+
+**Input format (Responses API with web_search tool):**
+```json
+{"stream":true, "model":"sonnet", "reasoning":{"effort":"low"},
+ "input":[
+   {"role":"developer", "content":"You are Lobe...(21KB)"},
+   {"role":"user", "content":"- You are Jarvis...(2.6KB)"},
+   {"role":"user", "content":"NVDA stock price"}
+ ],
+ "tools":[{"type":"web_search_preview_2025_03_11"}]
+}
+```
+
+**Processing:**
+1. Auth: Bearer token checked
+2. Input array parsed: each item's `role` and `content` extracted
+3. `developer` → `system`, system-prompt-like user messages → `system`
+4. `web_search_preview` tool silently ignored (we always have `search_focus: "internet"`)
+5. System prompt filter: same aggressive stripping as Scenario 2
+6. Query built directly (no httpx self-call), sent to Perplexity client
+7. Response streamed as Responses API SSE events:
+   - `response.created`
+   - `response.reasoning_summary_text.delta` (search steps: Found URLs, Searching queries)
+   - `response.reasoning_summary_text.done`
+   - `response.output_text.delta` (answer chunks)
+   - `response.output_text.done`
+   - `response.completed`
+
+**Key special handling:**
+- Responses API format translation (input→messages, output→response object)
+- `web_search_preview` tool silently dropped
+- Reasoning summary events for thinking block display
+- Calls Perplexity client directly (not through internal HTTP)
+
+---
+
+### Scenario 4: LibreChat → `/v1/chat/completions`
+
+**Input format (with conversation branches):**
+```json
+{"model":"sonnet", "stream":true, "messages":[
+  {"role":"system", "content":"- You are Jarvis...- You must use ccsearch..."},
+  {"role":"user", "content":"TSMC stock price"},
+  {"role":"assistant", "content":"I can't access real-time data..."},
+  {"role":"assistant", "content":"Sorry, I don't have..."},
+  {"role":"assistant", "content":"I need to use tools..."},
+  {"role":"user", "content":"just give me the price"}
+]}
+```
+
+**Processing:**
+1. Auth checked
+2. System prompt filter: strips tool/skill refs, keeps language pref
+3. **Consecutive assistant dedup**: 3 assistant messages → keep only last one
+4. History built: `[user: "TSMC stock price", assistant: "I need to use tools...(last branch)"]`
+5. **Topic separation**: current message `"just give me the price"` prefixed with `User's current request:` to prevent topic bleeding from history
+6. Query assembled and sent to Perplexity
+7. Response streamed as `chat.completion.chunk` SSE events
+
+**Key special handling:**
+- Consecutive assistant dedup (branch artifacts)
+- Topic separation prefix
+
+---
+
+### Scenario 5: Tool Calling (any client) → `/v1/chat/completions`
+
+**Input format:**
+```json
+{"model":"sonnet", "messages":[
+  {"role":"user", "content":"Look up user 42"}
+], "tools":[
+  {"type":"function", "function":{"name":"get_user", "description":"Look up user", "parameters":{...}}}
+]}
+```
+
+**Processing:**
+1. Non-function tools filtered out at source (`web_search_preview` etc. removed)
+2. **Relevance heuristic** (`_should_inject_tools`): checks if user message keywords overlap with tool names/descriptions. "Look up user" overlaps with "get_user"/"Look up user" → inject tool prompt
+3. Tool definitions converted to XML schema, appended to query
+4. Sent to Perplexity (model sees tool definitions via prompt injection)
+5. Response parsed: if contains `<function_call>` XML → extracted as `tool_calls`
+6. **Schema validation**: tool name must exist, required params must be present
+7. **False-positive defense**: if model wraps normal text in `<response>` XML → stripped
+8. Response returned with `finish_reason: "tool_calls"` and `tool_calls` array
+
+**For tool results (follow-up):**
+```json
+{"messages":[
+  {"role":"user", "content":"Look up user 42"},
+  {"role":"assistant", "content":null, "tool_calls":[{"id":"call_x", "function":{"name":"get_user", "arguments":"{\"user_id\":42}"}}]},
+  {"role":"tool", "tool_call_id":"call_x", "content":"{\"name\":\"Alice\"}"},
+  {"role":"user", "content":"What is their name?"}
+]}
+```
+- Assistant message with `tool_calls` → formatted as `[Called tools: get_user({"user_id":42})]`
+- Tool result → formatted as `Result: {"name":"Alice"}` (truncated to 400ch)
+
+---
+
+### Scenario 6: MCP Client → `/{API_KEY}/mcp` or `/{API_KEY}/sse`
+
+**Processing:**
+1. Auth via API key in URL path (not Bearer header)
+2. MCP protocol: initialize → tools/list → tools/call
+3. Each tool (`perplexity_search`, `perplexity_ask`, etc.) calls `client.search()` directly
+4. No message array processing — query string goes directly to Perplexity
+5. Response returned as MCP tool result (plain text)
+
+**No system prompt filter, no history processing, no dedup — just direct search.**
+
+---
+
+### The Perplexity SSE Request (shared by all scenarios)
+
+Regardless of which endpoint or client, all queries are sent via:
+
+```
+POST https://www.perplexity.ai/rest/sse/perplexity_ask
+
+{
+  "query_str": "<flattened query text>",
+  "params": {
+    "search_focus": "internet",          ← CRITICAL: enables search results in answer
+    "mode": "copilot",                   ← "concise" for auto model only
+    "model_preference": "claude46sonnet", ← internal Perplexity model ID
+    "sources": ["web"],
+    "use_schematized_api": true,
+    "supported_block_use_cases": ["answer_modes", "finance_widgets", ...],
+    "timezone": "Asia/Taipei",
+    "version": "2.18",
+    ... (13 other params)
+  }
+}
+```
+
+### The Perplexity SSE Response (shared parsing)
+
+Perplexity returns SSE events containing `blocks[]` with these types:
+
+| Block `intended_usage` | Contains | How We Use It |
+|---|---|---|
+| `ask_text_0_markdown` | Answer text chunks | → `content` in response |
+| `web_results` | Search result URLs + snippets | → `reasoning_content` (Found: URLs) |
+| `pro_search_steps` | Search queries executed | → `reasoning_content` (Searching: query) |
+| `plan` | Reasoning plan goals | → `reasoning_content` |
+| `finance_widget` | Structured stock data (JSON) | Currently ignored (model writes price in text) |
+| `sources_answer_mode` | Citation sources | Currently ignored |
