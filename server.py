@@ -789,7 +789,7 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
         elif role=="user":
             history.append(("user", content))
         elif role=="assistant":
-            if len(content)>600: content=content[:600]+"..."
+            if len(content)>4000: content=content[:4000]+"..."
             history.append(("assistant", content))
 
     # Dedup consecutive assistants
@@ -800,7 +800,7 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
         else:
             deduped.append((role,content))
     history=deduped
-    if len(history)>16: history=history[-16:]
+    if len(history)>64: history=history[-64:]
 
     current_msg=""
     if history and history[-1][0]=="user":
@@ -831,6 +831,8 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
     query=json.dumps(query_obj, ensure_ascii=False)
     if not query.strip():
         raise HTTPException(400, "Empty query after processing")
+    if len(query) > 32000:
+        query=query[-32000:]  # truncate from start, keep most recent context
 
     mm=get_model_map()
     if model_name not in mm:
@@ -1046,8 +1048,8 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
             history.append(("user", content))
         elif role == "assistant":
             # Keep enough context per assistant message
-            if len(content) > 600:
-                content=content[:600] + "..."
+            if len(content) > 4000:
+                content=content[:4000] + "..."
             history.append(("assistant", content))
         elif role == "tool":
             # Format tool results clearly for the model
@@ -1064,8 +1066,8 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
     history=deduped
 
     # Keep only last 16 items (~8 turns) to prevent context overflow
-    if len(history) > 16:
-        history=history[-16:]
+    if len(history) > 64:
+        history=history[-64:]
 
     # Separate current user message from history
     current_msg=""
