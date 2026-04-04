@@ -82,7 +82,7 @@ pplx-proxy authenticates by replaying the session cookie from your browser.
 1. Open [perplexity.ai](https://www.perplexity.ai) and sign in to your Pro or Max account.
 2. Open browser DevTools (F12 or Cmd+Option+I).
 3. Navigate to **Application** → **Cookies** → `https://www.perplexity.ai`.
-4. Find the cookie named `next-auth.session-token`.
+4. Find the cookie named `__Secure-next-auth.session-token`.
 5. Copy its **Value** (a long JWT-like string).
 6. Paste it into your `.env` file:
 
@@ -100,7 +100,7 @@ All settings live in the `.env` file. Here is the full reference:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PPLX_COOKIE` | *(required)* | Your `next-auth.session-token` from Perplexity |
+| `PPLX_COOKIE` | *(required)* | Your `__Secure-next-auth.session-token` from Perplexity |
 | `PPLX_PROXY_API_KEY` | *(empty)* | Bearer token for API auth. If empty, no authentication is required |
 | `ACCOUNT_TYPE` | `pro` | Your subscription tier: `free`, `pro`, or `max` |
 | `DEFAULT_MODEL` | `gpt` | Model used when no model is specified in the request |
