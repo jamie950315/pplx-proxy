@@ -660,15 +660,15 @@ def _strip_xml_wrapper(text: str) -> str:
 
 @app.post("/v1/responses")
 async def responses_api(request: Request, _=Depends(verify_api_key)):
-    """OpenAI Responses API compatibility. Translates to /v1/chat/completions.
+    """OpenAI Responses API compatibility. Supports streaming SSE.
     Used by LobeHub when 'use built-in web search' is enabled."""
     body=await request.json()
-    log.info(f"Responses API: model={body.get('model')}, stream={body.get('stream')}")
-
+    stream=body.get("stream", False)
     model_name=body.get("model", DEFAULT_MODEL)
     inp=body.get("input", "")
     instructions=body.get("instructions", "")
     tools_raw=body.get("tools", [])
+    log.info(f"Responses API: model={model_name}, stream={stream}")
 
     # Build messages from Responses API input
     messages=[]
@@ -685,54 +685,148 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
                 if role=="developer": role="system"
                 content=item.get("content", "")
                 if isinstance(content, list):
-                    text_parts=[ct.get("text", "") for ct in content if isinstance(ct, dict) and ct.get("type") in ("input_text", "text")]
+                    text_parts=[ct.get("text","") for ct in content if isinstance(ct, dict) and ct.get("type") in ("input_text","text")]
                     content=" ".join(text_parts) if text_parts else str(content)
                 if content:
                     messages.append({"role": role, "content": content})
 
-    # Filter out web search tools (we always search via search_focus=internet)
-    openai_tools=[t for t in tools_raw if t.get("type") == "function"]
-
-    if not messages or not any(m.get("role") == "user" for m in messages):
+    if not messages or not any(m.get("role")=="user" for m in messages):
         raise HTTPException(400, "No user message found in input")
 
-    # Forward as non-streaming chat/completions call via httpx
-    import httpx
-    chat_body={"model": model_name, "messages": messages, "stream": False}
-    if openai_tools:
-        chat_body["tools"]=openai_tools
+    # Build query using same logic as chat/completions
+    system_msg=""
+    history=[]
+    for msg in messages:
+        role=msg.get("role","user")
+        content=msg.get("content") or ""
+        if role=="system":
+            system_msg=content
+        elif role=="user":
+            history.append(("user", content))
+        elif role=="assistant":
+            if len(content)>600: content=content[:600]+"..."
+            history.append(("assistant", content))
 
-    auth_header=request.headers.get("authorization", "")
-    async with httpx.AsyncClient() as hc:
-        resp=await hc.post(
-            f"http://127.0.0.1:{PORT}/v1/chat/completions",
-            json=chat_body,
-            headers={"Authorization": auth_header, "Content-Type": "application/json"},
-            timeout=60,
-        )
-        if resp.status_code != 200:
-            raise HTTPException(resp.status_code, resp.json() if resp.headers.get("content-type","").startswith("application/json") else resp.text)
-        result=resp.json()
+    # Dedup consecutive assistants
+    deduped=[]
+    for role,content in history:
+        if deduped and role=="assistant" and deduped[-1][0]=="assistant":
+            deduped[-1]=(role,content)
+        else:
+            deduped.append((role,content))
+    history=deduped
+    if len(history)>16: history=history[-16:]
 
-    # Convert chat.completion → Responses API format
-    content_text=result.get("choices", [{}])[0].get("message", {}).get("content", "")
-    resp_id=result.get("id", "").replace("chatcmpl-", "resp_")
+    current_msg=""
+    if history and history[-1][0]=="user":
+        current_msg=history[-1][1]
+        history=history[:-1]
 
-    return {
-        "id": resp_id,
-        "object": "response",
-        "created_at": result.get("created", int(time.time())),
-        "model": result.get("model", model_name),
-        "output": [{
-            "type": "message",
-            "id": f"msg_{uuid4().hex[:8]}",
-            "role": "assistant",
+    parts=[]
+    if system_msg:
+        _keep=[]
+        for _l in system_msg.splitlines():
+            _ls=_l.strip().lstrip("- ")
+            if not _ls: continue
+            if _re.search(r"(?i)(ccsearch|tool|skill|技能|加載|fetch|brave|perplexity|search|web.?search)", _ls): continue
+            if _re.search(r"(?i)(you are|your role|your name|personal assistant|AI agent|jarvis|lobe)", _ls): continue
+            if _re.search(r"(?i)(latex|katex|code.?block|quotation|math|formula|公式|available_skills|<skill)", _ls): continue
+            _keep.append(_ls)
+        _sys_clean=" ".join(_keep).strip()
+        if len(_sys_clean)>200: _sys_clean=_sys_clean[:200]
+        if _sys_clean:
+            parts.append(f"[Instructions: {_sys_clean}]\n[You have built-in web search. Answer directly.]")
+        else:
+            parts.append("[You have built-in web search. Answer directly. Do not say you cannot access data.]")
+    if history:
+        ctx_lines=[]
+        for role,content in history:
+            prefix="User" if role=="user" else "Assistant"
+            ctx_lines.append(f"{prefix}: {content}")
+        parts.append("Previous conversation:\n"+"\n".join(ctx_lines))
+    if current_msg:
+        if history: parts.append(f"User\'s current request:\n{current_msg}")
+        else: parts.append(current_msg)
+
+    query="\n\n".join(parts)
+    if not query.strip():
+        raise HTTPException(400, "Empty query after processing")
+
+    mm=get_model_map()
+    if model_name not in mm:
+        raise HTTPException(400, f"Unknown model: {model_name}")
+    mode, model_pref=mm[model_name]
+
+    client=get_client()
+    resp_id=f"resp_{uuid4().hex[:12]}"
+    created=int(time.time())
+
+    if stream:
+        async def _stream_responses_api():
+            # Emit response.created
+            resp_obj={"id": resp_id, "object": "response", "created_at": created,
+                      "model": model_name, "status": "in_progress", "output": []}
+            yield f"event: response.created\ndata: {json.dumps(resp_obj)}\n\n"
+
+            # Emit output_item.added
+            msg_id=f"msg_{uuid4().hex[:8]}"
+            yield f"event: response.output_item.added\ndata: {json.dumps({'type': 'message', 'id': msg_id, 'role': 'assistant'})}\n\n"
+
+            full=""
+            async for ch in client.search(query, mode, model_pref, ["web"], "en-US"):
+                if ch.get("error"):
+                    yield f"event: error\ndata: {json.dumps({'error': ch['error']})}\n\n"
+                    break
+                if ch.get("thinking"):
+                    continue  # Skip thinking in Responses format
+                if ch.get("done"):
+                    full=ch.get("answer", full)
+                    break
+                # Stream delta
+                delta=ch.get("delta", "")
+                if delta:
+                    delta=_clean_response(delta, strip=False)
+                    if delta:
+                        evt={"type": "response.output_text.delta", "item_id": msg_id, "delta": delta}
+                        yield f"event: response.output_text.delta\ndata: {json.dumps(evt)}\n\n"
+
+            full=_clean_response(full)
+
+            # Emit output_text.done
+            yield f"event: response.output_text.done\ndata: {json.dumps({'type': 'response.output_text.done', 'item_id': msg_id, 'text': full})}\n\n"
+
+            # Emit response.completed
+            done_resp={"id": resp_id, "object": "response", "created_at": created,
+                       "model": model_name, "status": "completed",
+                       "output": [{"type": "message", "id": msg_id, "role": "assistant", "status": "completed",
+                                   "content": [{"type": "output_text", "text": full, "annotations": []}]}],
+                       "usage": {"prompt_tokens": len(query)//4, "completion_tokens": len(full)//4, "total_tokens": (len(query)+len(full))//4}}
+            yield f"event: response.completed\ndata: {json.dumps(done_resp)}\n\n"
+
+        return StreamingResponse(_stream_responses_api(), media_type="text/event-stream",
+                                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    else:
+        # Non-streaming: collect full response
+        full=""
+        async for ch in client.search(query, mode, model_pref, ["web"], "en-US"):
+            if ch.get("error"):
+                raise HTTPException(502, ch)
+            if ch.get("done"):
+                full=ch.get("answer", full)
+                break
+            full=ch.get("answer", full)
+        full=_clean_response(full)
+
+        return {
+            "id": resp_id, "object": "response", "created_at": created, "model": model_name,
+            "output": [{"type": "message", "id": f"msg_{uuid4().hex[:8]}", "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": full, "annotations": []}]}],
             "status": "completed",
-            "content": [{"type": "output_text", "text": content_text, "annotations": []}],
-        }],
-        "status": "completed",
-        "usage": result.get("usage"),
-    }
+            "usage": {"prompt_tokens": len(query)//4, "completion_tokens": len(full)//4,
+                      "total_tokens": (len(query)+len(full))//4},
+        }
 
 
 @app.post("/v1/chat/completions")
