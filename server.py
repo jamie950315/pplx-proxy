@@ -682,6 +682,7 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
                 messages.append({"role": "user", "content": item})
             elif isinstance(item, dict):
                 role=item.get("role", "user")
+                if role=="developer": role="system"
                 content=item.get("content", "")
                 if isinstance(content, list):
                     text_parts=[ct.get("text", "") for ct in content if isinstance(ct, dict) and ct.get("type") in ("input_text", "text")]
@@ -757,7 +758,7 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
         raise HTTPException(400, "messages must be an array")
     if len(messages) == 0:
         raise HTTPException(400, "messages array is empty")
-    VALID_ROLES={"system", "user", "assistant", "tool"}
+    VALID_ROLES={"system", "user", "assistant", "tool", "developer"}
     for i, msg in enumerate(messages):
         if not isinstance(msg, dict):
             raise HTTPException(400, f"messages[{i}] must be an object")
@@ -793,6 +794,7 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
     history=[]
     for msg in messages:
         role=msg.get("role", "user")
+        if role=="developer": role="system"
         content=msg.get("content") or ""
         if isinstance(content, list):
             text_parts=[ct.get("text", "") for ct in content if ct.get("type") == "text"]
