@@ -829,7 +829,7 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
         # Detect user messages that are actually system prompts
         if role=="user":
             _ct=(msg.get("content") or "")[:200].lower()
-            if any(kw in _ct for kw in ["you are ", "you must ", "your role", "ccsearch", "加載", "技能", "available_skills", "<skill"]):
+            if any(kw in _ct for kw in ["you are ", "you must ", "your role", "ccsearch", "加載", "技能", "available_skills", "<skill", "<user_memory", "<available_tools", "<tool_selection", "<credentials", "<best_practices", "<memory_effort", "<session_context"]):
                 role="system"
         content=msg.get("content") or ""
         # Strip rate limit notices from previous responses
@@ -1061,7 +1061,7 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
         # Jamie's custom system prompt as role:user after the developer message)
         if role=="user":
             _ct=(msg.get("content") or "")[:200].lower()
-            if any(kw in _ct for kw in ["you are ", "you must ", "your role", "ccsearch", "加載", "技能", "available_skills", "<skill"]):
+            if any(kw in _ct for kw in ["you are ", "you must ", "your role", "ccsearch", "加載", "技能", "available_skills", "<skill", "<user_memory", "<available_tools", "<tool_selection", "<credentials", "<best_practices", "<memory_effort", "<session_context"]):
                 role="system"
         content=msg.get("content") or ""
         if isinstance(content, list):
