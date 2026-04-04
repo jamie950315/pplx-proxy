@@ -78,6 +78,16 @@ def _fetch_rate_limit_sync():
         log.warning(f"Rate limit fetch failed: {e}")
         return None
 
+async def _rate_limit_poll_loop():
+    """Background task: sync rate limit every 1 hour."""
+    while True:
+        await asyncio.sleep(3600)  # 1 hour
+        try:
+            loop=asyncio.get_event_loop()
+            await loop.run_in_executor(None, _fetch_rate_limit_sync)
+        except Exception as e:
+            log.warning(f"Rate limit poll failed: {e}")
+
 def _decrement_pro():
     """Decrement local remaining_pro counter after a successful Pro query."""
     if _rate_limit["remaining_pro"] is not None and _rate_limit["remaining_pro"] > 0:
@@ -586,6 +596,7 @@ _TOOL_CALL_RE=_re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", _re.DOTALL)
 
 
 _CITATION_RE=_re.compile(r'\[\d+\]')
+_REMAINING_NOTICE_RE=_re.compile(r'\s*\[Remaining Pro Search: \d+\]\s*')
 _GROK_TAG_RE=_re.compile(r'<grok:[^>]*>.*?</grok:[^>]*>', _re.DOTALL)
 _GROK_SELF_RE=_re.compile(r'<grok:[^>]*/>')
 _MULTI_SPACE=_re.compile(r' {2,}')
@@ -778,6 +789,8 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
             if any(kw in _ct for kw in ["you are ", "you must ", "your role", "ccsearch", "加載", "技能", "available_skills", "<skill"]):
                 role="system"
         content=msg.get("content") or ""
+        # Strip rate limit notices from previous responses
+        content=_REMAINING_NOTICE_RE.sub("", content).strip()
         if role=="system":
             system_msg=content
         elif role=="user":
@@ -1010,6 +1023,8 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
         if isinstance(content, list):
             text_parts=[ct.get("text", "") for ct in content if ct.get("type") == "text"]
             content=" ".join(text_parts)
+        # Strip rate limit notices from previous responses
+        content=_REMAINING_NOTICE_RE.sub("", content).strip()
         # Handle assistant messages with tool_calls
         if role == "assistant":
             tc = msg.get("tool_calls") or []
@@ -1613,6 +1628,7 @@ if HAS_MCP:
             log.info("MCP streamable HTTP lifespan started")
             asyncio.create_task(session_keepalive_loop())
             asyncio.create_task(auto_discover_loop())
+            asyncio.create_task(_rate_limit_poll_loop())
             log.info(f"pplx-proxy started on port {PORT}")
             yield
         log.info("MCP streamable HTTP lifespan stopped")
