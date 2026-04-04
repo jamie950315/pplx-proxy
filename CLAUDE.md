@@ -8,7 +8,7 @@
 
 Single FastAPI app (`server.py`, ~1750 lines) that:
 
-1. Receives OpenAI-format or MCP tool call requests
+1. Receives OpenAI-format chat/completions or MCP requests
 2. Translates to Perplexity's internal SSE (`POST /rest/sse/perplexity_ask`)
 3. Uses `curl_cffi` with Chrome TLS fingerprinting to bypass Cloudflare
 4. Streams responses back in OpenAI SSE or MCP format
@@ -30,10 +30,8 @@ Single FastAPI app (`server.py`, ~1750 lines) that:
 
 **Tool Calling**: implemented via prompt injection (Perplexity has no native tool calling). 3-layer defense against false positives:
 1. **Relevance heuristic** (`_should_inject_tools`): only inject tool prompt if user message has keyword overlap with tool names/descriptions
-2. **Schema validation** (`_validate_tool_calls`): validates function name, required params present, no empty values
-3. **XML cleanup** (`_strip_xml_wrapper`): strips `<response>`, `<answer>` wrappers when not a tool call
 
-**Context Management**: system prompt / conversation history / current message separated. Assistant messages with tool_calls → `[Called tools: get_user({"user_id": 42})]`. Empty assistant messages → `[done]`. Assistant messages truncated to 600 chars. Tool results truncated to 400 chars. Last 16 items (~8 turns) kept. Current user message prefixed with `User's current request:` when history exists (prevents topic bleeding). Consecutive same-role messages deduped (keeps last — fixes LibreChat branch artifacts). System prompts truncated to 500ch and labeled `[System instructions]` to prevent Perplexity from searching them.
+**Context Management**: system prompt / conversation history / current message separated. Empty assistant messages → `[done]`. Total query capped at 96K chars (~32K tokens). Consecutive same-role messages deduped (keeps last — fixes LibreChat branch artifacts). System prompts filtered via whitelist (.prompt_whitelist.txt).
 
 **Response Cleaning** (`_clean_response`): strips `[1]` `[2]` citations, `<grok:*>` tags, `<?xml?>` declarations, `<response>` wrappers, `<script>` tags.
 
@@ -67,7 +65,7 @@ pplx-proxy.service   # systemd unit
 
 **Auth required** (Bearer token):
 - `GET /v1/models` — tier-filtered model list (OpenAI-compatible format)
-- `POST /v1/chat/completions` — chat (streaming + non-streaming, tool calling, thinking)
+- `POST /v1/chat/completions` — chat (streaming + non-streaming, thinking)
 - `POST /v1/responses` — OpenAI Responses API compatibility (translates to chat/completions internally, used by LobeHub web search mode)
 - `GET /admin/models` — full model map with internal details
 - `POST /admin/update-models` — modify models
@@ -84,7 +82,7 @@ pplx-proxy.service   # systemd unit
 
 All responses strictly follow the OpenAI Chat Completions spec:
 
-**Non-streaming**: `id` (chatcmpl-*), `object` (chat.completion), `created`, `model`, `system_fingerprint` (null), `choices[].index`, `choices[].logprobs` (null), `choices[].finish_reason`, `choices[].message.role`, `choices[].message.content`, `choices[].message.tool_calls`, `usage.prompt_tokens`, `usage.completion_tokens`, `usage.total_tokens` (always = prompt + completion)
+**Non-streaming**: `id` (chatcmpl-*), `object` (chat.completion), `created`, `model`, `system_fingerprint` (null), `choices[].index`, `choices[].logprobs` (null), `choices[].finish_reason`, `choices[].message.role`, `choices[].message.content`, `usage.prompt_tokens`, `usage.completion_tokens`, `usage.total_tokens` (always = prompt + completion)
 
 **Streaming**: `object` (chat.completion.chunk), consistent `id` across all chunks, `system_fingerprint` in every chunk, `logprobs` in every choice, first chunk has `delta.role=assistant`, last chunk has `finish_reason` + empty `delta`, ends with `data: [DONE]`
 
@@ -100,7 +98,7 @@ All responses strictly follow the OpenAI Chat Completions spec:
 | `perplexity_research` | `query`, `language` |
 | `perplexity_models` | (none) — lists tier-available models |
 
-All tools validate: empty query, invalid model, invalid sources, tier restrictions.
+Validates: empty query, invalid model, invalid sources, tier restrictions.
 
 ## Discovery Probe Strategy
 
@@ -225,7 +223,6 @@ History Processing (truncation, dedup, topic separation)
   ↓
 Query Assembly (system instruction + history + current request)
   ↓
-Tool Injection (if tools provided and relevant)
   ↓
 Perplexity SSE Request (search_focus=internet, model_preference, etc.)
   ↓
