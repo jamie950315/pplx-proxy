@@ -23,6 +23,7 @@ All queries use `search_focus: "internet"` — Perplexity's built-in web search 
 - **Account tier support** — free/pro/max — only exposes models your tier can access
 - **Auto-discovery** — background task checks model health every 24h, auto-upgrades when versions change
 - **Response cleaning** — strips Perplexity citations `[1][2]`, `<grok:*>` tags, `<?xml?>` declarations, `<script>` tags
+- **Rate limit tracking** — tracks Pro Search quota, auto-fallback to free model when exhausted, notices at every 5th decrement
 - **Session keep-alive** — periodic pings prevent cookie expiry
 - **Push notifications** — [ntfy.sh](https://ntfy.sh) alerts on cookie expiry or model upgrades
 - **Debug chat UI** — `/chat` page with tools toggle, thinking toggle, streaming toggle, and **OpenAI format validator**
@@ -230,6 +231,8 @@ curl -X POST https://your-domain/admin/refresh-cookie \
 2. **System prompts must be stripped** before sending to Perplexity. Perplexity searches ALL query text — if the system prompt says "You are an AI assistant", Perplexity finds chatbot tutorial pages and the model gets confused. Only the language preference is kept.
 
 3. **`role: developer` and system-prompt-like user messages** must be detected and filtered. Some clients (LobeHub) send system prompts as `role: developer` or `role: user` instead of `role: system`.
+
+4. **Rate limit tracking** uses FlareSolverr (localhost:8191) to poll Perplexity's `/rest/rate-limit/all` endpoint with the session cookie. Requires FlareSolverr running locally. When `remaining_pro` reaches 0, all non-auto models fall back to `auto` (free tier).
 
 See CLAUDE.md for the full technical breakdown and MANUAL.md troubleshooting section for diagnosis steps.
 
