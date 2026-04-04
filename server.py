@@ -191,6 +191,25 @@ class PerplexityClient:
                 "model_preference": model_pref,
                 "source": "default",
                 "sources": sources,
+                "search_focus": "internet",
+                "search_recency_filter": None,
+                "timezone": "Asia/Taipei",
+                "visitor_id": str(uuid4()),
+                "user_nextauth_id": str(uuid4()),
+                "prompt_source": "user",
+                "query_source": "home",
+                "browser_history_summary": [],
+                "is_related_query": False,
+                "is_sponsored": False,
+                "is_nav_suggestions_disabled": False,
+                "use_schematized_api": True,
+                "send_back_text_in_streaming_api": False,
+                "supported_block_use_cases": [
+                    "answer_modes", "media_items", "knowledge_cards",
+                    "inline_entity_cards", "place_widgets", "finance_widgets",
+                    "sports_widgets", "shopping_widgets", "search_result_widgets",
+                ],
+                "client_coordinates": None,
                 "version": PPLX_API_VERSION,
             },
         }
@@ -748,10 +767,13 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
     # Build query: system + history context + current request
     parts=[]
     if system_msg:
-        # Truncate system prompt to prevent it from dominating Perplexity's search
-        if len(system_msg) > 500:
-            system_msg=system_msg[:500] + "..."
-        parts.append(f"[System instructions — do not search for this]\n{system_msg}")
+        # Strip tool/skill lines that confuse Perplexity
+        _sys_lines=[l for l in system_msg.splitlines() if not _re.search(r"(?i)(ccsearch|proactively use.*tool|must.*use.*tool)", l)]
+        _sys_clean="\n".join(_sys_lines).strip()
+        if len(_sys_clean) > 400:
+            _sys_clean=_sys_clean[:400] + "..."
+        if _sys_clean:
+            parts.append(f"[Behavioral instructions]\n{_sys_clean}\n[You have built-in web search. Answer directly. Never say you cannot access data or need external tools.]")
     if history:
         ctx_lines=[]
         for role, content in history:
