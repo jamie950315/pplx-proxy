@@ -41,6 +41,63 @@ NTFY_COOLDOWN_SECS=int(os.getenv("NTFY_COOLDOWN_SECS", "3600"))
 USER_AGENT=os.getenv("USER_AGENT", "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
 ENV_FILE=Path(__file__).parent / ".env"
 
+# ─── Rate Limit Tracker ────────────────────────────────────────────────────
+
+_rate_limit={"remaining_pro": None, "remaining_research": None, "updated_at": 0}
+_rate_limit_lock=None  # initialized in startup
+
+def _fetch_rate_limit_sync():
+    """Fetch rate limits from Perplexity via FlareSolverr. ~10s per call."""
+    import urllib.request
+    try:
+        cookies=load_cookies()
+        token=cookies.get("__Secure-next-auth.session-token", "")
+        if not token:
+            return None
+        req=urllib.request.Request("http://localhost:8191/v1",
+            data=json.dumps({
+                "cmd": "request.get",
+                "url": "https://www.perplexity.ai/rest/rate-limit/all",
+                "maxTimeout": 20000,
+                "cookies": [{"name": "__Secure-next-auth.session-token", "value": token,
+                             "domain": ".perplexity.ai", "path": "/", "secure": True, "httpOnly": True}]
+            }).encode(), headers={"Content-Type": "application/json"})
+        resp=urllib.request.urlopen(req, timeout=25)
+        fs=json.loads(resp.read())
+        body=fs.get("solution", {}).get("response", "")
+        import re as _rl_re
+        m=_rl_re.search(r"<pre[^>]*>(.*?)</pre>", body, _rl_re.DOTALL)
+        raw=m.group(1) if m else body
+        d=json.loads(raw)
+        _rate_limit["remaining_pro"]=d.get("remaining_pro")
+        _rate_limit["remaining_research"]=d.get("remaining_research")
+        _rate_limit["updated_at"]=int(time.time())
+        log.info(f"Rate limit synced: pro={_rate_limit['remaining_pro']}, research={_rate_limit['remaining_research']}")
+        return d
+    except Exception as e:
+        log.warning(f"Rate limit fetch failed: {e}")
+        return None
+
+def _decrement_pro():
+    """Decrement local remaining_pro counter after a successful Pro query."""
+    if _rate_limit["remaining_pro"] is not None and _rate_limit["remaining_pro"] > 0:
+        _rate_limit["remaining_pro"] -= 1
+
+def _should_show_remaining() -> bool:
+    """Show remaining notice at multiples of 5 or when ≤5."""
+    rp = _rate_limit.get("remaining_pro")
+    if rp is None:
+        return False
+    return rp <= 5 or rp % 5 == 0
+
+def _remaining_notice() -> str:
+    """Build the remaining notice string, or empty if not needed."""
+    if not _should_show_remaining():
+        return ""
+    rp = _rate_limit["remaining_pro"]
+    return f"\n\n[Remaining Pro Search: {rp}]"
+
+
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(message)s")
 log=logging.getLogger("pplx-proxy")
 
@@ -384,6 +441,15 @@ async def verify_api_key(request: Request):
 # ─── FastAPI App ───────────────────────────────────────────────────────────
 
 app=FastAPI(title="pplx-proxy", version="1.0.0")
+
+@app.on_event("startup")
+async def _startup_rate_limit():
+    """Fetch rate limits on startup (background, non-blocking)."""
+    async def _bg():
+        await asyncio.sleep(3)  # let server finish booting
+        loop=asyncio.get_event_loop()
+        await loop.run_in_executor(None, _fetch_rate_limit_sync)
+    asyncio.create_task(_bg())
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # Global error handler: unconfigured service → 503
@@ -419,7 +485,16 @@ async def health():
             cache_age=round((time.time() - data.get("timestamp", 0)) / 3600, 1)
         except Exception:
             pass
-    return {"status": "ok", "service": "pplx-proxy", "cookie_age_hours": cache_age}
+    # Trigger background rate limit refresh if stale (never blocks response)
+    if _rate_limit["remaining_pro"] is None or (time.time() - _rate_limit["updated_at"]) > 300:
+        asyncio.get_event_loop().run_in_executor(None, _fetch_rate_limit_sync)
+    rl_age=int(time.time() - _rate_limit["updated_at"]) if _rate_limit["updated_at"] else None
+    return {
+        "status": "ok", "service": "pplx-proxy", "cookie_age_hours": cache_age,
+        "remaining_pro": _rate_limit.get("remaining_pro"),
+        "remaining_research": _rate_limit.get("remaining_research"),
+        "rate_limit_age_seconds": rl_age,
+    }
 
 
 @app.get("/v1/models")
@@ -814,6 +889,14 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
 
             full=_clean_response(full)
 
+            # Rate limit decrement + notice
+            _decrement_pro()
+            notice=_remaining_notice()
+            if notice:
+                evt_n={"type": "response.output_text.delta", "item_id": msg_id, "delta": notice}
+                yield f"event: response.output_text.delta\ndata: {json.dumps(evt_n)}\n\n"
+                full+=notice
+
             # Emit output_text.done
             yield f"event: response.output_text.done\ndata: {json.dumps({'type': 'response.output_text.done', 'item_id': msg_id, 'text': full})}\n\n"
 
@@ -839,6 +922,12 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
                 break
             full=ch.get("answer", full)
         full=_clean_response(full)
+
+        # Rate limit decrement + notice
+        _decrement_pro()
+        notice=_remaining_notice()
+        if notice:
+            full+=notice
 
         return {
             "id": resp_id, "object": "response", "created_at": created, "model": model_name,
@@ -1044,6 +1133,13 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
     reasoning_content="\n".join(thinking_parts) if thinking_parts else None
     full=_clean_response(full)
 
+    # Rate limit: decrement + append notice
+    if mode != "auto":  # Pro queries only (copilot mode)
+        _decrement_pro()
+    notice=_remaining_notice()
+    if notice:
+        full+=notice
+
     # Check for tool calls in response
     if tools and isinstance(tools, list):
         _tn={t["function"]["name"] for t in tools if t.get("type")=="function" and "function" in t}
@@ -1149,6 +1245,13 @@ async def _stream_openai_with_tools(client, query, mode, model_pref, model_name,
                "choices": [{"index": 0, "delta": {"content": ct}, "finish_reason": None, "logprobs": None}]}
             yield f"data: {json.dumps(d)}\n\n"
             await asyncio.sleep(0.03)
+        # Rate limit decrement + notice
+        _decrement_pro()
+        notice=_remaining_notice()
+        if notice:
+            nd={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
+                "choices": [{"index": 0, "delta": {"content": notice}, "finish_reason": None, "logprobs": None}]}
+            yield f"data: {json.dumps(nd)}\n\n"
         stop={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
               "choices": [{"index": 0, "delta": {}, "finish_reason": "stop", "logprobs": None}]}
         yield f"data: {json.dumps(stop)}\n\n"
@@ -1196,6 +1299,13 @@ async def _stream_openai(client, query, mode, model_pref, model_name, cid, creat
                    "choices": [{"index": 0, "delta": {"content": cites}, "finish_reason": None, "logprobs": None}]}
                 yield f"data: {json.dumps(c)}\n\n"
 
+            # Rate limit decrement + notice
+            _decrement_pro()
+            notice=_remaining_notice()
+            if notice:
+                nd={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
+                    "choices": [{"index": 0, "delta": {"content": notice}, "finish_reason": None, "logprobs": None}]}
+                yield f"data: {json.dumps(nd)}\n\n"
             stop={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
                   "choices": [{"index": 0, "delta": {}, "finish_reason": "stop", "logprobs": None}]}
             yield f"data: {json.dumps(stop)}\n\n"
