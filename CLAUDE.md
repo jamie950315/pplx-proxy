@@ -172,6 +172,7 @@ LobeHub sends the user's custom system prompt as a `role: user` message (not `ro
 
 If models start saying "I can't access real-time data" again:
 
+0. Check cookie name is `__Secure-next-auth.session-token` (NOT `next-auth.session-token`). Wrong name = free-tier turbo for ALL models.
 1. Check `search_focus: "internet"` is in the request params (line ~194 in `search()` method)
 2. Check server logs for the query text — if it contains system prompt content (role-play, tool refs, AI agent descriptions), the filter is broken
 3. Check if system prompt content is arriving as `role: user` and bypassing the filter

@@ -633,7 +633,7 @@ Set `PUBLIC_URL=https://pplx.yourdomain.com` in `.env` so MCP host validation al
 ```
 Browser login
   -> Extract cookie
-  -> Set PPLX_COOKIE in .env
+  -> Set PPLX_COOKIE in .env (the value of the `__Secure-next-auth.session-token` cookie from your Perplexity browser session)
   -> pplx-proxy starts
   -> Keep-alive pings every 6h
   -> Cookie stays alive indefinitely
