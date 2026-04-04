@@ -146,6 +146,33 @@ curl -X POST /admin/discover-models
 # Change tier: edit ACCOUNT_TYPE in .env, restart
 ```
 
+## Rate Limit Tracking
+
+The proxy tracks Perplexity Pro Search quota via FlareSolverr:
+
+```
+Startup → FlareSolverr fetch (background, ~10s)
+  ↓
+Every API/MCP request → local decrement (remaining_pro -= 1)
+  ↓
+Every 1 hour → FlareSolverr re-sync (background)
+  ↓
+/health request → shows remaining_pro + triggers refresh if stale
+```
+
+### Notice Injection
+At multiples of 5 (or ≤5), appended to response content:
+`[Remaining Pro Search: 155]`
+
+Stripped from message history via `_REMAINING_NOTICE_RE` regex before sending to Perplexity.
+
+### Quota Fallback
+When `remaining_pro <= 0`: all non-auto models auto-downgrade to `auto` (pplx_pro).
+Applied in both `/v1/chat/completions` and `/v1/responses` handlers.
+
+### FlareSolverr Dependency
+Rate limit fetching requires FlareSolverr at `http://localhost:8191`. Uses `__Secure-next-auth.session-token` cookie injection to authenticate. The Perplexity REST endpoints (`/rest/rate-limit/all`) are behind Cloudflare challenge — curl_cffi cannot bypass it, only FlareSolverr (headless browser) works.
+
 ## Critical: Why Models Say "I Can't Access Real-Time Data"
 
 Three layers cause Perplexity models to ignore search results and claim they can't access data. All three must be addressed:

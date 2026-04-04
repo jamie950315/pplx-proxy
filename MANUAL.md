@@ -426,6 +426,26 @@ In streaming mode, reasoning chunks arrive before content chunks with `delta.rea
 | `gemini` | Always on |
 | `nemotron` | Always on |
 
+### Rate Limit Tracking
+
+pplx-proxy tracks your Perplexity Pro Search quota (`remaining_pro`) and provides visibility and protection:
+
+**How it works:**
+- On startup, a background task fetches rate limits from Perplexity via FlareSolverr (headless browser, ~10s).
+- Every 1 hour, the counter re-syncs with Perplexity's actual data.
+- After each Pro Search query (copilot mode), the local counter decrements by 1.
+- When `/health` is requested and data is stale (>5min), a background refresh triggers.
+
+**Quota notice:** When `remaining_pro` hits a multiple of 5 (160, 155, 150, ..., 5, 0), the response includes:
+```
+[Remaining Pro Search: 155]
+```
+This notice is automatically stripped from message history in subsequent API calls so it doesn't pollute Perplexity search results.
+
+**Auto-fallback:** When `remaining_pro` reaches 0, all non-auto model requests automatically fall back to `auto` (pplx_pro, free tier). The `auto` model itself is never downgraded.
+
+**Requirements:** FlareSolverr must be running at `http://localhost:8191` for rate limit syncing.
+
 ### Responses API (`/v1/responses`)
 
 The `/v1/responses` endpoint provides OpenAI Responses API compatibility, primarily used by LobeHub when "built-in web search" is enabled. It accepts the same input format as OpenAI's Responses API and returns results in the same format.
