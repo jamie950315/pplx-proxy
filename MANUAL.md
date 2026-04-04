@@ -167,6 +167,7 @@ curl -X POST http://localhost:8892/v1/chat/completions \
 | GET | `/chat` | No | Debug chat UI |
 | GET | `/v1/models` | Bearer | List available models |
 | POST | `/v1/chat/completions` | Bearer | Chat completions |
+| POST | `/v1/responses` | Bearer | OpenAI Responses API compatibility |
 | POST | `/{api_key}/mcp` | URL key | MCP Streamable HTTP |
 | GET | `/{api_key}/sse` | URL key | MCP SSE transport |
 | GET | `/admin/models` | Bearer | Full model map |

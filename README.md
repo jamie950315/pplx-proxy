@@ -74,6 +74,7 @@ Thinking variants are activated via `thinking: true` or `reasoning_effort` param
 | `GET` | `/chat` | No | **Debug chat UI with OpenAI format validator** |
 | `GET` | `/v1/models` | Yes | List tier-available models |
 | `POST` | `/v1/chat/completions` | Yes | Chat (streaming + non-streaming + tools + thinking) |
+| `POST` | `/v1/responses` | Yes | OpenAI Responses API compatibility (used by LobeHub web search) |
 | `POST` | `/<api-key>/mcp` | Key in URL | MCP Streamable HTTP |
 | `GET` | `/<api-key>/sse` | Key in URL | MCP SSE |
 | `GET` | `/admin/models` | Yes | Full model map |
