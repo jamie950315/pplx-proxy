@@ -829,8 +829,8 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
     query=json.dumps(query_obj, ensure_ascii=False)
     if not query.strip():
         raise HTTPException(400, "Empty query after processing")
-    if len(query) > 32000:
-        query=query[-32000:]  # truncate from start, keep most recent context
+    if len(query) > 96000:
+        query=query[-96000:]  # ~32K tokens at ~3 chars/token
 
     mm=get_model_map()
     if model_name not in mm:
