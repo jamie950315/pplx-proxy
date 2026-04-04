@@ -644,7 +644,16 @@ Cookie expired. Extract a fresh one and use `POST /admin/refresh-cookie` or upda
 Tool calling relies on keyword matching. Make your request explicit: "Use the calculator to compute 2+2" works better than just "2+2".
 
 ### Model says "I can't access real-time data"
-This was caused by a missing `search_focus: "internet"` parameter in the Perplexity request. It has been fixed. If you see this on an older version, update to the latest.
+
+This is the most critical issue in pplx-proxy. There are three independent causes, and all three must be addressed:
+
+**Cause 1: Missing `search_focus` parameter.** Perplexity defaults to `"writing"` mode when `search_focus` is not set. In writing mode, the search engine still runs (you can see `Searching: ...` in the reasoning output), but the model is instructed to NOT use the search results in its answer. Fix: ensure `search_focus: "internet"` is present in the request params inside `client.search()`.
+
+**Cause 2: System prompt content pollutes search results.** Perplexity searches ALL text in the query, including system prompts. If the system prompt says `"You are Jarvis, a personal assistant"` or `"You are Lobe, an AI Agent"`, Perplexity searches for those phrases and finds AI chatbot tutorial pages and prompt engineering guides. The model sees these results and concludes it is a chatbot without search capabilities. Fix: strip all system prompt content before sending to Perplexity, keeping only the language preference.
+
+**Cause 3: System prompts arriving as `role: user`.** Some clients (notably LobeHub) send the user's custom system prompt as a `role: user` message instead of `role: system`. The system prompt filter only processes system-role messages, so the custom prompt passes through unfiltered with all its tool references intact. Fix: detect user messages containing system-prompt keywords and reclassify them as system role.
+
+**How to diagnose:** Check server logs for the query text sent to Perplexity (`CONTEXT QUERY` in debug logs). If it contains role-play instructions, tool names, or AI agent descriptions, the system prompt filter needs updating.
 
 ### Model says "I don't have access to tools"
 Perplexity's model sometimes prefers its built-in web search over provided tools. This is expected behavior.
