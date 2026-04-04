@@ -6,7 +6,7 @@
 
 ## Architecture
 
-Single FastAPI app (`server.py`, ~1550 lines) that:
+Single FastAPI app (`server.py`, ~1600 lines) that:
 
 1. Receives OpenAI-format or MCP tool call requests
 2. Translates to Perplexity's internal SSE (`POST /rest/sse/perplexity_ask`)
@@ -68,6 +68,7 @@ pplx-proxy.service   # systemd unit
 **Auth required** (Bearer token):
 - `GET /v1/models` — tier-filtered model list (OpenAI-compatible format)
 - `POST /v1/chat/completions` — chat (streaming + non-streaming, tool calling, thinking)
+- `POST /v1/responses` — OpenAI Responses API compatibility (translates to chat/completions internally, used by LobeHub web search mode)
 - `GET /admin/models` — full model map with internal details
 - `POST /admin/update-models` — modify models
 - `POST /admin/refresh-cookie` — inject new token

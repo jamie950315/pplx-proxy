@@ -657,6 +657,83 @@ def _strip_xml_wrapper(text: str) -> str:
     return stripped.strip()
 
 
+
+@app.post("/v1/responses")
+async def responses_api(request: Request, _=Depends(verify_api_key)):
+    """OpenAI Responses API compatibility. Translates to /v1/chat/completions.
+    Used by LobeHub when 'use built-in web search' is enabled."""
+    body=await request.json()
+    log.info(f"Responses API: model={body.get('model')}, stream={body.get('stream')}")
+
+    model_name=body.get("model", DEFAULT_MODEL)
+    inp=body.get("input", "")
+    instructions=body.get("instructions", "")
+    tools_raw=body.get("tools", [])
+
+    # Build messages from Responses API input
+    messages=[]
+    if instructions:
+        messages.append({"role": "system", "content": instructions})
+    if isinstance(inp, str):
+        messages.append({"role": "user", "content": inp})
+    elif isinstance(inp, list):
+        for item in inp:
+            if isinstance(item, str):
+                messages.append({"role": "user", "content": item})
+            elif isinstance(item, dict):
+                role=item.get("role", "user")
+                content=item.get("content", "")
+                if isinstance(content, list):
+                    text_parts=[ct.get("text", "") for ct in content if isinstance(ct, dict) and ct.get("type") in ("input_text", "text")]
+                    content=" ".join(text_parts) if text_parts else str(content)
+                if content:
+                    messages.append({"role": role, "content": content})
+
+    # Filter out web search tools (we always search via search_focus=internet)
+    openai_tools=[t for t in tools_raw if t.get("type") == "function"]
+
+    if not messages or not any(m.get("role") == "user" for m in messages):
+        raise HTTPException(400, "No user message found in input")
+
+    # Forward as non-streaming chat/completions call via httpx
+    import httpx
+    chat_body={"model": model_name, "messages": messages, "stream": False}
+    if openai_tools:
+        chat_body["tools"]=openai_tools
+
+    auth_header=request.headers.get("authorization", "")
+    async with httpx.AsyncClient() as hc:
+        resp=await hc.post(
+            f"http://127.0.0.1:{PORT}/v1/chat/completions",
+            json=chat_body,
+            headers={"Authorization": auth_header, "Content-Type": "application/json"},
+            timeout=60,
+        )
+        if resp.status_code != 200:
+            raise HTTPException(resp.status_code, resp.json() if resp.headers.get("content-type","").startswith("application/json") else resp.text)
+        result=resp.json()
+
+    # Convert chat.completion → Responses API format
+    content_text=result.get("choices", [{}])[0].get("message", {}).get("content", "")
+    resp_id=result.get("id", "").replace("chatcmpl-", "resp_")
+
+    return {
+        "id": resp_id,
+        "object": "response",
+        "created_at": result.get("created", int(time.time())),
+        "model": result.get("model", model_name),
+        "output": [{
+            "type": "message",
+            "id": f"msg_{uuid4().hex[:8]}",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": content_text, "annotations": []}],
+        }],
+        "status": "completed",
+        "usage": result.get("usage"),
+    }
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, _=Depends(verify_api_key)):
     try:
