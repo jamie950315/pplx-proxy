@@ -13,6 +13,8 @@ Perplexity's web frontend talks to its backend through an internal SSE endpoint 
 
 No official API key needed — just your subscription.
 
+All queries use `search_focus: "internet"` — Perplexity's built-in web search is always active, so models return real-time data (stock prices, weather, news) directly in their answers.
+
 ## Features
 
 - **Full OpenAI format compliance** — `system_fingerprint`, `logprobs`, proper `usage` arithmetic, all fields per spec
