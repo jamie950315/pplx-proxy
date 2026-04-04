@@ -844,13 +844,31 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
     # Build query: system + history context + current request
     parts=[]
     if system_msg:
-        # Strip tool/skill lines that confuse Perplexity
-        _sys_lines=[l for l in system_msg.splitlines() if not _re.search(r"(?i)(ccsearch|proactively use.*tool|must.*use.*tool)", l)]
-        _sys_clean="\n".join(_sys_lines).strip()
-        if len(_sys_clean) > 400:
-            _sys_clean=_sys_clean[:400] + "..."
+        # Aggressively filter system prompt — only keep language/tone preferences
+        # Perplexity searches ALL query text. System prompts with role-play, tool
+        # references, or AI-assistant mentions cause Perplexity to find irrelevant
+        # AI/chatbot tutorial pages instead of the user's actual query.
+        _keep=[]
+        for _l in system_msg.splitlines():
+            _ls=_l.strip().lstrip("- ")
+            # Skip: tool/skill refs, role-play identity, formatting rules, empty
+            if not _ls:
+                continue
+            if _re.search(r"(?i)(ccsearch|tool|skill|技能|加載|fetch|brave|perplexity|search|web.?search)", _ls):
+                continue
+            if _re.search(r"(?i)(you are|your role|your name|personal assistant|AI agent|jarvis)", _ls):
+                continue
+            if _re.search(r"(?i)(latex|katex|code.?block|quotation|math|formula|公式)", _ls):
+                continue
+            _keep.append(_ls)
+        # Only include if there's something meaningful left
+        _sys_clean=" ".join(_keep).strip()
+        if len(_sys_clean) > 200:
+            _sys_clean=_sys_clean[:200]
         if _sys_clean:
-            parts.append(f"[Behavioral instructions]\n{_sys_clean}\n[You have built-in web search. Answer directly. Never say you cannot access data or need external tools.]")
+            parts.append(f"[Instructions: {_sys_clean}]\n[You have built-in web search. Answer questions directly using your search results. Do not say you need tools or cannot access data.]")
+        else:
+            parts.append("[You have built-in web search. Answer questions directly using your search results. Do not say you need tools or cannot access data.]")
     if history:
         ctx_lines=[]
         for role, content in history:
