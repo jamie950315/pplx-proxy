@@ -577,6 +577,29 @@ async def list_models(_=Depends(verify_api_key)):
 import xml.etree.ElementTree as _ET
 import re as _re
 
+_TOOL_STOPWORDS=frozenset({
+    "about", "after", "also", "been", "before", "below", "both", "call",
+    "code", "come", "could", "data", "does", "each", "even", "file",
+    "find", "first", "from", "give", "have", "help", "here", "high",
+    "http", "https", "info", "into", "item", "just", "keep", "know",
+    "last", "like", "list", "long", "look", "made", "make", "many",
+    "more", "most", "much", "must", "name", "need", "next", "note",
+    "only", "open", "other", "over", "page", "part", "pass", "plan",
+    "post", "read", "real", "save", "show", "side", "some", "such",
+    "sure", "take", "tell", "text", "than", "that", "them", "then",
+    "they", "this", "time", "tool", "turn", "type", "upon", "used",
+    "user", "uses", "very", "want", "well", "what", "when", "will",
+    "with", "work", "your", "based", "being", "below", "given",
+    "items", "known", "later", "using", "value", "where", "which",
+    "while", "those", "these", "their", "there", "other", "should",
+    "would", "could", "every", "still", "right", "point", "start",
+    "never", "after", "again", "under", "above", "along", "since",
+    "until", "unless", "during", "return", "returns",
+    "create", "update", "delete", "manage", "provide", "include",
+    "support", "current", "specific", "available", "required",
+    "content", "command", "execute", "existing", "results", "description",
+})
+
 def _should_inject_tools(user_msg: str, tools: list, tool_choice: str) -> bool:
     """Heuristic: only inject tool prompt if user message seems tool-relevant.
     Prevents false tool calls for greetings, casual chat, etc."""
@@ -589,7 +612,7 @@ def _should_inject_tools(user_msg: str, tools: list, tool_choice: str) -> bool:
     
     msg_lower = user_msg.lower()
     # Skip tool injection for very short/casual messages
-    if len(msg_lower) < 8 and not any(w in msg_lower for w in ("calc", "look", "find", "get", "send", "search", "fetch", "weather", "user", "email", "math")):
+    if len(msg_lower) < 8 and not any(w in msg_lower for w in ("calc", "look", "find", "get", "send", "search", "fetch", "weather", "email", "math")):
         return False
     
     # Check if any tool keyword appears in the message
@@ -599,19 +622,19 @@ def _should_inject_tools(user_msg: str, tools: list, tool_choice: str) -> bool:
         desc = fn.get("description", "").lower()
         params = fn.get("parameters", {}).get("properties", {})
         
-        # Check tool name keywords
+        # Check tool name keywords (skip stopwords)
         for word in name.split():
-            if len(word) > 2 and word in msg_lower:
+            if len(word) > 2 and word not in _TOOL_STOPWORDS and word in msg_lower:
                 return True
-        # Check description keywords
+        # Check description keywords (skip stopwords, require >4 chars)
         for word in desc.split():
-            if len(word) > 3 and word in msg_lower:
+            if len(word) > 4 and word not in _TOOL_STOPWORDS and word in msg_lower:
                 return True
-        # Check parameter names as keywords
+        # Check parameter names as keywords (skip stopwords)
         for pname in params:
             pname_clean = pname.lower().replace("_", " ")
             for word in pname_clean.split():
-                if len(word) > 2 and word in msg_lower:
+                if len(word) > 3 and word not in _TOOL_STOPWORDS and word in msg_lower:
                     return True
     
     return False
