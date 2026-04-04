@@ -221,6 +221,18 @@ curl -X POST https://your-domain/admin/refresh-cookie \
   -d '{"session_token": "NEW_TOKEN"}'
 ```
 
+## Critical Implementation Notes
+
+**Why models say "I can't access real-time data":** This proxy must handle three issues that cause Perplexity models to ignore their own search results:
+
+1. **`search_focus: "internet"`** must be set in every request. Without it, Perplexity defaults to `"writing"` mode where models don't incorporate search results. This is the single most important parameter.
+
+2. **System prompts must be stripped** before sending to Perplexity. Perplexity searches ALL query text — if the system prompt says "You are an AI assistant", Perplexity finds chatbot tutorial pages and the model gets confused. Only the language preference is kept.
+
+3. **`role: developer` and system-prompt-like user messages** must be detected and filtered. Some clients (LobeHub) send system prompts as `role: developer` or `role: user` instead of `role: system`.
+
+See CLAUDE.md for the full technical breakdown and MANUAL.md troubleshooting section for diagnosis steps.
+
 ## Disclaimer
 
 Unofficial reverse proxy for personal use. Relies on Perplexity's internal web API which may change without notice. Use responsibly.

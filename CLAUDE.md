@@ -145,3 +145,33 @@ curl -X POST /admin/discover-models
 
 # Change tier: edit ACCOUNT_TYPE in .env, restart
 ```
+
+## Critical: Why Models Say "I Can't Access Real-Time Data"
+
+Three layers cause Perplexity models to ignore search results and claim they can't access data. All three must be addressed:
+
+### Layer 1: `search_focus` Parameter (Affects ALL Clients)
+
+Perplexity's internal SSE API has a `search_focus` parameter. If omitted, it defaults to `"writing"` mode — the search engine still runs (visible in reasoning/thinking output as `Searching: ...` and `Found: [...]`), but **the model is instructed not to incorporate search results into its answer**. The model sees the results but deliberately ignores them.
+
+**Fix:** Always set `search_focus: "internet"` in the request params. This is the single most critical parameter in the entire proxy.
+
+### Layer 2: System Prompt Pollutes Search Results (Affects Clients with Long System Prompts)
+
+Perplexity searches **ALL text** in the query, including system prompts. If the system prompt contains phrases like `"You are Jarvis, a personal assistant"` or `"You are Lobe, an AI Agent"`, Perplexity searches for those phrases and finds AI chatbot tutorial pages, LobeChat documentation, and prompt engineering guides. The model sees these results and concludes it's a tool-less chatbot — so it says "I don't have real-time quotes."
+
+**Fix:** Strip all system prompt content before sending to Perplexity. Only preserve the language preference line (e.g., "Reply in Traditional Chinese"). Everything else — identity, role-play, tool references, formatting rules, skill definitions, XML markup — must be removed.
+
+### Layer 3: System Prompts Arriving as `role: user` (Affects LobeHub Specifically)
+
+LobeHub sends the user's custom system prompt as a `role: user` message (not `role: system` or `role: developer`). Since the system prompt filter only processes `system`/`developer` roles, the custom system prompt passes through unfiltered. If it contains tool references like `"You must use ccsearch tool"`, the model thinks it needs external tools to search.
+
+**Fix:** Detect user messages that contain system-prompt keywords (`you are`, `you must`, `ccsearch`, `技能`, `available_skills`) and reclassify them as `system` role before filtering.
+
+### How to Verify
+
+If models start saying "I can't access real-time data" again:
+
+1. Check `search_focus: "internet"` is in the request params (line ~194 in `search()` method)
+2. Check server logs for the query text — if it contains system prompt content (role-play, tool refs, AI agent descriptions), the filter is broken
+3. Check if system prompt content is arriving as `role: user` and bypassing the filter
