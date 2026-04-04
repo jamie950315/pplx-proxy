@@ -746,7 +746,7 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
     stream=body.get("stream", False)
     language=body.get("language", "en-US")
     sources=body.get("sources", ["web"])
-    tools=body.get("tools", None)
+    tools=[t for t in (body.get("tools") or []) if t.get("type")=="function" and "function" in t] or None
     tool_choice=body.get("tool_choice", "auto")
     thinking=body.get("thinking", False)
     reasoning_effort=body.get("reasoning_effort", None)  # "none" = no thinking, anything else = thinking
@@ -937,7 +937,7 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
 
     # Check for tool calls in response
     if tools and isinstance(tools, list):
-        _tn={t["function"]["name"] for t in tools if t.get("type")=="function"}
+        _tn={t["function"]["name"] for t in tools if t.get("type")=="function" and "function" in t}
         tool_calls, remaining=_parse_tool_calls(full, _tn)
         tool_calls=_validate_tool_calls(tool_calls, tools)
         if not tool_calls and full.strip().startswith("<"):
@@ -999,7 +999,7 @@ async def _stream_openai_with_tools(client, query, mode, model_pref, model_name,
     full=_clean_response(full)
 
     # Check for tool calls in buffered response
-    _tn={t["function"]["name"] for t in (tools or []) if t.get("type")=="function"}
+    _tn={t["function"]["name"] for t in (tools or []) if t.get("type")=="function" and "function" in t}
     tool_calls, remaining=_parse_tool_calls(full, _tn)
     tool_calls=_validate_tool_calls(tool_calls, tools or [])
     if not tool_calls and full.strip().startswith("<"):
