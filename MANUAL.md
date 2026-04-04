@@ -642,6 +642,9 @@ Cookie expired. Extract a fresh one and use `POST /admin/refresh-cookie` or upda
 ### Tool calls not firing
 Tool calling relies on keyword matching. Make your request explicit: "Use the calculator to compute 2+2" works better than just "2+2".
 
+### Model says "I can't access real-time data"
+This was caused by a missing `search_focus: "internet"` parameter in the Perplexity request. It has been fixed. If you see this on an older version, update to the latest.
+
 ### Model says "I don't have access to tools"
 Perplexity's model sometimes prefers its built-in web search over provided tools. This is expected behavior.
 

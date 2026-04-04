@@ -14,6 +14,8 @@ Single FastAPI app (`server.py`, ~1500 lines) that:
 4. Streams responses back in OpenAI SSE or MCP format
 5. Background tasks: session keep-alive (6h) + model discovery (24h)
 
+**Critical parameter**: `search_focus: "internet"` must be set in requests to Perplexity. Without it, Perplexity defaults to `"writing"` mode and models will say "I cannot access real-time data" even though search results are found.
+
 ## Key Concepts
 
 **Account Tiers** (`ACCOUNT_TYPE` in .env):
