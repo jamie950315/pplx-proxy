@@ -835,7 +835,7 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
         # Strip rate limit notices from previous responses
         content=_REMAINING_NOTICE_RE.sub("", content).strip()
         if role=="system":
-            system_msg=content
+            system_msg+=content+"\n"
         elif role=="user":
             history.append(("user", content))
         elif role=="assistant":
@@ -1081,7 +1081,7 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
         elif not content or not content.strip():
             continue
         if role == "system":
-            system_msg=content
+            system_msg+=content+"\n"
         elif role == "user":
             history.append(("user", content))
         elif role == "assistant":
