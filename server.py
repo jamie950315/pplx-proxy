@@ -724,20 +724,16 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
 
     parts=[]
     if system_msg:
-        _keep=[]
+        # Only extract language preference, strip everything else
+        _lang=None
         for _l in system_msg.splitlines():
             _ls=_l.strip().lstrip("- ")
-            if not _ls: continue
-            if _re.search(r"(?i)(ccsearch|tool|skill|技能|加載|fetch|brave|perplexity|search|web.?search)", _ls): continue
-            if _re.search(r"(?i)(you are|your role|your name|personal assistant|AI agent|jarvis|lobe)", _ls): continue
-            if _re.search(r"(?i)(latex|katex|code.?block|quotation|math|formula|公式|available_skills|<skill)", _ls): continue
-            _keep.append(_ls)
-        _sys_clean=" ".join(_keep).strip()
-        if len(_sys_clean)>200: _sys_clean=_sys_clean[:200]
-        if _sys_clean:
-            parts.append(f"[Instructions: {_sys_clean}]\n[You have built-in web search. Answer directly.]")
-        else:
-            parts.append("[You have built-in web search. Answer directly. Do not say you cannot access data.]")
+            if _re.search(r"(?i)(traditional chinese|繁體|zh-tw|reply in|respond in|回覆|回答.*語言)", _ls):
+                _lang=_ls[:100]
+                break
+        if _lang:
+            parts.append(f"[Reply language: {_lang}]")
+        parts.append("[You have built-in web search. Answer directly. Never say you cannot access data or need tools.]")
     if history:
         ctx_lines=[]
         for role,content in history:
@@ -889,6 +885,12 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
     for msg in messages:
         role=msg.get("role", "user")
         if role=="developer": role="system"
+        # Detect user messages that are actually system prompts (LobeHub sends
+        # Jamie's custom system prompt as role:user after the developer message)
+        if role=="user":
+            _ct=(msg.get("content") or "")[:200].lower()
+            if any(kw in _ct for kw in ["you are ", "you must ", "your role", "ccsearch", "加載", "技能", "available_skills", "<skill"]):
+                role="system"
         content=msg.get("content") or ""
         if isinstance(content, list):
             text_parts=[ct.get("text", "") for ct in content if ct.get("type") == "text"]
@@ -940,31 +942,18 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
     # Build query: system + history context + current request
     parts=[]
     if system_msg:
-        # Aggressively filter system prompt — only keep language/tone preferences
-        # Perplexity searches ALL query text. System prompts with role-play, tool
-        # references, or AI-assistant mentions cause Perplexity to find irrelevant
-        # AI/chatbot tutorial pages instead of the user's actual query.
-        _keep=[]
+        # Extract ONLY language preference from system prompt.
+        # Perplexity searches ALL query text — any AI/chatbot/tool/role text
+        # pollutes search results with AI tutorial pages.
+        _lang=None
         for _l in system_msg.splitlines():
             _ls=_l.strip().lstrip("- ")
-            # Skip: tool/skill refs, role-play identity, formatting rules, empty
-            if not _ls:
-                continue
-            if _re.search(r"(?i)(ccsearch|tool|skill|技能|加載|fetch|brave|perplexity|search|web.?search)", _ls):
-                continue
-            if _re.search(r"(?i)(you are|your role|your name|personal assistant|AI agent|jarvis)", _ls):
-                continue
-            if _re.search(r"(?i)(latex|katex|code.?block|quotation|math|formula|公式)", _ls):
-                continue
-            _keep.append(_ls)
-        # Only include if there's something meaningful left
-        _sys_clean=" ".join(_keep).strip()
-        if len(_sys_clean) > 200:
-            _sys_clean=_sys_clean[:200]
-        if _sys_clean:
-            parts.append(f"[Instructions: {_sys_clean}]\n[You have built-in web search. Answer questions directly using your search results. Do not say you need tools or cannot access data.]")
-        else:
-            parts.append("[You have built-in web search. Answer questions directly using your search results. Do not say you need tools or cannot access data.]")
+            if _re.search(r"(?i)(traditional chinese|繁體|zh-tw|reply in|respond in|回覆|回答.*語言)", _ls):
+                _lang=_ls[:100]
+                break
+        if _lang:
+            parts.append(f"[Reply language: {_lang}]")
+        parts.append("[You have built-in web search. Answer questions directly using search results. Never say you cannot access data or need external tools.]")
     if history:
         ctx_lines=[]
         for role, content in history:
