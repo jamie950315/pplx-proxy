@@ -452,14 +452,7 @@ async def verify_api_key(request: Request):
 
 app=FastAPI(title="pplx-proxy", version="1.0.0")
 
-@app.on_event("startup")
-async def _startup_rate_limit():
-    """Fetch rate limits on startup (background, non-blocking)."""
-    async def _bg():
-        await asyncio.sleep(3)  # let server finish booting
-        loop=asyncio.get_event_loop()
-        await loop.run_in_executor(None, _fetch_rate_limit_sync)
-    asyncio.create_task(_bg())
+# Rate limit startup fetch is in _combined_lifespan below
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # Global error handler: unconfigured service → 503
@@ -1631,6 +1624,11 @@ if HAS_MCP:
             asyncio.create_task(session_keepalive_loop())
             asyncio.create_task(auto_discover_loop())
             asyncio.create_task(_rate_limit_poll_loop())
+            # Fetch rate limits on startup (delayed 3s, non-blocking)
+            async def _rl_startup():
+                await asyncio.sleep(3)
+                await asyncio.get_event_loop().run_in_executor(None, _fetch_rate_limit_sync)
+            asyncio.create_task(_rl_startup())
             log.info(f"pplx-proxy started on port {PORT}")
             yield
         log.info("MCP streamable HTTP lifespan stopped")
