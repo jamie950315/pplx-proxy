@@ -107,50 +107,45 @@ def _remaining_notice() -> str:
     rp = _rate_limit["remaining_pro"]
     return f"\n\n[Remaining Pro Search: {rp}]"
 
-# ─── Prompt Blacklist (file-based, hot-reloadable) ──────────────────────────
+# ─── Prompt Whitelist (file-based, hot-reloadable) ──────────────────────────
 
-_BLACKLIST_FILE=Path(__file__).parent / ".prompt_blacklist.txt"
-_blacklist_cache={"patterns": [], "mtime": 0}
+_WHITELIST_FILE=Path(__file__).parent / ".prompt_whitelist.txt"
+_whitelist_cache={"patterns": [], "mtime": 0}
 
-def _load_blacklist() -> list:
-    """Load regex patterns from .prompt_blacklist.txt. Hot-reloads on file change."""
+def _load_whitelist() -> list:
+    """Load regex patterns from .prompt_whitelist.txt. Hot-reloads on file change."""
     try:
-        mtime=_BLACKLIST_FILE.stat().st_mtime
+        mtime=_WHITELIST_FILE.stat().st_mtime
     except FileNotFoundError:
         return []
-    if mtime == _blacklist_cache["mtime"]:
-        return _blacklist_cache["patterns"]
+    if mtime == _whitelist_cache["mtime"]:
+        return _whitelist_cache["patterns"]
     patterns=[]
     try:
-        for line in _BLACKLIST_FILE.read_text().splitlines():
+        for line in _WHITELIST_FILE.read_text().splitlines():
             line=line.strip()
             if not line or line.startswith("#"):
                 continue
             try:
                 patterns.append(re.compile(line))
             except re.error as e:
-                log.warning(f"Invalid blacklist regex: {line!r} — {e}")
-        _blacklist_cache["patterns"]=patterns
-        _blacklist_cache["mtime"]=mtime
-        log.info(f"Loaded {len(patterns)} blacklist patterns from {_BLACKLIST_FILE}")
+                log.warning(f"Invalid whitelist regex: {line!r} — {e}")
+        _whitelist_cache["patterns"]=patterns
+        _whitelist_cache["mtime"]=mtime
+        log.info(f"Loaded {len(patterns)} whitelist patterns from {_WHITELIST_FILE}")
     except Exception as e:
-        log.warning(f"Failed to load blacklist: {e}")
+        log.warning(f"Failed to load whitelist: {e}")
     return patterns
 
 def _filter_system_prompt(system_msg: str) -> list:
-    """Filter system prompt lines using blacklist. Returns list of instruction strings."""
-    blacklist=_load_blacklist()
+    """Filter system prompt: only lines matching a whitelist pattern survive."""
+    whitelist=_load_whitelist()
     kept=[]
     for line in system_msg.splitlines():
         ls=line.strip().lstrip("- ")
         if not ls:
             continue
-        blocked=False
-        for pat in blacklist:
-            if pat.search(ls):
-                blocked=True
-                break
-        if not blocked:
+        if whitelist and any(p.search(ls) for p in whitelist):
             kept.append(ls)
     # Always append search instruction
     kept.append("You have built-in web search. Answer questions directly using search results. Never say you cannot access data or need external tools.")

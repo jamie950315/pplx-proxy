@@ -1,0 +1,15 @@
+# pplx-proxy system prompt whitelist
+# Only lines matching at least one pattern are KEPT.
+# Everything else is stripped before sending to Perplexity.
+# One regex per line. Empty lines and # comments ignored.
+# Patterns are matched case-insensitively.
+
+# Language preference
+(?i)(traditional chinese|繁體|zh-tw|reply in|respond in|回覆|回答.*語言|same language)
+
+# Output format rules
+(?i)(禁止輸出|絕對禁止|不要輸出|do not output|never output|avoid.*output)
+(?i)(latex|katex|數學公式|math formula)
+
+# Tone / style
+(?i)(friendly|professional|concise|直接|簡潔)
