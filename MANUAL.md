@@ -492,16 +492,30 @@ curl -X POST http://localhost:8892/admin/discover-models \
 
 ## 15. Context Management
 
-Because Perplexity does not accept OpenAI-format message arrays, pplx-proxy translates the conversation into a structured text block.
+Because Perplexity does not accept OpenAI-format message arrays, pplx-proxy translates the conversation into a structured JSON string with `instructions`, `history`, and `query`.
 
 ### How It Works
 
 Given a multi-turn conversation, the proxy:
 
-1. Extracts the **system message** (if any) and places it first.
-2. Builds a **conversation history** section from all previous messages, labeled with `User:`, `Assistant:`, and `Tool result:` prefixes.
-3. Separates the **current user message** from history and labels it with `User's current request:` to prevent topic confusion.
-4. Appends **tool definitions** (if tools are provided and relevant) as an XML schema block.
+1. Extracts upstream system/developer content for source detection.
+2. For **generic clients**, filters system prompts through `.prompt_whitelist.txt` and uses surviving lines as `instructions`.
+3. For **LobeHub**, discards upstream system/developer prompt content entirely and loads local `CUSTOM_PROMPTS` as `instructions` on every turn.
+4. Builds a `history` array from previous `user` / `assistant` messages.
+5. Separates the current user message into `query`.
+6. Serializes the final payload as JSON before sending it to Perplexity.
+
+A typical final payload looks like:
+
+```json
+{
+  "instructions": ["...custom prompt or filtered system lines..."],
+  "history": [{"role": "user", "content": "..."}],
+  "query": "current question"
+}
+```
+
+`history` is omitted when empty. For a first-turn LobeHub request, the payload is just `instructions + query`.
 
 ### Assistant Messages with Tool Calls
 
@@ -512,19 +526,16 @@ Assistant: [Called tools: get_user({"user_id": 42})]
 
 This gives the model clear context about what tools were invoked.
 
-### Truncation Limits
+### Input Limits and Dedup
 
 To prevent Perplexity's input from growing too large:
 
-- System prompts are truncated to **500 characters** and labeled so Perplexity does not search for them.
-- Total query capped at **96K characters** (~32K tokens).
-- Tool results are truncated to **400 characters**.
+- Total serialized query capped at **96K characters** (~32K tokens).
 - Consecutive same-role messages are deduplicated (keeps the last one) — this handles LibreChat-style branching artifacts.
-- 
+- Rate-limit notices are stripped from prior assistant messages before they enter `history`.
+- Empty assistant messages become `[done]` before reaching Perplexity.
 
-### Topic Separation
-
-The current user message is prefixed with `User's current request:` when conversation history exists. This prevents the model from treating a new question as a continuation of the previous topic.
+There is no longer a `User's current request:` prefix or labeled text block assembly — the proxy now uses structured JSON fields instead.
 
 ---
 
@@ -601,11 +612,13 @@ This is the most critical issue in pplx-proxy. There are three independent cause
 
 **Cause 1: Missing `search_focus` parameter.** Perplexity defaults to `"writing"` mode when `search_focus` is not set. In writing mode, the search engine still runs (you can see `Searching: ...` in the reasoning output), but the model is instructed to NOT use the search results in its answer. Fix: ensure `search_focus: "internet"` is present in the request params inside `client.search()`.
 
-**Cause 2: System prompt content pollutes search results.** Perplexity searches ALL text in the query, including system prompts. If the system prompt says `"You are Jarvis, a personal assistant"` or `"You are Lobe, an AI Agent"`, Perplexity searches for those phrases and finds AI chatbot tutorial pages and prompt engineering guides. The model sees these results and concludes it is a chatbot without search capabilities. Fix: strip all system prompt content before sending to Perplexity, keeping only the language preference.
+**Cause 2: System prompt content pollutes search results.** Perplexity searches ALL text in the query, including prompt instructions. If the prompt says `"You are Jarvis, a personal assistant"` or `"You are Lobe, an AI Agent"`, Perplexity searches for those phrases and finds AI chatbot tutorial pages and prompt engineering guides. The model sees these results and concludes it is a chatbot without search capabilities. Fix: never forward raw upstream prompt blocks blindly. Generic clients keep only whitelist-approved lines; LobeHub uses local `CUSTOM_PROMPTS` instead.
 
-**Cause 3: System prompts arriving as `role: user`.** Some clients (notably LobeHub) send the user's custom system prompt as a `role: user` message instead of `role: system`. The system prompt filter only processes system-role messages, so the custom prompt passes through unfiltered with all its tool references intact. Fix: detect user messages containing system-prompt keywords and reclassify them as system role.
+**Cause 3: System prompts arriving as `role: user`.** Some clients (notably LobeHub) send the user's custom system prompt as a `role: user` message instead of `role: system`. The proxy detects these with system-prompt keywords, reclassifies them as system content, and keeps them out of `history`. For LobeHub, the reclassified prompt is used only for source detection and is never forwarded to Perplexity.
 
-**How to diagnose:** Check server logs for the query text sent to Perplexity (`CONTEXT QUERY` in debug logs). If it contains role-play instructions, tool names, or AI agent descriptions, the system prompt filter needs updating.
+**Cause 4: Missing local prompt injection for LobeHub.** If `CUSTOM_PROMPTS` is empty, missing, or not included in `instructions`, LobeHub turns will lose the local behavior you expect. Fix: ensure `/home/jamie/pplx-proxy/CUSTOM_PROMPTS` exists and logs show `custom_prompts_loaded=true` for LobeHub requests.
+
+**How to diagnose:** Check server logs for `PROMPT DEBUG` and `PPLX REQUEST QUERY`. Generic clients should show whitelist-filtered `instructions`. LobeHub should show `instructions=[CUSTOM_PROMPTS]` on every turn, plus `history` and `query` as applicable.
 
 ### Model says "I don't have access to tools"
 Perplexity's model sometimes prefers its built-in web search over provided tools. This is expected behavior.

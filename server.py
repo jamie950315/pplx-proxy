@@ -107,10 +107,12 @@ def _remaining_notice() -> str:
     rp = _rate_limit["remaining_pro"]
     return f"\n\n[Remaining Pro Search: {rp}]"
 
-# ─── Prompt Whitelist (file-based, hot-reloadable) ──────────────────────────
+# ─── Prompt Whitelist / Custom Prompts (file-based, hot-reloadable) ─────────
 
 _WHITELIST_FILE=Path(__file__).parent / ".prompt_whitelist.txt"
+_CUSTOM_PROMPTS_FILE=Path(__file__).parent / "CUSTOM_PROMPTS"
 _whitelist_cache={"patterns": [], "mtime": 0}
+_custom_prompts_cache={"text": "", "mtime": 0}
 
 def _load_whitelist() -> list:
     """Load regex patterns from .prompt_whitelist.txt. Hot-reloads on file change."""
@@ -136,6 +138,25 @@ def _load_whitelist() -> list:
     except Exception as e:
         log.warning(f"Failed to load whitelist: {e}")
     return patterns
+
+def _load_custom_prompts() -> str:
+    """Load custom prompts from CUSTOM_PROMPTS. Hot-reloads on file change."""
+    try:
+        mtime=_CUSTOM_PROMPTS_FILE.stat().st_mtime
+    except FileNotFoundError:
+        return ""
+    if mtime == _custom_prompts_cache["mtime"]:
+        return _custom_prompts_cache["text"]
+    try:
+        text=_CUSTOM_PROMPTS_FILE.read_text().strip()
+        _custom_prompts_cache["text"]=text
+        _custom_prompts_cache["mtime"]=mtime
+        log.info(f"Loaded custom prompts from {_CUSTOM_PROMPTS_FILE} ({len(text)} chars)")
+        return text
+    except Exception as e:
+        log.warning(f"Failed to load custom prompts: {e}")
+        return ""
+
 
 def _filter_system_prompt(system_msg: str) -> list:
     """Filter system prompt: only lines matching a whitelist pattern survive.
@@ -163,6 +184,37 @@ def _filter_system_prompt(system_msg: str) -> list:
     # Always append search instruction
     kept.append("You have built-in web search. Answer questions directly using search results. Never say you cannot access data or need external tools.")
     return kept
+
+def _detect_request_source(system_msg: str, messages: list) -> str:
+    """Best-effort request source detection for logging/debugging."""
+    raw=(system_msg or "")
+    lowered=raw.lower()
+    score=0
+    if "you are lobe" in lowered:
+        score+=3
+    if any(tag in lowered for tag in ["<available_skills>", "<user_memory>", "<available_tools>", "<tool.instructions>", "<skill name="]):
+        score+=3
+    if any(term in lowered for term in ["activateskill", "activatetools", "runskill", "lobe-skill-store", "lobe-creds"]):
+        score+=2
+    if any(msg.get("role") == "developer" for msg in messages if isinstance(msg, dict)):
+        score+=1
+    return "lobehub" if score >= 3 else "generic_openai_client"
+
+
+def _log_prompt_payload(source: str, request_source: str, system_msg: str, final_instructions: list, history: list, current_msg: str, query: str, is_first_user_turn: bool=False, custom_prompts_loaded: bool=False):
+    """Log raw/final prompt payloads for debugging prompt filtering."""
+    raw_system=system_msg.strip()
+    instructions_text="\n".join(final_instructions) if final_instructions else ""
+    history_json=json.dumps([{"role": r, "content": ct} for r, ct in history], ensure_ascii=False, indent=2) if history else "[]"
+    current_text=current_msg or ""
+    log.info(
+        f"PROMPT DEBUG [{source}] source_guess={request_source} is_first_user_turn={str(is_first_user_turn).lower()} custom_prompts_loaded={str(custom_prompts_loaded).lower()}\n"
+        f"--- RAW SYSTEM PROMPT START ---\n{raw_system or '[empty]'}\n--- RAW SYSTEM PROMPT END ---\n"
+        f"--- FINAL INSTRUCTIONS START ---\n{instructions_text or '[empty]'}\n--- FINAL INSTRUCTIONS END ---\n"
+        f"--- HISTORY START ---\n{history_json}\n--- HISTORY END ---\n"
+        f"--- CURRENT QUERY START ---\n{current_text or '[empty]'}\n--- CURRENT QUERY END ---\n"
+        f"--- FINAL QUERY JSON START ---\n{query}\n--- FINAL QUERY JSON END ---"
+    )
 
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -342,7 +394,8 @@ class PerplexityClient:
             },
         }
 
-        log.info(f"Query: mode={mode}, pref={model_pref}, q={query[:80]}...")
+        log.info(f"Query: mode={mode}, pref={model_pref}, len={len(query)}")
+        log.info(f"PPLX REQUEST QUERY START\n{query}\nPPLX REQUEST QUERY END")
 
         try:
             resp=await self.session.post(PPLX_SSE_ASK, json=json_data, stream=True)
@@ -666,10 +719,21 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
         current_msg=history[-1][1]
         history=history[:-1]
 
+    request_source=_detect_request_source(system_msg, messages)
+    is_lobehub=request_source == "lobehub"
+    is_first_user_turn=is_lobehub and not history
+    custom_prompts=_load_custom_prompts() if is_lobehub else ""
+    final_instructions=[]
+    if is_lobehub:
+        if custom_prompts:
+            final_instructions.append(custom_prompts)
+    else:
+        final_instructions=_filter_system_prompt(system_msg) if system_msg else []
+
     # Build query as JSON for clear block separation
     query_obj={}
-    if system_msg:
-        query_obj["instructions"]=_filter_system_prompt(system_msg)
+    if final_instructions:
+        query_obj["instructions"]=final_instructions
     if history:
         query_obj["history"]=[{"role": r, "content": ct} for r, ct in history]
     if current_msg:
@@ -678,6 +742,9 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
         query_obj["query"]=""
 
     query=json.dumps(query_obj, ensure_ascii=False)
+    if len(query) > 96000:
+        query=query[-96000:]  # ~32K tokens at ~3 chars/token
+    _log_prompt_payload("responses_api", request_source, system_msg, final_instructions, history, current_msg, query, is_first_user_turn, bool(custom_prompts) and bool(final_instructions))
     if not query.strip():
         raise HTTPException(400, "Empty query after processing")
     if len(query) > 96000:
@@ -904,11 +971,21 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
         current_msg=history[-1][1]
         history=history[:-1]
 
-    # Build query: system + history context + current request
+    request_source=_detect_request_source(system_msg, messages)
+    is_lobehub=request_source == "lobehub"
+    is_first_user_turn=is_lobehub and not history
+    custom_prompts=_load_custom_prompts() if is_lobehub else ""
+    final_instructions=[]
+    if is_lobehub:
+        if custom_prompts:
+            final_instructions.append(custom_prompts)
+    else:
+        final_instructions=_filter_system_prompt(system_msg) if system_msg else []
+
     # Build query as JSON for clear block separation
     query_obj={}
-    if system_msg:
-        query_obj["instructions"]=_filter_system_prompt(system_msg)
+    if final_instructions:
+        query_obj["instructions"]=final_instructions
     if history:
         query_obj["history"]=[{"role": r, "content": ct} for r, ct in history]
     if current_msg:
@@ -917,6 +994,9 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
         query_obj["query"]=""
 
     query=json.dumps(query_obj, ensure_ascii=False)
+    if len(query) > 96000:
+        query=query[-96000:]  # ~32K tokens at ~3 chars/token
+    _log_prompt_payload("chat_completions", request_source, system_msg, final_instructions, history, current_msg, query, is_first_user_turn, bool(custom_prompts) and bool(final_instructions))
     log.debug(f"CONTEXT QUERY ({len(query)}ch, {len(history)} hist items):\n{query[:1500]}")
 
     if not query.strip():
