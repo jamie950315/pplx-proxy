@@ -11,6 +11,7 @@ import time
 import asyncio
 import logging
 import re
+import hashlib
 from uuid import uuid4
 from typing import Optional, AsyncGenerator
 from pathlib import Path
@@ -221,7 +222,47 @@ logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(messa
 log=logging.getLogger("pplx-proxy")
 
 
-# ─── Prompt Blacklist ──────────────────────────────────────────────────────
+# ─── Perplexity Session Cache ─────────────────────────────────────────────
+# Tracks backend_uuid per conversation so follow-up turns can skip history/instructions.
+# Key = hash of conversation history, Value = {backend_uuid, timestamp}
+
+_SESSION_MAX_AGE=3600  # 1 hour TTL
+_SESSION_MAX_ENTRIES=200
+_session_cache={}
+
+def _session_key(history: list) -> str:
+    """Compute a stable hash of conversation history for session lookup."""
+    h=hashlib.sha256()
+    for role, content in history:
+        h.update(f"{role}:{content}\n".encode())
+    return h.hexdigest()[:16]
+
+def _session_lookup(history: list) -> str | None:
+    """Look up a stored backend_uuid for this conversation history. Returns None on miss."""
+    if not history:
+        return None
+    key=_session_key(history)
+    entry=_session_cache.get(key)
+    if not entry:
+        return None
+    if time.time() - entry["ts"] > _SESSION_MAX_AGE:
+        del _session_cache[key]
+        return None
+    log.info(f"SESSION HIT: key={key} backend_uuid={entry['backend_uuid']}")
+    return entry["backend_uuid"]
+
+def _session_store(history: list, current_msg: str, response_text: str, backend_uuid: str):
+    """Store backend_uuid keyed by the conversation state AFTER this turn."""
+    if not backend_uuid:
+        return
+    new_history=list(history) + [("user", current_msg), ("assistant", response_text)]
+    key=_session_key(new_history)
+    _session_cache[key]={"backend_uuid": backend_uuid, "ts": time.time()}
+    log.info(f"SESSION STORE: key={key} backend_uuid={backend_uuid} entries={len(_session_cache)}")
+    # Evict oldest if over limit
+    if len(_session_cache) > _SESSION_MAX_ENTRIES:
+        oldest=min(_session_cache, key=lambda k: _session_cache[k]["ts"])
+        del _session_cache[oldest]
 
 
 # ─── Perplexity Client ─────────────────────────────────────────────────────
@@ -722,33 +763,40 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
     request_source=_detect_request_source(system_msg, messages)
     is_lobehub=request_source == "lobehub"
     is_first_user_turn=is_lobehub and not history
-    custom_prompts=_load_custom_prompts() if is_lobehub else ""
-    final_instructions=[]
-    if is_lobehub:
-        if custom_prompts:
-            final_instructions.append(custom_prompts)
+
+    # Session continuity: check if we can skip history/instructions
+    follow_up_uuid=_session_lookup(history)
+    if follow_up_uuid:
+        query=current_msg
+        final_instructions=[]
+        log.info(f"SESSION CONTINUE [responses_api] source={request_source} follow_up={follow_up_uuid[:12]}...")
     else:
-        final_instructions=_filter_system_prompt(system_msg) if system_msg else []
+        custom_prompts=_load_custom_prompts() if is_lobehub else ""
+        final_instructions=[]
+        if is_lobehub:
+            if custom_prompts:
+                final_instructions.append(custom_prompts)
+        else:
+            final_instructions=_filter_system_prompt(system_msg) if system_msg else []
 
-    # Build query as JSON for clear block separation
-    query_obj={}
-    if final_instructions:
-        query_obj["instructions"]=final_instructions
-    if history:
-        query_obj["history"]=[{"role": r, "content": ct} for r, ct in history]
-    if current_msg:
-        query_obj["query"]=current_msg
-    elif not history:
-        query_obj["query"]=""
+        # Build query as JSON for clear block separation
+        query_obj={}
+        if final_instructions:
+            query_obj["instructions"]=final_instructions
+        if history:
+            query_obj["history"]=[{"role": r, "content": ct} for r, ct in history]
+        if current_msg:
+            query_obj["query"]=current_msg
+        elif not history:
+            query_obj["query"]=""
 
-    query=json.dumps(query_obj, ensure_ascii=False)
-    if len(query) > 96000:
-        query=query[-96000:]  # ~32K tokens at ~3 chars/token
-    _log_prompt_payload("responses_api", request_source, system_msg, final_instructions, history, current_msg, query, is_first_user_turn, bool(custom_prompts) and bool(final_instructions))
+        query=json.dumps(query_obj, ensure_ascii=False)
+        if len(query) > 96000:
+            query=query[-96000:]
+
+    _log_prompt_payload("responses_api", request_source, system_msg, final_instructions, history, current_msg, query, is_first_user_turn, not bool(follow_up_uuid) and bool(final_instructions))
     if not query.strip():
         raise HTTPException(400, "Empty query after processing")
-    if len(query) > 96000:
-        query=query[-96000:]  # ~32K tokens at ~3 chars/token
 
     mm=get_model_map()
     if model_name not in mm:
@@ -780,9 +828,12 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
             yield f"event: response.reasoning_summary_part.added\ndata: {json.dumps({'type': 'reasoning_summary_part', 'item_id': msg_id})}\n\n"
 
             full=""
+            _resp_backend_uuid=None
             _thinking_parts=[]
             _thinking_done=False
-            async for ch in client.search(query, mode, model_pref, ["web"], "en-US"):
+            async for ch in client.search(query, mode, model_pref, ["web"], "en-US", follow_up_uuid):
+                if ch.get("backend_uuid"):
+                    _resp_backend_uuid=ch["backend_uuid"]
                 if ch.get("error"):
                     yield f"event: error\ndata: {json.dumps({'error': ch['error']})}\n\n"
                     break
@@ -829,6 +880,10 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
             # Emit output_text.done
             yield f"event: response.output_text.done\ndata: {json.dumps({'type': 'response.output_text.done', 'item_id': msg_id, 'text': full})}\n\n"
 
+            # Store session for next turn (use cleaned text before notice)
+            _clean_full=_REMAINING_NOTICE_RE.sub("", full).strip()
+            _session_store(history, current_msg, _clean_full, _resp_backend_uuid)
+
             # Emit response.completed
             done_resp={"id": resp_id, "object": "response", "created_at": created,
                        "model": model_name, "status": "completed",
@@ -843,7 +898,10 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
     else:
         # Non-streaming: collect full response
         full=""
-        async for ch in client.search(query, mode, model_pref, ["web"], "en-US"):
+        resp_backend_uuid=None
+        async for ch in client.search(query, mode, model_pref, ["web"], "en-US", follow_up_uuid):
+            if ch.get("backend_uuid"):
+                resp_backend_uuid=ch["backend_uuid"]
             if ch.get("error"):
                 raise HTTPException(502, ch)
             if ch.get("done"):
@@ -851,6 +909,9 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
                 break
             full=ch.get("answer", full)
         full=_clean_response(full)
+
+        # Store session for next turn
+        _session_store(history, current_msg, full, resp_backend_uuid)
 
         # Rate limit decrement + notice
         _decrement_pro()
@@ -974,30 +1035,38 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
     request_source=_detect_request_source(system_msg, messages)
     is_lobehub=request_source == "lobehub"
     is_first_user_turn=is_lobehub and not history
-    custom_prompts=_load_custom_prompts() if is_lobehub else ""
-    final_instructions=[]
-    if is_lobehub:
-        if custom_prompts:
-            final_instructions.append(custom_prompts)
+
+    # Session continuity: check if we can skip history/instructions
+    follow_up_uuid=_session_lookup(history)
+    if follow_up_uuid:
+        query=current_msg
+        final_instructions=[]
+        log.info(f"SESSION CONTINUE [chat_completions] source={request_source} follow_up={follow_up_uuid[:12]}...")
     else:
-        final_instructions=_filter_system_prompt(system_msg) if system_msg else []
+        custom_prompts=_load_custom_prompts() if is_lobehub else ""
+        final_instructions=[]
+        if is_lobehub:
+            if custom_prompts:
+                final_instructions.append(custom_prompts)
+        else:
+            final_instructions=_filter_system_prompt(system_msg) if system_msg else []
 
-    # Build query as JSON for clear block separation
-    query_obj={}
-    if final_instructions:
-        query_obj["instructions"]=final_instructions
-    if history:
-        query_obj["history"]=[{"role": r, "content": ct} for r, ct in history]
-    if current_msg:
-        query_obj["query"]=current_msg
-    elif not history:
-        query_obj["query"]=""
+        # Build query as JSON for clear block separation
+        query_obj={}
+        if final_instructions:
+            query_obj["instructions"]=final_instructions
+        if history:
+            query_obj["history"]=[{"role": r, "content": ct} for r, ct in history]
+        if current_msg:
+            query_obj["query"]=current_msg
+        elif not history:
+            query_obj["query"]=""
 
-    query=json.dumps(query_obj, ensure_ascii=False)
-    if len(query) > 96000:
-        query=query[-96000:]  # ~32K tokens at ~3 chars/token
-    _log_prompt_payload("chat_completions", request_source, system_msg, final_instructions, history, current_msg, query, is_first_user_turn, bool(custom_prompts) and bool(final_instructions))
-    log.debug(f"CONTEXT QUERY ({len(query)}ch, {len(history)} hist items):\n{query[:1500]}")
+        query=json.dumps(query_obj, ensure_ascii=False)
+        if len(query) > 96000:
+            query=query[-96000:]
+
+    _log_prompt_payload("chat_completions", request_source, system_msg, final_instructions, history, current_msg, query, is_first_user_turn, not bool(follow_up_uuid) and bool(final_instructions))
 
     if not query.strip():
         raise HTTPException(400, "No valid message content after processing. Ensure at least one user message has non-empty content.")
@@ -1008,14 +1077,17 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
 
     if stream:
         return StreamingResponse(
-            _stream_openai(client, query, mode, model_pref, model_name, cid, created, sources, language),
+            _stream_openai(client, query, mode, model_pref, model_name, cid, created, sources, language, follow_up_uuid, history, current_msg),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     full=""
+    resp_backend_uuid=None
     thinking_parts=[]
-    async for chunk in client.search(query, mode, model_pref, sources, language):
+    async for chunk in client.search(query, mode, model_pref, sources, language, follow_up_uuid):
+        if chunk.get("backend_uuid"):
+            resp_backend_uuid=chunk["backend_uuid"]
         if chunk.get("error"):
             raise HTTPException(502, chunk)
         if chunk.get("thinking"):
@@ -1027,6 +1099,9 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
         full=chunk.get("answer", full)
     reasoning_content="\n".join(thinking_parts) if thinking_parts else None
     full=_clean_response(full)
+
+    # Store session for next turn
+    _session_store(history, current_msg, full, resp_backend_uuid)
 
     # Rate limit: decrement + append notice
     if mode != "auto":  # Pro queries only (copilot mode)
@@ -1046,12 +1121,18 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
     }
 
 
-async def _stream_openai(client, query, mode, model_pref, model_name, cid, created, sources, language):
+async def _stream_openai(client, query, mode, model_pref, model_name, cid, created, sources, language, follow_up_uuid=None, history=None, current_msg=None):
     init={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
           "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None, "logprobs": None}]}
     yield f"data: {json.dumps(init)}\n\n"
 
-    async for chunk in client.search(query, mode, model_pref, sources, language):
+    _resp_backend_uuid=None
+    _full_answer=""
+    async for chunk in client.search(query, mode, model_pref, sources, language, follow_up_uuid):
+        if chunk.get("backend_uuid"):
+            _resp_backend_uuid=chunk["backend_uuid"]
+        if chunk.get("answer"):
+            _full_answer=chunk["answer"]
         # Stream thinking content as reasoning_content deltas
         if chunk.get("thinking"):
             t={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
@@ -1098,6 +1179,11 @@ async def _stream_openai(client, query, mode, model_pref, model_name, cid, creat
                   "choices": [{"index": 0, "delta": {}, "finish_reason": "stop", "logprobs": None}]}
             yield f"data: {json.dumps(stop)}\n\n"
             break
+
+    # Store session for next turn
+    if history is not None and current_msg:
+        _clean_full=_clean_response(_full_answer)
+        _session_store(history, current_msg, _clean_full, _resp_backend_uuid)
 
     yield "data: [DONE]\n\n"
 

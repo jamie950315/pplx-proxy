@@ -31,6 +31,8 @@ Single FastAPI app (`server.py`, ~1750 lines) that:
 
 **Context Management**: request payloads are assembled as JSON with `instructions` / `history` / `query`. Total query capped at 96K chars (~32K tokens). Consecutive same-role messages deduped (keeps last — fixes LibreChat branch artifacts). Generic clients still use whitelist-filtered system prompts from `.prompt_whitelist.txt`, but LobeHub requests now discard upstream system/developer prompt content entirely and prepend local `CUSTOM_PROMPTS` on every turn.
 
+**Session Continuity**: the proxy tracks Perplexity's `backend_uuid` per conversation turn. On follow-up turns (detected by hashing conversation history), only the raw user query is sent with `last_backend_uuid` — no instructions, no history. Perplexity's server-side session memory handles context. Sessions expire after 1 hour. Falls back to full payload on cache miss.
+
 **Response Cleaning** (`_clean_response`): strips `[1]` `[2]` citations, `<grok:*>` tags, `<?xml?>` declarations, `<response>` wrappers, `<script>` tags.
 
 **Auto-Discovery**: every `PROBE_INTERVAL_HOURS`, checks if models are alive. Dead models get version-incremented (e.g., `gpt54` → `gpt55`) up to +1.0. Sends ntfy on upgrade.

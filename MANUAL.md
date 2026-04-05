@@ -517,6 +517,17 @@ A typical final payload looks like:
 
 `history` is omitted when empty. For a first-turn LobeHub request, the payload is just `instructions + query`.
 
+### Session Continuity
+
+The proxy tracks Perplexity's `backend_uuid` (returned in every SSE response) and maps it to conversation history via SHA-256 hashing. On follow-up turns within the same conversation:
+
+1. The proxy hashes the incoming `history` and looks up the cache.
+2. **Cache hit**: sends only the raw user query text plus `last_backend_uuid` — no instructions, no history JSON. Perplexity's server-side session memory provides the full conversation context.
+3. **Cache miss**: falls back to the full payload (instructions + history + query).
+4. After each successful response, the new conversation state is stored for the next turn.
+
+Session cache entries expire after **1 hour** (`_SESSION_MAX_AGE`), capped at **200 entries** (`_SESSION_MAX_ENTRIES`). This dramatically reduces payload size for multi-turn conversations and avoids re-sending `CUSTOM_PROMPTS` and history on every turn.
+
 ### Assistant Messages with Tool Calls
 
 
