@@ -24,6 +24,7 @@ All queries use `search_focus: "internet"` — Perplexity's built-in web search 
 - **Auto-discovery** — background task checks model health every 24h, auto-upgrades when versions change
 - **Response cleaning** — strips Perplexity citations `[1][2]`, `<grok:*>` tags, `<?xml?>` declarations, `<script>` tags
 - **Rate limit tracking** — tracks Pro Search quota, auto-fallback to free model when exhausted, notices at every 5th decrement
+- **Session continuity** — tracks Perplexity `backend_uuid` so follow-up turns skip history/instructions entirely, sending only the new query
 - **Session keep-alive** — periodic pings prevent cookie expiry
 - **Push notifications** — [ntfy.sh](https://ntfy.sh) alerts on cookie expiry or model upgrades
 - **Debug chat UI** — `/chat` page with tools toggle, thinking toggle, streaming toggle, and **OpenAI format validator**
