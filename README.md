@@ -173,6 +173,7 @@ Manual trigger: `POST /admin/discover-models`
 | `ACCOUNT_TYPE` | `pro` | `free`, `pro`, or `max` |
 | `DEFAULT_MODEL` | `gpt` | Default when not specified |
 | `PPLX_PROXY_PORT` | `8892` | Listen port |
+| `CUSTOM_PROMPTS` | file | Local prompt block prepended to every LobeHub request |
 | `KEEPALIVE_HOURS` | `6` | Session ping interval |
 | `PROBE_INTERVAL_HOURS` | `24` | Auto-discovery interval |
 | `NTFY_TOPIC` | `pplx-proxy` | ntfy.sh topic |
@@ -216,9 +217,9 @@ curl -X POST https://your-domain/admin/refresh-cookie \
 
 1. **`search_focus: "internet"`** must be set in every request. Without it, Perplexity defaults to `"writing"` mode where models don't incorporate search results. This is the single most important parameter.
 
-2. **System prompts must be stripped** before sending to Perplexity. Perplexity searches ALL query text — if the system prompt says "You are an AI assistant", Perplexity finds chatbot tutorial pages and the model gets confused. Only the language preference is kept.
+2. **System prompts must be stripped or replaced** before sending to Perplexity. Perplexity searches ALL query text — if the system prompt says "You are an AI assistant", Perplexity finds chatbot tutorial pages and the model gets confused. Generic clients keep only whitelist-approved lines; LobeHub requests discard upstream prompt content entirely.
 
-3. **`role: developer` and system-prompt-like user messages** must be detected and filtered. Some clients (LobeHub) send system prompts as `role: developer` or `role: user` instead of `role: system`.
+3. **LobeHub requests always prepend local `CUSTOM_PROMPTS`.** The proxy still detects `role: developer` and system-prompt-like user messages so it can classify the request source, but those upstream prompt blocks are never forwarded. Each LobeHub turn sends `instructions=[CUSTOM_PROMPTS]` plus preserved `history` and current `query`.
 
 4. **Rate limit tracking** uses FlareSolverr (localhost:8191) to poll Perplexity's `/rest/rate-limit/all` endpoint with the session cookie. Requires FlareSolverr running locally. When `remaining_pro` reaches 0, all non-auto models fall back to `auto` (free tier).
 
