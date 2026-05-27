@@ -58,6 +58,13 @@ pplx-proxy.service   # systemd unit
 CUSTOM_PROMPTS       # Local prompt block prepended to every LobeHub request
 ```
 
+## Startup Modes
+
+- Manual Python runs only pplx-proxy with `uvicorn server:app --host 0.0.0.0 --port 8892`.
+- Docker Compose is the complete self-hosted stack: pplx-proxy, FlareSolverr, and the `pplx-data` runtime volume.
+- In Compose, `DATA_DIR=/data` and `FLARESOLVERR_URL=http://flaresolverr:8191`.
+- FlareSolverr is optional for chat, but required for `/health` quota fields and quota fallback.
+
 ## Endpoints
 
 **Public**:

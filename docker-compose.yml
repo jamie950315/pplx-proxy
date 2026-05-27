@@ -13,14 +13,20 @@ services:
     depends_on:
       flaresolverr:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8892/health', timeout=30)"]
+      interval: 30s
+      timeout: 45s
+      retries: 5
+      start_period: 30s
     restart: unless-stopped
 
   flaresolverr:
     image: ghcr.io/flaresolverr/flaresolverr:latest
     environment:
       LOG_LEVEL: info
-    ports:
-      - "8191:8191"
+    expose:
+      - "8191"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8191/"]
       interval: 30s

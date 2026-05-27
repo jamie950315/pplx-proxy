@@ -2,6 +2,8 @@
 .env
 .cookie_cache.json
 .models.json
+CUSTOM_PROMPTS
+.prompt_whitelist.txt
 __pycache__/
 *.pyc
 venv/

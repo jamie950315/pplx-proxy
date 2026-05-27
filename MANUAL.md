@@ -120,6 +120,15 @@ All settings live in the `.env` file. Here is the full reference:
 
 ## 6. Running the Service
 
+There are two supported startup modes:
+
+| Mode | Command | Includes |
+|------|---------|----------|
+| Manual Python | `uvicorn server:app --host 0.0.0.0 --port 8892` | pplx-proxy only |
+| Docker Compose | `docker compose up -d --build` | pplx-proxy, FlareSolverr, persistent runtime volume |
+
+Manual Python is best for development. Docker Compose is the complete self-hosted stack and is recommended when you want `/health` quota fields.
+
 **Development (foreground):**
 
 ```bash
@@ -127,13 +136,19 @@ source venv/bin/activate
 uvicorn server:app --host 0.0.0.0 --port 8892
 ```
 
-**Docker Compose (includes FlareSolverr for quota data):**
+**Docker Compose (full stack):**
 
 ```bash
 cp .env.example .env
 # Edit .env — set PPLX_COOKIE, PPLX_PROXY_API_KEY, and ACCOUNT_TYPE
 docker compose up -d --build
 ```
+
+The Compose stack starts:
+
+- `pplx-proxy` on `http://localhost:8892`
+- `flaresolverr` inside the Compose network at `http://flaresolverr:8191`
+- `pplx-data` volume for `.cookie_cache.json` and `.models.json`
 
 **Quick smoke test:**
 

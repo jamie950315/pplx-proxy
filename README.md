@@ -33,6 +33,17 @@ All queries use `search_focus: "internet"` — Perplexity's built-in web search 
 
 ## Quick Start
 
+Choose one startup mode:
+
+| Mode | Command | Includes |
+|------|---------|----------|
+| Manual Python | `venv/bin/uvicorn server:app --host 0.0.0.0 --port 8892` | pplx-proxy only |
+| Docker Compose | `docker compose up -d --build` | pplx-proxy, FlareSolverr, persistent runtime volume |
+
+Manual Python is best for local development. Docker Compose is the full self-hosted stack and is recommended when you want quota data in `/health`.
+
+### Manual Python
+
 ```bash
 git clone https://github.com/jamie950315/pplx-proxy.git
 cd pplx-proxy
@@ -49,13 +60,18 @@ Then open **http://localhost:8892/chat** to test with the debug UI.
 
 ### Docker Compose
 
-For the complete setup, including FlareSolverr for `/health` quota data:
+For the complete setup, including pplx-proxy, FlareSolverr, and persistent runtime storage:
 
 ```bash
 cp .env.example .env
 # Edit .env — set PPLX_COOKIE, PPLX_PROXY_API_KEY, and ACCOUNT_TYPE
 docker compose up -d --build
 ```
+
+This starts:
+- `pplx-proxy` on `http://localhost:8892`
+- `flaresolverr` inside the Compose network at `http://flaresolverr:8191`
+- `pplx-data` volume for `.cookie_cache.json` and `.models.json`
 
 FlareSolverr is optional for chat, streaming, MCP, and Responses API. Without it, `/health` still reports service and cookie age, but `remaining_pro` and `remaining_research` stay `null` and quota-based auto-fallback cannot run.
 
