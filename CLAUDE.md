@@ -26,7 +26,7 @@ Single FastAPI app (`server.py`, ~1750 lines) that:
 
 **Model Map**: dict of `{model_id: (mode, internal_pref)}`. Loaded from `.models.json` (persisted) or defaults. Filtered by tier at runtime.
 
-**Thinking Variants**: activated via `thinking: true` or `reasoning_effort != "none"`. Maps from `_THINKING_MAP` (e.g., `gpt → gpt54_thinking`, `sonnet → claude46sonnetthinking`). Perplexity does NOT expose internal thinking blocks — `reasoning_content` is populated from search steps (queries, URLs, plan goals).
+**Thinking Variants**: activated via `thinking: true` or `reasoning_effort != "none"`. Maps from `_THINKING_MAP` (e.g., `gpt → gpt55_thinking`, `sonnet → claude46sonnetthinking`). Perplexity does NOT expose internal thinking blocks — `reasoning_content` is populated from search steps (queries, URLs, plan goals).
 
 
 **Context Management**: request payloads are assembled as JSON with `instructions` / `history` / `query`. Total query capped at 96K chars (~32K tokens). Consecutive same-role messages deduped (keeps last — fixes LibreChat branch artifacts). Generic clients still use whitelist-filtered system prompts from `.prompt_whitelist.txt`, but LobeHub requests now discard upstream system/developer prompt content entirely and prepend local `CUSTOM_PROMPTS` on every turn.
@@ -35,7 +35,7 @@ Single FastAPI app (`server.py`, ~1750 lines) that:
 
 **Response Cleaning** (`_clean_response`): strips `[1]` `[2]` citations, `<grok:*>` tags, `<?xml?>` declarations, `<response>` wrappers, `<script>` tags.
 
-**Auto-Discovery**: every `PROBE_INTERVAL_HOURS`, checks if models are alive. Dead models get version-incremented (e.g., `gpt54` → `gpt55`) up to +1.0. Sends ntfy on upgrade.
+**Auto-Discovery**: every `PROBE_INTERVAL_HOURS`, checks if models are alive. Dead models get version-incremented (e.g., `gpt54` → `gpt55`) up to +1.0. It also probes known missing model names from `_MODEL_REGISTRY`, so a persisted `.models.json` can gain newly added IDs such as Grok, Haiku, GPT Mini/Nano, and Gemini Flash. Sends ntfy on upgrade or new-model discovery.
 
 ## File Structure
 
@@ -105,10 +105,14 @@ Validates: empty query, invalid model, invalid sources, tier restrictions.
 Only base models are probed. Thinking variants auto-derived from `_THINKING_MAP`.
 
 - `sonar` (`experimental`) → alive check only, no version pattern
-- `gpt` (`gpt54`) → gpt55...gpt64 (max 10)
+- `gpt` (`gpt55`) → gpt56...gpt65 (max 10)
+- `gpt-5.4` (`gpt54`) → gpt55...gpt64 (max 10)
 - `sonnet` (`claude46sonnet`) → claude47...claude56 (max 10)
-- `opus` (`claude46opus`) → claude47...claude56 (max 10)
+- `opus` (`claude47opus`) → claude48...claude57 (max 10)
+- `opus-4.6` (`claude46opus`) → claude47...claude56 (max 10)
 - `gemini` (`gemini31pro_high`) → gemini32...gemini41 (max 10)
+- `grok` (`grok4`) → alive check only, no verified version pattern yet
+- `grok-reasoning` (`grok420reasoning`) → grok421reasoning... (max +1.0)
 - `nemotron` (`nv_nemotron_3_super`) → nv_nemotron_4 (max 1)
 
 ## Code Style

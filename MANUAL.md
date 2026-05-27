@@ -31,7 +31,7 @@ A comprehensive guide to installing, configuring, and using pplx-proxy — a sel
 
 pplx-proxy is a FastAPI application that sits between your application and Perplexity.ai's web backend. Instead of using Perplexity's official (paid) API, it authenticates with your existing Pro or Max subscription cookie, translates requests into Perplexity's internal SSE protocol, and exposes the result through industry-standard interfaces.
 
-This gives you access to GPT-5.4, Claude Sonnet 4.6, Claude Opus 4.6, Gemini 3.1 Pro, and other models Perplexity offers — all through the same API format your tools already speak.
+This gives you access to GPT-5.5, Claude Sonnet 4.6, Claude Opus 4.7, Gemini 3.1 Pro, Grok, Nemotron, and other models Perplexity offers — all through the same API format your tools already speak.
 
 Three interfaces are available:
 
@@ -152,11 +152,21 @@ curl -X POST http://localhost:8892/v1/chat/completions \
 |----------|---------------|-----------|-------|
 | `auto` | Perplexity Best | free | Default Perplexity experience |
 | `sonar` | Sonar | pro | Perplexity's experimental model |
-| `gpt` | GPT-5.4 | pro | OpenAI's latest |
+| `gpt` | GPT-5.5 | pro | OpenAI's latest |
+| `gpt-5.4` | GPT-5.4 | pro | Previous GPT flagship |
+| `gpt-mini` | GPT-5 Mini | pro | Smaller GPT model |
+| `gpt-nano` | GPT-5 Nano | pro | Fastest GPT model |
 | `sonnet` | Claude Sonnet 4.6 | pro | Anthropic mid-tier |
 | `gemini` | Gemini 3.1 Pro | pro | Google's flagship |
+| `gemini-flash` | Gemini 3.5 Flash | pro | Faster Gemini model |
+| `grok` | Grok 4 | pro | xAI general model |
+| `grok-reasoning` | Grok 4.20 Reasoning | pro | xAI reasoning model |
+| `grok-non-reasoning` | Grok 4.20 Non Reasoning | pro | xAI non-reasoning model |
 | `nemotron` | Nemotron 3 Super | pro | NVIDIA's model |
-| `opus` | Claude Opus 4.6 | max | Anthropic's most capable |
+| `opus` | Claude Opus 4.7 | max | Anthropic's most capable |
+| `opus-4.6` | Claude Opus 4.6 | max | Previous Opus flagship |
+
+Tracked candidates such as Claude Haiku 4.5, Gemini 3.1 Flash Lite, and Grok 4.20 Multi-Agent are not exposed by default until a working Perplexity web preference is verified by discovery.
 
 ### Endpoint Summary
 
@@ -332,15 +342,15 @@ The reasoning output appears in `choices[0].message.reasoning_content`:
 
 In streaming mode, reasoning chunks arrive before content chunks with `delta.reasoning_content`.
 
-**Note:** Perplexity does not expose the model's internal chain-of-thought. The `reasoning_content` is populated from Perplexity's visible search steps — search queries, URLs found, and plan goals. Gemini and Nemotron have always-on thinking.
+**Note:** Perplexity does not expose the model's internal chain-of-thought. The `reasoning_content` is populated from Perplexity's visible search steps — search queries, URLs found, and plan goals.
 
 | Model | Thinking Variant |
 |-------|-----------------|
-| `gpt` | `gpt54_thinking` |
+| `gpt` | `gpt55_thinking` |
+| `gpt-5.4` | `gpt54_thinking` |
 | `sonnet` | `claude46sonnetthinking` |
-| `opus` | `claude46opusthinking` |
-| `gemini` | Always on |
-| `nemotron` | Always on |
+| `opus` | `claude47opusthinking` |
+| `opus-4.6` | `claude46opusthinking` |
 
 ### Rate Limit Tracking
 

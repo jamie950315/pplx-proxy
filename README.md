@@ -60,13 +60,23 @@ Then open **http://localhost:8892/chat** to test with the debug UI.
 |----------|---------|------|-----------------|
 | `auto` | Perplexity Best | free+ | — |
 | `sonar` | Sonar | pro+ | — |
-| `gpt` | GPT-5.4 | pro+ | `gpt54_thinking` |
+| `gpt` | GPT-5.5 | pro+ | `gpt55_thinking` |
+| `gpt-5.4` | GPT-5.4 | pro+ | `gpt54_thinking` |
+| `gpt-mini` | GPT-5 Mini | pro+ | — |
+| `gpt-nano` | GPT-5 Nano | pro+ | — |
 | `sonnet` | Claude Sonnet 4.6 | pro+ | `claude46sonnetthinking` |
-| `gemini` | Gemini 3.1 Pro | pro+ | always on |
-| `nemotron` | Nemotron 3 Super | pro+ | always on |
-| `opus` | Claude Opus 4.6 | max | `claude46opusthinking` |
+| `gemini` | Gemini 3.1 Pro | pro+ | — |
+| `gemini-flash` | Gemini 3.5 Flash | pro+ | — |
+| `grok` | Grok 4 | pro+ | — |
+| `grok-reasoning` | Grok 4.20 Reasoning | pro+ | — |
+| `grok-non-reasoning` | Grok 4.20 Non Reasoning | pro+ | — |
+| `nemotron` | Nemotron 3 Super | pro+ | — |
+| `opus` | Claude Opus 4.7 | max | `claude47opusthinking` |
+| `opus-4.6` | Claude Opus 4.6 | max | `claude46opusthinking` |
 
 Thinking variants are activated via `thinking: true` or `reasoning_effort` parameter — no separate model names needed.
+
+Tracked candidates such as Claude Haiku 4.5, Gemini 3.1 Flash Lite, and Grok 4.20 Multi-Agent are not exposed by default until a working Perplexity web preference is verified by discovery.
 
 ## API Endpoints
 
@@ -161,7 +171,7 @@ All responses strictly match the [OpenAI Chat Completions API spec](https://plat
 
 ## Auto-Discovery
 
-Every `PROBE_INTERVAL_HOURS` (default 24h), pplx-proxy checks if models are still alive. If one dies, it increments the version number (e.g., `gpt54` → `gpt55` → ... up to +1.0) and auto-upgrades. Thinking variants are auto-derived from `_THINKING_MAP`.
+Every `PROBE_INTERVAL_HOURS` (default 24h), pplx-proxy checks if models are still alive. If one dies, it increments the version number (e.g., `gpt54` → `gpt55` → ... up to +1.0) and auto-upgrades. It also probes known new model names that are missing from a persisted `.models.json`, so newly added families such as Grok, Haiku, Flash, Mini, and Nano can be added instead of only version-bumping old IDs. Thinking variants are auto-derived from `_THINKING_MAP`.
 
 Manual trigger: `POST /admin/discover-models`
 

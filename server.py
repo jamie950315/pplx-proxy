@@ -46,6 +46,7 @@ ENV_FILE=Path(__file__).parent / ".env"
 
 _rate_limit={"remaining_pro": None, "remaining_research": None, "updated_at": 0}
 _rate_limit_lock=None  # initialized in startup
+_rate_limit_refresh_task=None
 
 def _fetch_rate_limit_sync():
     """Fetch rate limits from Perplexity via FlareSolverr. ~10s per call."""
@@ -88,6 +89,22 @@ async def _rate_limit_poll_loop():
             await loop.run_in_executor(None, _fetch_rate_limit_sync)
         except Exception as e:
             log.warning(f"Rate limit poll failed: {e}")
+
+async def _refresh_rate_limit(block: bool=False):
+    """Refresh rate limits with in-flight dedupe."""
+    global _rate_limit_refresh_task
+    if _rate_limit_refresh_task and not _rate_limit_refresh_task.done():
+        if block:
+            await _rate_limit_refresh_task
+        return
+
+    async def _run():
+        loop=asyncio.get_event_loop()
+        await loop.run_in_executor(None, _fetch_rate_limit_sync)
+
+    _rate_limit_refresh_task=asyncio.create_task(_run())
+    if block:
+        await _rate_limit_refresh_task
 
 def _decrement_pro():
     """Decrement local remaining_pro counter after a successful Pro query."""
@@ -286,30 +303,42 @@ DEFAULT_HEADERS={
     "user-agent": USER_AGENT,
 }
 
-# Default model map — overridden by .models.json if it exists
-# All known models (superset)
-_ALL_MODELS={
-    "auto": ("pro", "pplx_pro"),
-    "sonar": ("pro", "experimental"),
-    "gpt": ("pro", "gpt54"),
-    "gemini": ("pro", "gemini31pro_high"),
-    "sonnet": ("pro", "claude46sonnet"),
-    "opus": ("pro", "claude46opus"),
-    "nemotron": ("pro", "nv_nemotron_3_super"),
+# Default model registry — overridden by .models.json if it exists.
+# IDs are stable proxy-facing names. Values use Perplexity web model_preference IDs.
+_MODEL_REGISTRY={
+    "auto": {"entry": ("pro", "pplx_pro"), "tier": "free", "label": "Perplexity Best"},
+    "sonar": {"entry": ("pro", "experimental"), "tier": "pro", "label": "Sonar"},
+    "gpt": {"entry": ("pro", "gpt55"), "tier": "pro", "label": "GPT-5.5", "thinking": ("pro", "gpt55_thinking")},
+    "gpt-5.4": {"entry": ("pro", "gpt54"), "tier": "pro", "label": "GPT-5.4", "thinking": ("pro", "gpt54_thinking")},
+    "gpt-mini": {"entry": ("pro", "gpt5_mini"), "tier": "pro", "label": "GPT-5 Mini"},
+    "gpt-nano": {"entry": ("pro", "gpt5_nano"), "tier": "pro", "label": "GPT-5 Nano"},
+    "gemini": {"entry": ("pro", "gemini31pro_high"), "tier": "pro", "label": "Gemini 3.1 Pro"},
+    "gemini-flash": {"entry": ("pro", "gemini35flash"), "tier": "pro", "label": "Gemini 3.5 Flash"},
+    "gemini-flash-lite": {"entry": ("pro", "gemini31flashlite"), "tier": "pro", "label": "Gemini 3.1 Flash Lite", "enabled": False},
+    "sonnet": {"entry": ("pro", "claude46sonnet"), "tier": "pro", "label": "Claude Sonnet 4.6", "thinking": ("pro", "claude46sonnetthinking")},
+    "haiku": {"entry": ("pro", "claude45haiku"), "tier": "pro", "label": "Claude Haiku 4.5", "enabled": False},
+    "opus": {"entry": ("pro", "claude47opus"), "tier": "max", "label": "Claude Opus 4.7", "thinking": ("pro", "claude47opusthinking")},
+    "opus-4.6": {"entry": ("pro", "claude46opus"), "tier": "max", "label": "Claude Opus 4.6", "thinking": ("pro", "claude46opusthinking")},
+    "grok": {"entry": ("pro", "grok4"), "tier": "pro", "label": "Grok 4"},
+    "grok-reasoning": {"entry": ("pro", "grok420reasoning"), "tier": "pro", "label": "Grok 4.20 Reasoning"},
+    "grok-non-reasoning": {"entry": ("pro", "grok420nonreasoning"), "tier": "pro", "label": "Grok 4.20 Non Reasoning"},
+    "grok-multi": {"entry": ("pro", "grok420multiagent"), "tier": "max", "label": "Grok 4.20 Multi-Agent", "enabled": False},
+    "nemotron": {"entry": ("pro", "nv_nemotron_3_super"), "tier": "pro", "label": "Nemotron 3 Super"},
 }
 
+# All known models (superset)
+_ALL_MODELS={k: v["entry"] for k, v in _MODEL_REGISTRY.items()}
+_MODEL_LABELS={k: v["label"] for k, v in _MODEL_REGISTRY.items()}
+_ENABLED_MODEL_IDS={k for k, v in _MODEL_REGISTRY.items() if v.get("enabled", True)}
+
 # Thinking variants — activated via thinking=true parameter
-_THINKING_MAP={
-    "gpt": ("pro", "gpt54_thinking"),
-    "sonnet": ("pro", "claude46sonnetthinking"),
-    "opus": ("pro", "claude46opusthinking"),
-}
+_THINKING_MAP={k: v["thinking"] for k, v in _MODEL_REGISTRY.items() if "thinking" in v}
 
 # Model availability per account tier
 _TIER_MODELS={
     "free": {"auto"},
-    "pro": {"auto", "sonar", "gpt", "gemini", "sonnet", "nemotron"},
-    "max": {"auto", "sonar", "gpt", "gemini", "sonnet", "nemotron", "opus"},
+    "pro": {k for k, v in _MODEL_REGISTRY.items() if k in _ENABLED_MODEL_IDS and v["tier"] in {"free", "pro"}},
+    "max": set(_ENABLED_MODEL_IDS),
 }
 
 def _default_model_map() -> dict:
@@ -339,8 +368,10 @@ def check_tier(model_name: str) -> str:
     allowed=_TIER_MODELS.get(ACCOUNT_TYPE, _TIER_MODELS["pro"])
     if model_name not in allowed:
         if model_name in _ALL_MODELS:
+            if model_name not in _ENABLED_MODEL_IDS:
+                return f"Model '{model_name}' is tracked as a candidate, but no working Perplexity web preference is verified yet"
             # Model exists but not in this tier
-            needed="max" if model_name in _TIER_MODELS["max"] else "pro"
+            needed=_MODEL_REGISTRY.get(model_name, {}).get("tier", "pro")
             return f"Model '{model_name}' requires {needed} tier (current: {ACCOUNT_TYPE})"
         return ""  # unknown model, let model_map handle it
     return ""
@@ -642,9 +673,16 @@ async def health():
             cache_age=round((time.time() - data.get("timestamp", 0)) / 3600, 1)
         except Exception:
             pass
-    # Trigger background rate limit refresh if stale (never blocks response)
-    if _rate_limit["remaining_pro"] is None or (time.time() - _rate_limit["updated_at"]) > 300:
-        asyncio.get_event_loop().run_in_executor(None, _fetch_rate_limit_sync)
+    # Populate the first rate-limit result before returning; later stale refreshes are backgrounded.
+    if _rate_limit["remaining_pro"] is None:
+        for attempt in range(2):
+            await _refresh_rate_limit(block=True)
+            if _rate_limit["remaining_pro"] is not None:
+                break
+            if attempt == 0:
+                await asyncio.sleep(1)
+    elif (time.time() - _rate_limit["updated_at"]) > 300:
+        await _refresh_rate_limit(block=False)
     rl_age=int(time.time() - _rate_limit["updated_at"]) if _rate_limit["updated_at"] else None
     return {
         "status": "ok", "service": "pplx-proxy", "cookie_age_hours": cache_age,
@@ -889,6 +927,7 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
                        "model": model_name, "status": "completed",
                        "output": [{"type": "message", "id": msg_id, "role": "assistant", "status": "completed",
                                    "content": [{"type": "output_text", "text": full, "annotations": []}]}],
+                       "output_text": full,
                        "usage": {"prompt_tokens": len(query)//4, "completion_tokens": len(full)//4, "total_tokens": (len(query)+len(full))//4}}
             yield f"event: response.completed\ndata: {json.dumps(done_resp)}\n\n"
 
@@ -924,6 +963,7 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
             "output": [{"type": "message", "id": f"msg_{uuid4().hex[:8]}", "role": "assistant",
                         "status": "completed",
                         "content": [{"type": "output_text", "text": full, "annotations": []}]}],
+            "output_text": full,
             "status": "completed",
             "usage": {"prompt_tokens": len(query)//4, "completion_tokens": len(full)//4,
                       "total_tokens": (len(query)+len(full))//4},
@@ -1202,23 +1242,23 @@ _VERSION_PATTERNS=[
     (_re.compile(r"^(claude)(\d)(\d)(opus(?:thinking)?)$"), "{prefix}{ma}{mi}{suffix}"),
     # gemini31pro_high → major=3, minor=1
     (_re.compile(r"^(gemini)(\d)(\d)(pro(?:_high)?)$"), "{prefix}{ma}{mi}{suffix}"),
-    # grok41nonreasoning → major=4, minor=1
-    (_re.compile(r"^(grok)(\d)(\d)((?:non)?reasoning)$"), "{prefix}{ma}{mi}{suffix}"),
+    # grok420reasoning → major=4, minor=20
+    (_re.compile(r"^(grok)(\d)(\d+)((?:non)?reasoning|multiagent)?$"), "{prefix}{ma}{mi}{suffix}"),
     # nv_nemotron_3_super → gen=3
     (_re.compile(r"^(nv_nemotron_)(\d)(_super|_ultra)$"), "{prefix}{ma}{suffix}"),
 ]
 
-def _increment_version(major: int, minor: int) -> tuple:
-    """Increment version: 5.4 → 5.5, 5.9 → 6.0"""
+def _increment_version(major: int, minor: int, minor_width: int=1) -> tuple:
+    """Increment version: 5.4 → 5.5, 5.9 → 6.0, 4.20 → 4.21."""
     minor+=1
-    if minor >= 10:
+    if minor_width == 1 and minor >= 10:
         minor=0
         major+=1
     return major, minor
 
-def _version_distance(orig_ma, orig_mi, cur_ma, cur_mi) -> float:
+def _version_distance(orig_ma, orig_mi, cur_ma, cur_mi, minor_width: int=1) -> float:
     """Calculate version distance: e.g., 5.4 → 7.4 = 2.0"""
-    return (cur_ma - orig_ma) + (cur_mi - orig_mi) / 10.0
+    return (cur_ma - orig_ma) + (cur_mi - orig_mi) / (10.0 ** minor_width)
 
 
 async def probe_model(client, pref) -> bool:
@@ -1232,6 +1272,30 @@ async def probe_model(client, pref) -> bool:
         return False
     except Exception:
         return False
+
+
+async def _discover_known_missing_models(client, report: dict, sleep_seconds: float=2.0) -> bool:
+    """Probe known model names that are absent from a persisted .models.json."""
+    global MODEL_MAP
+    allowed_tiers={"free"} if ACCOUNT_TYPE == "free" else {"free", "pro"} if ACCOUNT_TYPE == "pro" else {"free", "pro", "max"}
+    changed=False
+    report.setdefault("added", {})
+    report.setdefault("unavailable", [])
+    for model_id, (mode, pref) in _ALL_MODELS.items():
+        tier=_MODEL_REGISTRY.get(model_id, {}).get("tier", "pro")
+        if model_id in MODEL_MAP or tier not in allowed_tiers:
+            continue
+        report["probed"]+=1
+        log.info(f"Discovery: probing new model name {model_id} ({pref})...")
+        if await probe_model(client, pref):
+            MODEL_MAP[model_id]=(mode, pref)
+            report["added"][model_id]={"pref": pref, "label": _MODEL_LABELS.get(model_id, model_id)}
+            changed=True
+            log.info(f"Discovery: added new model {model_id} ({pref})")
+        else:
+            report["unavailable"].append({"model": model_id, "pref": pref, "reason": "known candidate did not respond"})
+        await asyncio.sleep(sleep_seconds)
+    return changed
 
 
 @app.post("/admin/discover-models")
@@ -1249,7 +1313,7 @@ async def discover_models(request: Request, _=Depends(verify_api_key)):
 
     base_models=dict(mm)
 
-    report={"alive": [], "upgraded": {}, "dead": [], "probed": 0}
+    report={"alive": [], "upgraded": {}, "added": {}, "unavailable": [], "dead": [], "probed": 0}
 
     for model_id, (mode, pref) in base_models.items():
         # Match against version patterns
@@ -1283,13 +1347,15 @@ async def discover_models(request: Request, _=Depends(verify_api_key)):
         groups=m.groups()
         if len(groups) == 4:
             prefix, orig_ma_s, orig_mi_s, suffix=groups
+            suffix=suffix or ""
             orig_ma, orig_mi=int(orig_ma_s), int(orig_mi_s)
             ma, mi=orig_ma, orig_mi
+            minor_width=len(orig_mi_s)
             found=False
 
             while True:
-                ma, mi=_increment_version(ma, mi)
-                if _version_distance(orig_ma, orig_mi, ma, mi) > 1.0:
+                ma, mi=_increment_version(ma, mi, minor_width)
+                if _version_distance(orig_ma, orig_mi, ma, mi, minor_width) > 1.0:
                     break
                 new_pref=template.format(prefix=prefix, ma=ma, mi=mi, suffix=suffix)
                 report["probed"]+=1
@@ -1327,13 +1393,16 @@ async def discover_models(request: Request, _=Depends(verify_api_key)):
             if not found:
                 report["dead"].append({"model": model_id, "pref": pref, "reason": "no next gen found"})
 
-    if report["upgraded"]:
+    added=await _discover_known_missing_models(client, report)
+
+    if report["upgraded"] or added:
         save_model_map(MODEL_MAP)
 
     return {
         "status": "ok",
         "alive": len(report["alive"]),
         "upgraded": len(report["upgraded"]),
+        "added": len(report["added"]),
         "dead": len(report["dead"]),
         "probed": report["probed"],
         
@@ -1663,11 +1732,17 @@ async def refresh_cookie_endpoint(request: Request, _=Depends(verify_api_key)):
         return {"status": "error", "message": "Send session token as plain text body or JSON {\"session_token\": \"...\"}"}
     cookies={"__Secure-next-auth.session-token": token}
     save_cookies(cookies)
-    global _client
+    global _client, _rate_limit_refresh_task
     if _client:
         _client.reset(cookies)
     else:
         _client=PerplexityClient(cookies)
+    if _rate_limit_refresh_task and not _rate_limit_refresh_task.done():
+        _rate_limit_refresh_task.cancel()
+    _rate_limit_refresh_task=None
+    _rate_limit["remaining_pro"]=None
+    _rate_limit["remaining_research"]=None
+    _rate_limit["updated_at"]=0
     # Reload model map from file if it exists
     global MODEL_MAP
     MODEL_MAP=load_model_map()
@@ -1683,14 +1758,14 @@ async def auto_discover_loop():
         try:
             client=get_client()
             await client.init()
+            report={"added": {}, "unavailable": [], "probed": 0}
+            if await _discover_known_missing_models(client, report):
+                save_model_map(MODEL_MAP)
+                await notify_cookie_expired(f"New models discovered: {', '.join(sorted(report['added']))}")
             mm=get_model_map()
-            thinking_map={}
             base_models={}
             for mid, (mode, pref) in mm.items():
-                if mid.endswith("-thinking"):
-                    thinking_map[mid.replace("-thinking", "")]=mid
-                else:
-                    base_models[mid]=(mode, pref)
+                base_models[mid]=(mode, pref)
             for model_id, (mode, pref) in base_models.items():
                 matched=False
                 for pattern, template in _VERSION_PATTERNS:
@@ -1707,11 +1782,13 @@ async def auto_discover_loop():
                 groups=m.groups()
                 if len(groups)==4:
                     prefix,oma_s,omi_s,suffix=groups
+                    suffix=suffix or ""
                     oma,omi=int(oma_s),int(omi_s)
+                    minor_width=len(omi_s)
                     ma,mi=oma,omi
                     while True:
-                        ma,mi=_increment_version(ma,mi)
-                        if _version_distance(oma,omi,ma,mi)>1.0:
+                        ma,mi=_increment_version(ma,mi,minor_width)
+                        if _version_distance(oma,omi,ma,mi,minor_width)>1.0:
                             break
                         new_pref=template.format(prefix=prefix,ma=ma,mi=mi,suffix=suffix)
                         if await probe_model(client, new_pref):
