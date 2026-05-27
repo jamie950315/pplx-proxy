@@ -1,4 +1,4 @@
-# CLAUDE.md
+# AGENTS.md
 
 ## What This Is
 
@@ -173,7 +173,7 @@ When `remaining_pro <= 0`: all non-auto models auto-downgrade to `auto` (pplx_pr
 Applied in both `/v1/chat/completions` and `/v1/responses` handlers.
 
 ### FlareSolverr Dependency
-Rate limit fetching requires FlareSolverr at `http://localhost:8191`. Uses `__Secure-next-auth.session-token` cookie injection to authenticate. The Perplexity REST endpoints (`/rest/rate-limit/all`) are behind Cloudflare challenge — curl_cffi cannot bypass it, only FlareSolverr (headless browser) works.
+Rate limit fetching requires FlareSolverr at `FLARESOLVERR_URL` (default `http://localhost:8191`). Docker Compose runs it as `http://flaresolverr:8191`. Uses `__Secure-next-auth.session-token` cookie injection to authenticate. The Perplexity REST endpoints (`/rest/rate-limit/all`) are behind Cloudflare challenge — curl_cffi cannot bypass it, only FlareSolverr (headless browser) works. FlareSolverr is optional for chat functionality; without it, `/health` marks `flaresolverr.status` as unavailable and quota fields remain null.
 
 ## Critical: Why Models Say "I Can't Access Real-Time Data"
 

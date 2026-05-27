@@ -1,0 +1,8 @@
+.git
+.env
+.cookie_cache.json
+.models.json
+__pycache__/
+*.pyc
+venv/
+.pytest_cache/

@@ -1,0 +1,32 @@
+services:
+  pplx-proxy:
+    build: .
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /data
+      FLARESOLVERR_URL: http://flaresolverr:8191
+    ports:
+      - "${PPLX_PROXY_PORT:-8892}:8892"
+    volumes:
+      - pplx-data:/data
+    depends_on:
+      flaresolverr:
+        condition: service_healthy
+    restart: unless-stopped
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    environment:
+      LOG_LEVEL: info
+    ports:
+      - "8191:8191"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8191/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  pplx-data:

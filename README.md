@@ -47,6 +47,18 @@ venv/bin/uvicorn server:app --host 0.0.0.0 --port 8892
 
 Then open **http://localhost:8892/chat** to test with the debug UI.
 
+### Docker Compose
+
+For the complete setup, including FlareSolverr for `/health` quota data:
+
+```bash
+cp .env.example .env
+# Edit .env — set PPLX_COOKIE, PPLX_PROXY_API_KEY, and ACCOUNT_TYPE
+docker compose up -d --build
+```
+
+FlareSolverr is optional for chat, streaming, MCP, and Responses API. Without it, `/health` still reports service and cookie age, but `remaining_pro` and `remaining_research` stay `null` and quota-based auto-fallback cannot run.
+
 ## Getting Your Cookie
 
 1. Log in to [perplexity.ai](https://www.perplexity.ai)
@@ -184,9 +196,11 @@ Manual trigger: `POST /admin/discover-models`
 | `ACCOUNT_TYPE` | `pro` | `free`, `pro`, or `max` |
 | `DEFAULT_MODEL` | `gpt` | Default when not specified |
 | `PPLX_PROXY_PORT` | `8892` | Listen port |
+| `DATA_DIR` | `.` | Runtime file directory for `.cookie_cache.json` and `.models.json` |
 | `CUSTOM_PROMPTS` | file | Local prompt block prepended to every LobeHub request |
 | `KEEPALIVE_HOURS` | `6` | Session ping interval |
 | `PROBE_INTERVAL_HOURS` | `24` | Auto-discovery interval |
+| `FLARESOLVERR_URL` | `http://localhost:8191` | FlareSolverr endpoint for `/health` quota data |
 | `NTFY_TOPIC` | `pplx-proxy` | ntfy.sh topic |
 | `NTFY_URL` | `https://ntfy.sh` | ntfy server URL |
 | `NTFY_COOLDOWN_SECS` | `3600` | Min interval between alerts |
@@ -232,9 +246,9 @@ curl -X POST https://your-domain/admin/refresh-cookie \
 
 3. **LobeHub requests always prepend local `CUSTOM_PROMPTS`.** The proxy still detects `role: developer` and system-prompt-like user messages so it can classify the request source, but those upstream prompt blocks are never forwarded. Each LobeHub turn sends `instructions=[CUSTOM_PROMPTS]` plus preserved `history` and current `query`.
 
-4. **Rate limit tracking** uses FlareSolverr (localhost:8191) to poll Perplexity's `/rest/rate-limit/all` endpoint with the session cookie. Requires FlareSolverr running locally. When `remaining_pro` reaches 0, all non-auto models fall back to `auto` (free tier).
+4. **Rate limit tracking** uses FlareSolverr (`FLARESOLVERR_URL`, default `http://localhost:8191`) to poll Perplexity's `/rest/rate-limit/all` endpoint with the session cookie. Requires FlareSolverr for quota fields in `/health`. When `remaining_pro` reaches 0, all non-auto models fall back to `auto` (free tier).
 
-See CLAUDE.md for the full technical breakdown and MANUAL.md troubleshooting section for diagnosis steps.
+See AGENTS.md for the full technical breakdown and MANUAL.md troubleshooting section for diagnosis steps.
 
 ## Disclaimer
 

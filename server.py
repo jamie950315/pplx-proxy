@@ -30,8 +30,10 @@ PPLX_COOKIE=os.getenv("PPLX_COOKIE", "")
 API_KEY=os.getenv("PPLX_PROXY_API_KEY", "")
 PORT=int(os.getenv("PPLX_PROXY_PORT", "8892"))
 LOG_LEVEL=os.getenv("LOG_LEVEL", "INFO")
-COOKIE_FILE=Path(__file__).parent / ".cookie_cache.json"
-MODELS_FILE=Path(__file__).parent / ".models.json"
+DATA_DIR=Path(os.getenv("DATA_DIR", str(Path(__file__).parent)))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+COOKIE_FILE=DATA_DIR / ".cookie_cache.json"
+MODELS_FILE=DATA_DIR / ".models.json"
 DEFAULT_MODEL=os.getenv("DEFAULT_MODEL", "gpt")
 ACCOUNT_TYPE=os.getenv("ACCOUNT_TYPE", "pro").lower()  # free, pro, max
 PUBLIC_URL=os.getenv("PUBLIC_URL", "http://localhost:8892")
@@ -41,10 +43,11 @@ COOKIE_MAX_AGE_HOURS=int(os.getenv("COOKIE_MAX_AGE_HOURS", "168"))
 NTFY_COOLDOWN_SECS=int(os.getenv("NTFY_COOLDOWN_SECS", "3600"))
 USER_AGENT=os.getenv("USER_AGENT", "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
 ENV_FILE=Path(__file__).parent / ".env"
+FLARESOLVERR_URL=os.getenv("FLARESOLVERR_URL", "http://localhost:8191").rstrip("/")
 
 # ─── Rate Limit Tracker ────────────────────────────────────────────────────
 
-_rate_limit={"remaining_pro": None, "remaining_research": None, "updated_at": 0}
+_rate_limit={"remaining_pro": None, "remaining_research": None, "updated_at": 0, "last_error": None}
 _rate_limit_lock=None  # initialized in startup
 _rate_limit_refresh_task=None
 
@@ -56,7 +59,7 @@ def _fetch_rate_limit_sync():
         token=cookies.get("__Secure-next-auth.session-token", "")
         if not token:
             return None
-        req=urllib.request.Request("http://localhost:8191/v1",
+        req=urllib.request.Request(f"{FLARESOLVERR_URL}/v1",
             data=json.dumps({
                 "cmd": "request.get",
                 "url": "https://www.perplexity.ai/rest/rate-limit/all",
@@ -74,9 +77,11 @@ def _fetch_rate_limit_sync():
         _rate_limit["remaining_pro"]=d.get("remaining_pro")
         _rate_limit["remaining_research"]=d.get("remaining_research")
         _rate_limit["updated_at"]=int(time.time())
+        _rate_limit["last_error"]=None
         log.info(f"Rate limit synced: pro={_rate_limit['remaining_pro']}, research={_rate_limit['remaining_research']}")
         return d
     except Exception as e:
+        _rate_limit["last_error"]=str(e)
         log.warning(f"Rate limit fetch failed: {e}")
         return None
 
@@ -684,11 +689,17 @@ async def health():
     elif (time.time() - _rate_limit["updated_at"]) > 300:
         await _refresh_rate_limit(block=False)
     rl_age=int(time.time() - _rate_limit["updated_at"]) if _rate_limit["updated_at"] else None
+    flaresolverr_status="ok" if _rate_limit.get("updated_at") else "unavailable" if _rate_limit.get("last_error") else "unknown"
     return {
         "status": "ok", "service": "pplx-proxy", "cookie_age_hours": cache_age,
         "remaining_pro": _rate_limit.get("remaining_pro"),
         "remaining_research": _rate_limit.get("remaining_research"),
         "rate_limit_age_seconds": rl_age,
+        "flaresolverr": {
+            "status": flaresolverr_status,
+            "url": FLARESOLVERR_URL,
+            "last_error": _rate_limit.get("last_error"),
+        },
     }
 
 
@@ -1743,6 +1754,7 @@ async def refresh_cookie_endpoint(request: Request, _=Depends(verify_api_key)):
     _rate_limit["remaining_pro"]=None
     _rate_limit["remaining_research"]=None
     _rate_limit["updated_at"]=0
+    _rate_limit["last_error"]=None
     # Reload model map from file if it exists
     global MODEL_MAP
     MODEL_MAP=load_model_map()

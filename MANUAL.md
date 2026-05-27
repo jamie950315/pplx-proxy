@@ -127,6 +127,14 @@ source venv/bin/activate
 uvicorn server:app --host 0.0.0.0 --port 8892
 ```
 
+**Docker Compose (includes FlareSolverr for quota data):**
+
+```bash
+cp .env.example .env
+# Edit .env — set PPLX_COOKIE, PPLX_PROXY_API_KEY, and ACCOUNT_TYPE
+docker compose up -d --build
+```
+
 **Quick smoke test:**
 
 ```bash
@@ -360,7 +368,7 @@ pplx-proxy tracks your Perplexity Pro Search quota (`remaining_pro`) and provide
 - On startup, a background task fetches rate limits from Perplexity via FlareSolverr (headless browser, ~10s).
 - Every 1 hour, the counter re-syncs with Perplexity's actual data.
 - After each Pro Search query (copilot mode), the local counter decrements by 1.
-- When `/health` is requested and data is stale (>5min), a background refresh triggers.
+- When `/health` is requested before quota data exists, it waits for a short FlareSolverr sync. Later stale data refreshes in the background.
 
 **Quota notice:** When `remaining_pro` hits a multiple of 5 (160, 155, 150, ..., 5, 0), the response includes:
 ```
@@ -370,7 +378,7 @@ This notice is automatically stripped from message history in subsequent API cal
 
 **Auto-fallback:** When `remaining_pro` reaches 0, all non-auto model requests automatically fall back to `auto` (pplx_pro, free tier). The `auto` model itself is never downgraded.
 
-**Requirements:** FlareSolverr must be running at `http://localhost:8191` for rate limit syncing.
+**Requirements:** FlareSolverr must be running at `FLARESOLVERR_URL` (default `http://localhost:8191`) for rate limit syncing. It is optional for chat, streaming, MCP, and Responses API. Without it, `/health` shows `flaresolverr.status: "unavailable"` and quota fields stay `null`.
 
 ### Responses API (`/v1/responses`)
 
