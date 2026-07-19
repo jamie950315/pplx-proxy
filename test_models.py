@@ -1,4 +1,5 @@
 import asyncio
+import json
 import unittest
 from unittest.mock import patch
 
@@ -11,19 +12,25 @@ class ModelRegistryTests(unittest.TestCase):
             model_map=server._default_model_map()
         for model_id in [
             "gpt",
+            "gpt-5.6-terra",
             "gpt-5.4",
             "gpt-mini",
             "gpt-nano",
             "sonnet",
+            "sonnet-5",
             "gemini",
             "gemini-flash",
             "grok",
+            "grok-4.5",
             "grok-reasoning",
             "grok-non-reasoning",
             "nemotron",
+            "glm-5.2",
+            "kimi-k2.6",
         ]:
             self.assertIn(model_id, model_map)
         self.assertNotIn("opus", model_map)
+        self.assertNotIn("gpt-5.6-sol", model_map)
         self.assertNotIn("grok-multi", model_map)
         self.assertNotIn("haiku", model_map)
         self.assertNotIn("gemini-flash-lite", model_map)
@@ -32,14 +39,17 @@ class ModelRegistryTests(unittest.TestCase):
         with patch.object(server, "ACCOUNT_TYPE", "max"):
             model_map=server._default_model_map()
         self.assertIn("opus", model_map)
-        self.assertEqual(model_map["opus"], ("pro", "claude47opus"))
+        self.assertEqual(model_map["opus"], ("pro", "claude48opus"))
         self.assertIn("opus-4.6", model_map)
+        self.assertIn("gpt-5.6-sol", model_map)
         self.assertNotIn("grok-multi", model_map)
 
     def test_thinking_map_tracks_latest_defaults(self):
-        self.assertEqual(server._THINKING_MAP["gpt"], ("pro", "gpt55_thinking"))
+        self.assertEqual(server._THINKING_MAP["gpt"], ("pro", "gpt56_terra_thinking"))
         self.assertEqual(server._THINKING_MAP["gpt-5.4"], ("pro", "gpt54_thinking"))
-        self.assertEqual(server._THINKING_MAP["opus"], ("pro", "claude47opusthinking"))
+        self.assertEqual(server._THINKING_MAP["sonnet"], ("pro", "claude50sonnetthinking"))
+        self.assertEqual(server._THINKING_MAP["grok"], ("pro", "grok45medium"))
+        self.assertEqual(server._THINKING_MAP["opus"], ("pro", "claude48opusthinking"))
 
     def test_tier_error_uses_model_minimum_tier(self):
         with patch.object(server, "ACCOUNT_TYPE", "free"):
@@ -59,7 +69,7 @@ class DiscoveryTests(unittest.TestCase):
         report={"added": {}, "unavailable": [], "probed": 0}
 
         async def fake_probe(_client, pref):
-            return pref in {"claude46sonnet", "grok4", "claude45haiku"}
+            return pref in {"claude50sonnet", "grok45low", "claude45haiku"}
 
         async def no_sleep(_seconds):
             return None
@@ -71,13 +81,42 @@ class DiscoveryTests(unittest.TestCase):
                  patch.object(server.asyncio, "sleep", new=no_sleep):
                 changed=await server._discover_known_missing_models(object(), report, sleep_seconds=0)
                 self.assertTrue(changed)
-                self.assertEqual(server.MODEL_MAP["sonnet"], ("pro", "claude46sonnet"))
-                self.assertEqual(server.MODEL_MAP["grok"], ("pro", "grok4"))
+                self.assertEqual(server.MODEL_MAP["sonnet"], ("pro", "claude50sonnet"))
+                self.assertEqual(server.MODEL_MAP["grok"], ("pro", "grok45low"))
                 self.assertEqual(server.MODEL_MAP["haiku"], ("pro", "claude45haiku"))
                 self.assertIn("sonnet", report["added"])
                 self.assertIn("grok", report["added"])
                 self.assertIn("haiku", report["added"])
                 self.assertNotIn("opus", server.MODEL_MAP)
+
+        asyncio.run(run())
+
+
+class ResponseParsingTests(unittest.TestCase):
+    def test_ask_text_blocks_produce_answer_deltas(self):
+        class FakeResponse:
+            status_code=200
+
+            async def aiter_lines(self, delimiter):
+                for payload in [
+                    {"blocks": [{"intended_usage": "ask_text", "markdown_block": {"progress": "IN_PROGRESS", "chunks": ["Four"]}}]},
+                    {"blocks": [{"intended_usage": "ask_text", "markdown_block": {"progress": "DONE", "chunks": ["Four"]}}]},
+                ]:
+                    yield f"event: message\r\ndata: {json.dumps(payload)}"
+                yield "event: end_of_stream"
+
+        class FakeSession:
+            async def post(self, *args, **kwargs):
+                return FakeResponse()
+
+        async def run():
+            client=server.PerplexityClient({})
+            client.session=FakeSession()
+            client._initialized=True
+            chunks=[chunk async for chunk in client.search("2+2", "pro", "gpt56_terra")]
+            self.assertEqual(chunks[0]["delta"], "Four")
+            self.assertEqual(chunks[-1]["answer"], "Four")
+            self.assertTrue(chunks[-1]["done"])
 
         asyncio.run(run())
 

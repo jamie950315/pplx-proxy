@@ -312,23 +312,35 @@ DEFAULT_HEADERS={
 # IDs are stable proxy-facing names. Values use Perplexity web model_preference IDs.
 _MODEL_REGISTRY={
     "auto": {"entry": ("pro", "pplx_pro"), "tier": "free", "label": "Perplexity Best"},
-    "sonar": {"entry": ("pro", "experimental"), "tier": "pro", "label": "Sonar"},
-    "gpt": {"entry": ("pro", "gpt55"), "tier": "pro", "label": "GPT-5.5", "thinking": ("pro", "gpt55_thinking")},
+    "sonar": {"entry": ("pro", "experimental"), "tier": "pro", "label": "Sonar 2"},
+    "gpt": {"entry": ("pro", "gpt56_terra"), "tier": "pro", "label": "GPT-5.6 Terra", "thinking": ("pro", "gpt56_terra_thinking")},
+    "gpt-5.6-terra": {"entry": ("pro", "gpt56_terra"), "tier": "pro", "label": "GPT-5.6 Terra", "thinking": ("pro", "gpt56_terra_thinking")},
+    "gpt-5.6-sol": {"entry": ("pro", "gpt56_sol"), "tier": "max", "label": "GPT-5.6 Sol", "thinking": ("pro", "gpt56_sol_thinking")},
+    "gpt-5.5": {"entry": ("pro", "gpt55"), "tier": "pro", "label": "GPT-5.5", "thinking": ("pro", "gpt55_thinking")},
     "gpt-5.4": {"entry": ("pro", "gpt54"), "tier": "pro", "label": "GPT-5.4", "thinking": ("pro", "gpt54_thinking")},
     "gpt-mini": {"entry": ("pro", "gpt5_mini"), "tier": "pro", "label": "GPT-5 Mini"},
     "gpt-nano": {"entry": ("pro", "gpt5_nano"), "tier": "pro", "label": "GPT-5 Nano"},
     "gemini": {"entry": ("pro", "gemini31pro_high"), "tier": "pro", "label": "Gemini 3.1 Pro"},
     "gemini-flash": {"entry": ("pro", "gemini35flash"), "tier": "pro", "label": "Gemini 3.5 Flash"},
     "gemini-flash-lite": {"entry": ("pro", "gemini31flashlite"), "tier": "pro", "label": "Gemini 3.1 Flash Lite", "enabled": False},
-    "sonnet": {"entry": ("pro", "claude46sonnet"), "tier": "pro", "label": "Claude Sonnet 4.6", "thinking": ("pro", "claude46sonnetthinking")},
+    "sonnet": {"entry": ("pro", "claude50sonnet"), "tier": "pro", "label": "Claude Sonnet 5", "thinking": ("pro", "claude50sonnetthinking")},
+    "sonnet-5": {"entry": ("pro", "claude50sonnet"), "tier": "pro", "label": "Claude Sonnet 5", "thinking": ("pro", "claude50sonnetthinking")},
+    "sonnet-4.6": {"entry": ("pro", "claude46sonnet"), "tier": "pro", "label": "Claude Sonnet 4.6", "thinking": ("pro", "claude46sonnetthinking")},
     "haiku": {"entry": ("pro", "claude45haiku"), "tier": "pro", "label": "Claude Haiku 4.5", "enabled": False},
-    "opus": {"entry": ("pro", "claude47opus"), "tier": "max", "label": "Claude Opus 4.7", "thinking": ("pro", "claude47opusthinking")},
+    "opus": {"entry": ("pro", "claude48opus"), "tier": "max", "label": "Claude Opus 4.8", "thinking": ("pro", "claude48opusthinking")},
+    "opus-4.8": {"entry": ("pro", "claude48opus"), "tier": "max", "label": "Claude Opus 4.8", "thinking": ("pro", "claude48opusthinking")},
+    "opus-4.7": {"entry": ("pro", "claude47opus"), "tier": "max", "label": "Claude Opus 4.7", "thinking": ("pro", "claude47opusthinking")},
     "opus-4.6": {"entry": ("pro", "claude46opus"), "tier": "max", "label": "Claude Opus 4.6", "thinking": ("pro", "claude46opusthinking")},
-    "grok": {"entry": ("pro", "grok4"), "tier": "pro", "label": "Grok 4"},
+    "grok": {"entry": ("pro", "grok45low"), "tier": "pro", "label": "Grok 4.5", "thinking": ("pro", "grok45medium")},
+    "grok-4.5": {"entry": ("pro", "grok45low"), "tier": "pro", "label": "Grok 4.5", "thinking": ("pro", "grok45medium")},
+    "grok-4": {"entry": ("pro", "grok4"), "tier": "pro", "label": "Grok 4"},
     "grok-reasoning": {"entry": ("pro", "grok420reasoning"), "tier": "pro", "label": "Grok 4.20 Reasoning"},
     "grok-non-reasoning": {"entry": ("pro", "grok420nonreasoning"), "tier": "pro", "label": "Grok 4.20 Non Reasoning"},
     "grok-multi": {"entry": ("pro", "grok420multiagent"), "tier": "max", "label": "Grok 4.20 Multi-Agent", "enabled": False},
-    "nemotron": {"entry": ("pro", "nv_nemotron_3_super"), "tier": "pro", "label": "Nemotron 3 Super"},
+    "nemotron": {"entry": ("pro", "nv_nemotron_3_ultra"), "tier": "pro", "label": "Nemotron 3 Ultra"},
+    "nemotron-3-super": {"entry": ("pro", "nv_nemotron_3_super"), "tier": "pro", "label": "Nemotron 3 Super"},
+    "glm-5.2": {"entry": ("pro", "glm_5_2"), "tier": "pro", "label": "GLM-5.2"},
+    "kimi-k2.6": {"entry": ("pro", "kimik26instant"), "tier": "pro", "label": "Kimi K2.6", "thinking": ("pro", "kimik26thinking")},
 }
 
 # All known models (superset)
@@ -556,8 +568,6 @@ class PerplexityClient:
                             _seen_thinking.add(url)
                             yield {"thinking": f"Found: [{name}]({url})", "done": False}
 
-                if "markdown" not in usage:
-                    continue
                 mb=block.get("markdown_block", {})
                 if not mb:
                     continue
@@ -1246,15 +1256,15 @@ async def _stream_openai(client, query, mode, model_pref, model_name, cid, creat
 
 # Patterns to extract version from known prefs and generate next versions
 _VERSION_PATTERNS=[
-    # gpt54 → major=5, minor=4
-    (_re.compile(r"^(gpt)(\d)(\d)((?:_thinking)?)$"), "{prefix}{ma}{mi}{suffix}"),
+    # gpt54 / gpt56_terra → major=5, minor=4/6
+    (_re.compile(r"^(gpt)(\d)(\d)((?:_.*)?)$"), "{prefix}{ma}{mi}{suffix}"),
     # claude46sonnet → major=4, minor=6
     (_re.compile(r"^(claude)(\d)(\d)(sonnet(?:thinking)?)$"), "{prefix}{ma}{mi}{suffix}"),
     (_re.compile(r"^(claude)(\d)(\d)(opus(?:thinking)?)$"), "{prefix}{ma}{mi}{suffix}"),
     # gemini31pro_high → major=3, minor=1
     (_re.compile(r"^(gemini)(\d)(\d)(pro(?:_high)?)$"), "{prefix}{ma}{mi}{suffix}"),
-    # grok420reasoning → major=4, minor=20
-    (_re.compile(r"^(grok)(\d)(\d+)((?:non)?reasoning|multiagent)?$"), "{prefix}{ma}{mi}{suffix}"),
+    # grok420reasoning / grok45low → major=4, minor=20/5
+    (_re.compile(r"^(grok)(\d)(\d+)((?:non)?reasoning|multiagent|low|medium)?$"), "{prefix}{ma}{mi}{suffix}"),
     # nv_nemotron_3_super → gen=3
     (_re.compile(r"^(nv_nemotron_)(\d)(_super|_ultra)$"), "{prefix}{ma}{suffix}"),
 ]

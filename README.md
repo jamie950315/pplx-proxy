@@ -87,19 +87,27 @@ FlareSolverr is optional for chat, streaming, MCP, and Responses API. Without it
 | Model ID | Backend | Tier | Thinking Variant |
 |----------|---------|------|-----------------|
 | `auto` | Perplexity Best | free+ | — |
-| `sonar` | Sonar | pro+ | — |
-| `gpt` | GPT-5.5 | pro+ | `gpt55_thinking` |
+| `sonar` | Sonar 2 | pro+ | — |
+| `gpt` / `gpt-5.6-terra` | GPT-5.6 Terra | pro+ | `gpt56_terra_thinking` |
+| `gpt-5.6-sol` | GPT-5.6 Sol | max | `gpt56_sol_thinking` |
+| `gpt-5.5` | GPT-5.5 | pro+ | `gpt55_thinking` |
 | `gpt-5.4` | GPT-5.4 | pro+ | `gpt54_thinking` |
 | `gpt-mini` | GPT-5 Mini | pro+ | — |
 | `gpt-nano` | GPT-5 Nano | pro+ | — |
-| `sonnet` | Claude Sonnet 4.6 | pro+ | `claude46sonnetthinking` |
+| `sonnet` / `sonnet-5` | Claude Sonnet 5 | pro+ | `claude50sonnetthinking` |
+| `sonnet-4.6` | Claude Sonnet 4.6 | pro+ | `claude46sonnetthinking` |
 | `gemini` | Gemini 3.1 Pro | pro+ | — |
 | `gemini-flash` | Gemini 3.5 Flash | pro+ | — |
-| `grok` | Grok 4 | pro+ | — |
+| `grok` / `grok-4.5` | Grok 4.5 | pro+ | `grok45medium` |
+| `grok-4` | Grok 4 | pro+ | — |
 | `grok-reasoning` | Grok 4.20 Reasoning | pro+ | — |
 | `grok-non-reasoning` | Grok 4.20 Non Reasoning | pro+ | — |
-| `nemotron` | Nemotron 3 Super | pro+ | — |
-| `opus` | Claude Opus 4.7 | max | `claude47opusthinking` |
+| `nemotron` | Nemotron 3 Ultra | pro+ | — |
+| `nemotron-3-super` | Nemotron 3 Super | pro+ | — |
+| `glm-5.2` | GLM-5.2 | pro+ | — |
+| `kimi-k2.6` | Kimi K2.6 | pro+ | `kimik26thinking` |
+| `opus` / `opus-4.8` | Claude Opus 4.8 | max | `claude48opusthinking` |
+| `opus-4.7` | Claude Opus 4.7 | max | `claude47opusthinking` |
 | `opus-4.6` | Claude Opus 4.6 | max | `claude46opusthinking` |
 
 Thinking variants are activated via `thinking: true` or `reasoning_effort` parameter — no separate model names needed.

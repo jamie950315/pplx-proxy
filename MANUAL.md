@@ -31,7 +31,7 @@ A comprehensive guide to installing, configuring, and using pplx-proxy — a sel
 
 pplx-proxy is a FastAPI application that sits between your application and Perplexity.ai's web backend. Instead of using Perplexity's official (paid) API, it authenticates with your existing Pro or Max subscription cookie, translates requests into Perplexity's internal SSE protocol, and exposes the result through industry-standard interfaces.
 
-This gives you access to GPT-5.5, Claude Sonnet 4.6, Claude Opus 4.7, Gemini 3.1 Pro, Grok, Nemotron, and other models Perplexity offers — all through the same API format your tools already speak.
+This gives you access to GPT-5.6 Terra, Claude Sonnet 5, Claude Opus 4.8, Gemini 3.1 Pro, Grok 4.5, GLM-5.2, Kimi K2.6, Nemotron, and other models Perplexity offers — all through the same API format your tools already speak.
 
 Three interfaces are available:
 
@@ -174,19 +174,27 @@ curl -X POST http://localhost:8892/v1/chat/completions \
 | Model ID | Backend Model | Min. Tier | Notes |
 |----------|---------------|-----------|-------|
 | `auto` | Perplexity Best | free | Default Perplexity experience |
-| `sonar` | Sonar | pro | Perplexity's experimental model |
-| `gpt` | GPT-5.5 | pro | OpenAI's latest |
+| `sonar` | Sonar 2 | pro | Perplexity's experimental model |
+| `gpt` / `gpt-5.6-terra` | GPT-5.6 Terra | pro | OpenAI's latest |
+| `gpt-5.6-sol` | GPT-5.6 Sol | max | Highest-capability GPT-5.6 variant |
+| `gpt-5.5` | GPT-5.5 | pro | Previous GPT model |
 | `gpt-5.4` | GPT-5.4 | pro | Previous GPT flagship |
 | `gpt-mini` | GPT-5 Mini | pro | Smaller GPT model |
 | `gpt-nano` | GPT-5 Nano | pro | Fastest GPT model |
-| `sonnet` | Claude Sonnet 4.6 | pro | Anthropic mid-tier |
+| `sonnet` / `sonnet-5` | Claude Sonnet 5 | pro | Anthropic's latest Sonnet |
+| `sonnet-4.6` | Claude Sonnet 4.6 | pro | Previous Sonnet version |
 | `gemini` | Gemini 3.1 Pro | pro | Google's flagship |
 | `gemini-flash` | Gemini 3.5 Flash | pro | Faster Gemini model |
-| `grok` | Grok 4 | pro | xAI general model |
+| `grok` / `grok-4.5` | Grok 4.5 | pro | xAI's latest Grok |
+| `grok-4` | Grok 4 | pro | Previous Grok version |
 | `grok-reasoning` | Grok 4.20 Reasoning | pro | xAI reasoning model |
 | `grok-non-reasoning` | Grok 4.20 Non Reasoning | pro | xAI non-reasoning model |
-| `nemotron` | Nemotron 3 Super | pro | NVIDIA's model |
-| `opus` | Claude Opus 4.7 | max | Anthropic's most capable |
+| `nemotron` | Nemotron 3 Ultra | pro | NVIDIA's latest model |
+| `nemotron-3-super` | Nemotron 3 Super | pro | Previous Nemotron version |
+| `glm-5.2` | GLM-5.2 | pro | Z.ai's reasoning model |
+| `kimi-k2.6` | Kimi K2.6 | pro | Moonshot AI model |
+| `opus` / `opus-4.8` | Claude Opus 4.8 | max | Anthropic's most capable |
+| `opus-4.7` | Claude Opus 4.7 | max | Previous Opus version |
 | `opus-4.6` | Claude Opus 4.6 | max | Previous Opus flagship |
 
 Tracked candidates such as Claude Haiku 4.5, Gemini 3.1 Flash Lite, and Grok 4.20 Multi-Agent are not exposed by default until a working Perplexity web preference is verified by discovery.
@@ -327,7 +335,7 @@ Key guarantees:
 
 - The `id` is consistent across all chunks.
 - The first chunk contains `delta.role`.
-- The last content chunk has `finish_reason`.
+- The final chunk has an empty `delta` and `finish_reason: "stop"`.
 - The stream always terminates with `[DONE]`.
 
 ---
@@ -369,10 +377,16 @@ In streaming mode, reasoning chunks arrive before content chunks with `delta.rea
 
 | Model | Thinking Variant |
 |-------|-----------------|
-| `gpt` | `gpt55_thinking` |
+| `gpt` / `gpt-5.6-terra` | `gpt56_terra_thinking` |
+| `gpt-5.6-sol` | `gpt56_sol_thinking` |
+| `gpt-5.5` | `gpt55_thinking` |
 | `gpt-5.4` | `gpt54_thinking` |
-| `sonnet` | `claude46sonnetthinking` |
-| `opus` | `claude47opusthinking` |
+| `sonnet` / `sonnet-5` | `claude50sonnetthinking` |
+| `sonnet-4.6` | `claude46sonnetthinking` |
+| `grok` / `grok-4.5` | `grok45medium` |
+| `kimi-k2.6` | `kimik26thinking` |
+| `opus` / `opus-4.8` | `claude48opusthinking` |
+| `opus-4.7` | `claude47opusthinking` |
 | `opus-4.6` | `claude46opusthinking` |
 
 ### Rate Limit Tracking
