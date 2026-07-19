@@ -25,7 +25,7 @@ All queries use `search_focus: "internet"` — Perplexity's built-in web search 
 - **Response cleaning** — strips Perplexity citations `[1][2]`, `<grok:*>` tags, `<?xml?>` declarations, `<script>` tags
 - **Rate limit tracking** — tracks Pro Search quota, auto-fallback to free model when exhausted, notices at every 5th decrement
 - **Session continuity** — tracks Perplexity `backend_uuid` so follow-up turns skip history/instructions entirely, sending only the new query
-- **Session keep-alive** — periodic pings prevent cookie expiry
+- **Session keep-alive** — validates at startup and every 6 hours, then persists any rotated cookie returned by Perplexity
 - **Push notifications** — [ntfy.sh](https://ntfy.sh) alerts on cookie expiry or model upgrades
 - **Debug chat UI** — `/chat` page with tools toggle, thinking toggle, streaming toggle, and **OpenAI format validator**
 - **Dynamic model management** — add/remove models at runtime via admin API
@@ -246,7 +246,7 @@ sudo systemctl enable --now pplx-proxy
 ## Cookie Lifecycle
 
 ```
-Manual inject → keep-alive every 6h → session stays alive indefinitely
+Manual inject → validate at startup and every 6h → persist returned cookie rotation → restart uses the latest session
                                       ↓ (if Perplexity force-revokes)
                                       ntfy alert → manual re-inject
 ```

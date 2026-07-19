@@ -1,6 +1,8 @@
 import asyncio
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import server
@@ -119,6 +121,70 @@ class ResponseParsingTests(unittest.TestCase):
             self.assertTrue(chunks[-1]["done"])
 
         asyncio.run(run())
+
+
+class SessionKeepaliveTests(unittest.TestCase):
+    def test_keepalive_persists_rotated_cookie_for_restart(self):
+        class FakeResponse:
+            status_code=200
+
+            def json(self):
+                return {"user": {"id": "test-user"}}
+
+        class FakeSession:
+            cookies={
+                "__Secure-next-auth.session-token": "rotated-token",
+                "__cf_bm": "refreshed-browser-cookie",
+            }
+
+            async def get(self, *_args, **_kwargs):
+                return FakeResponse()
+
+        async def run(cache_file):
+            client=server.PerplexityClient({"__Secure-next-auth.session-token": "old-token", "existing": "keep"})
+            client.session=FakeSession()
+            client._initialized=True
+            with patch.object(server, "COOKIE_FILE", cache_file), \
+                 patch.object(server, "get_client", return_value=client):
+                self.assertTrue(await server.session_keepalive_once())
+                self.assertEqual(server.load_cookies()["__Secure-next-auth.session-token"], "rotated-token")
+                self.assertEqual(server.load_cookies()["existing"], "keep")
+                self.assertEqual(server.load_cookies()["__cf_bm"], "refreshed-browser-cookie")
+                cache=json.loads(cache_file.read_text())
+                self.assertIn("last_keepalive", cache)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            asyncio.run(run(Path(temp_dir) / ".cookie_cache.json"))
+
+    def test_unauthenticated_keepalive_does_not_overwrite_cookie(self):
+        class FakeResponse:
+            status_code=200
+
+            def json(self):
+                return {}
+
+        class FakeSession:
+            cookies={"__Secure-next-auth.session-token": "old-token"}
+
+            async def get(self, *_args, **_kwargs):
+                return FakeResponse()
+
+        async def no_notify(_reason):
+            return None
+
+        async def run(cache_file):
+            client=server.PerplexityClient({"__Secure-next-auth.session-token": "old-token"})
+            client.session=FakeSession()
+            client._initialized=True
+            with patch.object(server, "COOKIE_FILE", cache_file), \
+                 patch.object(server, "get_client", return_value=client), \
+                 patch.object(server, "notify_cookie_expired", new=no_notify):
+                server.save_cookies(client.cookies)
+                self.assertFalse(await server.session_keepalive_once())
+                self.assertEqual(server.load_cookies()["__Secure-next-auth.session-token"], "old-token")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            asyncio.run(run(Path(temp_dir) / ".cookie_cache.json"))
 
 
 if __name__ == "__main__":

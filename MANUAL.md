@@ -104,7 +104,7 @@ All settings live in the `.env` file. Here is the full reference:
 | `ACCOUNT_TYPE` | `pro` | Your subscription tier: `free`, `pro`, or `max` |
 | `DEFAULT_MODEL` | `gpt` | Model used when no model is specified in the request |
 | `PPLX_PROXY_PORT` | `8892` | Port to listen on |
-| `KEEPALIVE_HOURS` | `6` | Interval between session keep-alive pings |
+| `KEEPALIVE_HOURS` | `6` | Interval between session validation and cookie-rotation persistence |
 | `PROBE_INTERVAL_HOURS` | `24` | Interval between auto-discovery model checks |
 | `NTFY_TOPIC` | `pplx-proxy` | ntfy.sh push notification topic |
 | `NTFY_URL` | `https://ntfy.sh` | ntfy server URL |

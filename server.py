@@ -432,6 +432,22 @@ class PerplexityClient:
         self._initialized=False
         log.info("Client reset with new cookies")
 
+    def sync_cookies_from_session(self) -> bool:
+        """Copy cookies accepted by the live session into the restart-safe cache."""
+        if not self.session:
+            return False
+        live_cookies=_cookie_dict(getattr(self.session, "cookies", {}))
+        if not live_cookies:
+            return False
+        merged=dict(self.cookies)
+        merged.update(live_cookies)
+        if not merged.get("__Secure-next-auth.session-token"):
+            log.warning("Session cookie sync skipped: no secure session cookie")
+            return False
+        changed=merged != self.cookies
+        self.cookies=merged
+        return changed
+
     async def search(
         self,
         query: str,
@@ -601,9 +617,10 @@ def load_cookies() -> dict:
             data=json.loads(COOKIE_FILE.read_text())
             ts=data.get("timestamp", 0)
             age_h=(time.time() - ts) / 3600
-            if age_h < COOKIE_MAX_AGE_HOURS:
+            cookies=_cookie_dict(data.get("cookies", {}))
+            if age_h < COOKIE_MAX_AGE_HOURS and cookies:
                 log.info(f"Loaded cached cookies (age: {age_h:.1f}h)")
-                return data["cookies"]
+                return cookies
         except Exception as e:
             log.warning(f"Cookie cache read error: {e}")
 
@@ -617,10 +634,23 @@ def load_cookies() -> dict:
 
     return {}
 
-def save_cookies(cookies: dict):
-    """Save cookies to cache file."""
-    data={"cookies": cookies, "timestamp": time.time()}
-    COOKIE_FILE.write_text(json.dumps(data, indent=2))
+def _cookie_dict(cookies) -> dict:
+    """Return a plain string dictionary from a cookie mapping or cookie jar."""
+    try:
+        items=cookies.items()
+    except AttributeError:
+        return {}
+    return {str(name): str(value) for name, value in items if name and value}
+
+def save_cookies(cookies: dict, last_keepalive: float=None):
+    """Atomically save cookies so a restart always reads a complete cache."""
+    now=time.time()
+    data={"cookies": _cookie_dict(cookies), "timestamp": now}
+    if last_keepalive is not None:
+        data["last_keepalive"]=last_keepalive
+    tmp_file=COOKIE_FILE.with_name(f".{COOKIE_FILE.name}.{os.getpid()}.tmp")
+    tmp_file.write_text(json.dumps(data, indent=2))
+    tmp_file.replace(COOKIE_FILE)
     log.info(f"Cookies saved to {COOKIE_FILE}")
 
 
@@ -1704,34 +1734,37 @@ async def notify_cookie_expired(reason: str):
     except Exception as e:
         log.error(f"ntfy send failed: {e}")
 
+async def session_keepalive_once() -> bool:
+    """Validate the session and persist any cookie rotation from Perplexity."""
+    try:
+        client=get_client()
+        await client.init()
+        resp=await client.session.get(PPLX_AUTH_SESSION)
+        if resp.status_code != 200:
+            log.warning(f"Keep-alive failed: HTTP {resp.status_code}")
+            if resp.status_code in (401, 403):
+                await notify_cookie_expired(f"Keep-alive returned HTTP {resp.status_code}")
+            return False
+        data=resp.json() if hasattr(resp, "json") else {}
+        if not isinstance(data, dict) or not data.get("user"):
+            log.warning("Keep-alive failed: unauthenticated session response")
+            await notify_cookie_expired("Keep-alive returned an unauthenticated session response")
+            return False
+        rotated=client.sync_cookies_from_session()
+        save_cookies(client.cookies, last_keepalive=time.time())
+        state="rotated and persisted" if rotated else "validated and persisted"
+        log.info(f"Keep-alive OK: {resp.status_code}, cookie {state}")
+        return True
+    except Exception as e:
+        log.error(f"Keep-alive error: {e}")
+        return False
+
 async def session_keepalive_loop():
-    """Periodically hit Perplexity session endpoint to keep cookie alive."""
+    """Validate on startup, then periodically keep the session alive."""
     log.info(f"Session keep-alive enabled: every {KEEPALIVE_HOURS}h")
     while True:
+        await session_keepalive_once()
         await asyncio.sleep(KEEPALIVE_HOURS * 3600)
-        try:
-            client=get_client()
-            await client.init()
-            resp=await client.session.get(PPLX_AUTH_SESSION)
-            if resp.status_code == 200:
-                data=resp.json() if hasattr(resp, 'json') else {}
-                user=data.get("user", {}).get("email", "unknown") if isinstance(data, dict) else "unknown"
-                log.info(f"Keep-alive OK: {resp.status_code}, user={user}")
-                # Update timestamp in cache
-                if COOKIE_FILE.exists():
-                    try:
-                        cache=json.loads(COOKIE_FILE.read_text())
-                        cache["timestamp"]=time.time()
-                        cache["last_keepalive"]=time.time()
-                        COOKIE_FILE.write_text(json.dumps(cache, indent=2))
-                    except Exception:
-                        pass
-            else:
-                log.warning(f"Keep-alive failed: HTTP {resp.status_code}")
-                if resp.status_code in (401, 403):
-                    await notify_cookie_expired(f"Keep-alive returned HTTP {resp.status_code}")
-        except Exception as e:
-            log.error(f"Keep-alive error: {e}")
 
 
 @app.post("/admin/refresh-cookie")
