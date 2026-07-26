@@ -521,6 +521,7 @@ class PerplexityClient:
         backend_uuid=None
         web_results=[]
         seen_len=0
+        answer_usage=None
         _seen_thinking=set()  # dedup thinking content
 
         async for line in resp.aiter_lines(delimiter=b"\r\n\r\n"):
@@ -584,25 +585,45 @@ class PerplexityClient:
                             _seen_thinking.add(url)
                             yield {"thinking": f"Found: [{name}]({url})", "done": False}
 
-                mb=block.get("markdown_block", {})
-                if not mb:
-                    continue
-                progress=mb.get("progress", "")
-                chunks=mb.get("chunks", [])
-                if not chunks:
-                    continue
-                if progress == "DONE":
-                    # Final: full cumulative text
-                    full_answer="".join(chunks)
-                else:
-                    # Incremental: extract only new text
-                    chunk_text="".join(chunks)
-                    cumulative=full_answer + chunk_text
-                    if len(cumulative) > seen_len:
-                        delta=cumulative[seen_len:]
-                        full_answer=cumulative
-                        seen_len=len(cumulative)
-                        yield {"delta": delta, "answer": full_answer, "backend_uuid": backend_uuid, "web_results": web_results, "done": False}
+            # Perplexity can mirror the same answer through both ask_text and
+            # ask_text_0_markdown. Select one stream so chunks are not duplicated.
+            answer_blocks=[
+                block for block in blocks
+                if block.get("intended_usage", "").startswith("ask_text")
+                and block.get("markdown_block")
+            ]
+            if not answer_blocks:
+                continue
+            answer_block=None
+            if answer_usage:
+                answer_block=next(
+                    (block for block in answer_blocks if block.get("intended_usage") == answer_usage),
+                    None,
+                )
+            if answer_block is None:
+                answer_block=next(
+                    (block for block in answer_blocks if block.get("intended_usage") == "ask_text"),
+                    answer_blocks[0],
+                )
+                answer_usage=answer_block.get("intended_usage")
+
+            mb=answer_block["markdown_block"]
+            progress=mb.get("progress", "")
+            chunks=mb.get("chunks", [])
+            if not chunks:
+                continue
+            if progress == "DONE":
+                # Final: full cumulative text
+                full_answer="".join(chunks)
+            else:
+                # Incremental: extract only new text
+                chunk_text="".join(chunks)
+                cumulative=full_answer + chunk_text
+                if len(cumulative) > seen_len:
+                    delta=cumulative[seen_len:]
+                    full_answer=cumulative
+                    seen_len=len(cumulative)
+                    yield {"delta": delta, "answer": full_answer, "backend_uuid": backend_uuid, "web_results": web_results, "done": False}
 
         yield {"delta": "", "answer": full_answer, "backend_uuid": backend_uuid, "web_results": web_results, "done": True}
 

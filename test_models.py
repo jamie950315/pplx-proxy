@@ -122,6 +122,72 @@ class ResponseParsingTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_mirrored_answer_blocks_do_not_duplicate_deltas(self):
+        class FakeResponse:
+            status_code=200
+
+            async def aiter_lines(self, delimiter):
+                payloads=[
+                    {"blocks": [
+                        {"intended_usage": "ask_text_0_markdown", "markdown_block": {"progress": "IN_PROGRESS", "chunks": ["A"]}},
+                        {"intended_usage": "ask_text", "markdown_block": {"progress": "IN_PROGRESS", "chunks": ["AB"]}},
+                    ]},
+                    {"blocks": [
+                        {"intended_usage": "ask_text_0_markdown", "markdown_block": {"progress": "IN_PROGRESS", "chunks": ["BC"]}},
+                        {"intended_usage": "ask_text", "markdown_block": {"progress": "IN_PROGRESS", "chunks": ["C"]}},
+                    ]},
+                    {"blocks": [
+                        {"intended_usage": "ask_text_0_markdown", "markdown_block": {"progress": "DONE", "chunks": ["ABC"]}},
+                        {"intended_usage": "ask_text", "markdown_block": {"progress": "DONE", "chunks": ["AB", "C"]}},
+                    ]},
+                ]
+                for payload in payloads:
+                    yield f"event: message\r\ndata: {json.dumps(payload)}"
+                yield "event: end_of_stream"
+
+        class FakeSession:
+            async def post(self, *args, **kwargs):
+                return FakeResponse()
+
+        async def run():
+            client=server.PerplexityClient({})
+            client.session=FakeSession()
+            client._initialized=True
+            chunks=[chunk async for chunk in client.search("test", "pro", "gpt56_terra")]
+            deltas=[chunk["delta"] for chunk in chunks if chunk.get("delta")]
+            self.assertEqual(deltas, ["AB", "C"])
+            self.assertEqual(chunks[-1]["answer"], "ABC")
+            self.assertTrue(chunks[-1]["done"])
+
+        asyncio.run(run())
+
+    def test_legacy_markdown_answer_block_still_streams(self):
+        class FakeResponse:
+            status_code=200
+
+            async def aiter_lines(self, delimiter):
+                for payload in [
+                    {"blocks": [{"intended_usage": "ask_text_0_markdown", "markdown_block": {"progress": "IN_PROGRESS", "chunks": ["Legacy"]}}]},
+                    {"blocks": [{"intended_usage": "ask_text_0_markdown", "markdown_block": {"progress": "DONE", "chunks": ["Legacy"]}}]},
+                ]:
+                    yield f"event: message\r\ndata: {json.dumps(payload)}"
+                yield "event: end_of_stream"
+
+        class FakeSession:
+            async def post(self, *args, **kwargs):
+                return FakeResponse()
+
+        async def run():
+            client=server.PerplexityClient({})
+            client.session=FakeSession()
+            client._initialized=True
+            chunks=[chunk async for chunk in client.search("test", "pro", "gpt56_terra")]
+            self.assertEqual(chunks[0]["delta"], "Legacy")
+            self.assertEqual(chunks[-1]["answer"], "Legacy")
+            self.assertTrue(chunks[-1]["done"])
+
+        asyncio.run(run())
+
 
 class SessionKeepaliveTests(unittest.TestCase):
     def test_keepalive_persists_rotated_cookie_for_restart(self):
