@@ -1822,7 +1822,13 @@ async def refresh_cookie_endpoint(request: Request, _=Depends(verify_api_key)):
     # Reload model map from file if it exists
     global MODEL_MAP
     MODEL_MAP=load_model_map()
-    return {"status": "ok", "message": "Cookie updated and client reset", "models_loaded": len(MODEL_MAP)}
+    validated=await session_keepalive_once()
+    if not validated:
+        raise HTTPException(
+            status_code=401,
+            detail="Unable to validate the submitted Perplexity session token",
+        )
+    return {"status": "ok", "message": "Cookie updated and validated", "models_loaded": len(MODEL_MAP)}
 
 
 async def auto_discover_loop():

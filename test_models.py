@@ -253,5 +253,50 @@ class SessionKeepaliveTests(unittest.TestCase):
             asyncio.run(run(Path(temp_dir) / ".cookie_cache.json"))
 
 
+class RefreshCookieEndpointTests(unittest.TestCase):
+    class JsonRequest:
+        headers={"content-type": "application/json"}
+
+        async def json(self):
+            return {"session_token": "candidate-token"}
+
+        async def body(self):
+            return b""
+
+    def test_refresh_cookie_rejects_token_that_does_not_validate(self):
+        async def rejected():
+            return False
+
+        async def run(cache_file):
+            with patch.object(server, "COOKIE_FILE", cache_file), \
+                 patch.object(server, "_client", None), \
+                 patch.object(server, "session_keepalive_once", new=rejected):
+                with self.assertRaises(server.HTTPException) as context:
+                    await server.refresh_cookie_endpoint(self.JsonRequest())
+                self.assertEqual(context.exception.status_code, 401)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            asyncio.run(run(Path(temp_dir) / ".cookie_cache.json"))
+
+    def test_refresh_cookie_reports_success_only_after_validation(self):
+        validation_calls=[]
+
+        async def accepted():
+            validation_calls.append(True)
+            return True
+
+        async def run(cache_file):
+            with patch.object(server, "COOKIE_FILE", cache_file), \
+                 patch.object(server, "_client", None), \
+                 patch.object(server, "session_keepalive_once", new=accepted):
+                response=await server.refresh_cookie_endpoint(self.JsonRequest())
+                self.assertEqual(response["status"], "ok")
+                self.assertIn("validated", response["message"])
+                self.assertEqual(validation_calls, [True])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            asyncio.run(run(Path(temp_dir) / ".cookie_cache.json"))
+
+
 if __name__ == "__main__":
     unittest.main()
