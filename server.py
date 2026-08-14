@@ -50,6 +50,7 @@ _MODEL_DISPLAY_ALIASES={
     "pplx_pro": {"pplx_pro", "turbo"},
 }
 _model_preflight_cache={}
+_configured_session_state={"status": "unchecked", "source": None, "message": None}
 
 def _model_matches_preference(requested_model: str, actual_model: str) -> bool:
     """Return whether Perplexity used the requested model or its known alias."""
@@ -672,9 +673,8 @@ class PerplexityClient:
 
 # ─── Cookie Management ──────────────────────────���──────────────────────────
 
-def load_cookies() -> dict:
-    """Load cookies from cache file, .env, or return empty."""
-    # 1. try cache file (freshest)
+def _load_cached_cookies() -> dict:
+    """Load a fresh cookie cache without falling back to configuration."""
     if COOKIE_FILE.exists():
         try:
             data=json.loads(COOKIE_FILE.read_text())
@@ -686,16 +686,27 @@ def load_cookies() -> dict:
                 return cookies
         except Exception as e:
             log.warning(f"Cookie cache read error: {e}")
-
-    # 2. try env var
-    if PPLX_COOKIE:
-        try:
-            cookies=json.loads(PPLX_COOKIE)
-            return cookies
-        except json.JSONDecodeError:
-            return {"__Secure-next-auth.session-token": PPLX_COOKIE}
-
     return {}
+
+
+def _configured_cookies() -> dict:
+    """Parse the cookie value configured in .env."""
+    if not PPLX_COOKIE:
+        return {}
+    try:
+        cookies=json.loads(PPLX_COOKIE)
+        return _cookie_dict(cookies) if isinstance(cookies, dict) else {}
+    except json.JSONDecodeError:
+        return {"__Secure-next-auth.session-token": PPLX_COOKIE}
+
+
+def load_cookies() -> dict:
+    """Load cookies from cache file, .env, or return empty."""
+    cached=_load_cached_cookies()
+    if cached:
+        return cached
+
+    return _configured_cookies()
 
 def _cookie_dict(cookies) -> dict:
     """Return a plain string dictionary from a cookie mapping or cookie jar."""
@@ -729,6 +740,72 @@ def get_client() -> PerplexityClient:
             raise RuntimeError("No cookies available. Set PPLX_COOKIE in .env or run cookie refresh.")
         _client=PerplexityClient(cookies)
     return _client
+
+
+async def _validate_session_cookies(cookies: dict) -> Optional[dict]:
+    """Return validated, rotated cookies without changing the active session."""
+    cookies=_cookie_dict(cookies)
+    if not cookies.get("__Secure-next-auth.session-token"):
+        return None
+    session=cffi_requests.AsyncSession(
+        headers=DEFAULT_HEADERS.copy(),
+        cookies=cookies,
+        impersonate=PPLX_IMPERSONATE,
+    )
+    try:
+        resp=await session.get(PPLX_AUTH_SESSION)
+        if resp.status_code != 200:
+            return None
+        data=resp.json() if hasattr(resp, "json") else {}
+        if not isinstance(data, dict) or not data.get("user"):
+            return None
+        validated=dict(cookies)
+        validated.update(_cookie_dict(getattr(session, "cookies", {})))
+        return validated
+    except Exception as e:
+        log.warning(f"Configured session validation failed: {type(e).__name__}")
+        return None
+    finally:
+        await session.close()
+
+
+async def reconcile_configured_session() -> bool:
+    """Adopt a changed .env session only after it validates successfully."""
+    global _client
+    configured=_configured_cookies()
+    cached=_load_cached_cookies()
+    configured_token=configured.get("__Secure-next-auth.session-token", "")
+    cached_token=cached.get("__Secure-next-auth.session-token", "")
+
+    if not configured_token:
+        _configured_session_state.update({
+            "status": "missing",
+            "source": "cache" if cached_token else None,
+            "message": "No session is configured in .env",
+        })
+        return bool(cached_token)
+
+    if configured_token == cached_token:
+        _configured_session_state.update({"status": "active", "source": "cache", "message": None})
+        return True
+
+    validated=await _validate_session_cookies(configured)
+    if not validated:
+        _configured_session_state.update({
+            "status": "invalid",
+            "source": "cache" if cached_token else None,
+            "message": "Configured .env session is not authenticated",
+        })
+        log.warning("Configured .env session is invalid; retaining the existing cookie cache")
+        return False
+
+    save_cookies(validated, last_keepalive=time.time())
+    if _client:
+        _client.reset(validated)
+    _model_preflight_cache.clear()
+    _configured_session_state.update({"status": "active", "source": "env", "message": None})
+    log.info("Validated and activated the changed .env session")
+    return True
 
 
 # ─── Auth middleware ───────────────────────────────────────────────────────
@@ -795,6 +872,7 @@ async def health():
     flaresolverr_status="ok" if _rate_limit.get("updated_at") else "unavailable" if _rate_limit.get("last_error") else "unknown"
     return {
         "status": "ok", "service": "pplx-proxy", "cookie_age_hours": cache_age,
+        "configured_session": dict(_configured_session_state),
         "remaining_pro": _rate_limit.get("remaining_pro"),
         "remaining_research": _rate_limit.get("remaining_research"),
         "rate_limit_age_seconds": rl_age,
@@ -1676,6 +1754,7 @@ if HAS_MCP:
     async def _combined_lifespan(a):
         async with mcp_http_app.router.lifespan_context(mcp_http_app):
             log.info("MCP streamable HTTP lifespan started")
+            await reconcile_configured_session()
             asyncio.create_task(session_keepalive_loop())
             asyncio.create_task(auto_discover_loop())
             asyncio.create_task(_rate_limit_poll_loop())
@@ -1863,12 +1942,23 @@ async def refresh_cookie_endpoint(request: Request, _=Depends(verify_api_key)):
     if not token:
         return {"status": "error", "message": "Send session token as plain text body or JSON {\"session_token\": \"...\"}"}
     cookies={"__Secure-next-auth.session-token": token}
-    save_cookies(cookies)
+    validated_cookies=await _validate_session_cookies(cookies)
+    if not validated_cookies:
+        _configured_session_state.update({
+            "status": "invalid",
+            "source": "cache" if _load_cached_cookies() else None,
+            "message": "Submitted session token is not authenticated",
+        })
+        raise HTTPException(
+            status_code=401,
+            detail="Unable to validate the submitted Perplexity session token",
+        )
+    save_cookies(validated_cookies, last_keepalive=time.time())
     global _client, _rate_limit_refresh_task, _model_preflight_cache
     if _client:
-        _client.reset(cookies)
+        _client.reset(validated_cookies)
     else:
-        _client=PerplexityClient(cookies)
+        _client=PerplexityClient(validated_cookies)
     if _rate_limit_refresh_task and not _rate_limit_refresh_task.done():
         _rate_limit_refresh_task.cancel()
     _rate_limit_refresh_task=None
@@ -1880,12 +1970,7 @@ async def refresh_cookie_endpoint(request: Request, _=Depends(verify_api_key)):
     # Reload model map from file if it exists
     global MODEL_MAP
     MODEL_MAP=load_model_map()
-    validated=await session_keepalive_once()
-    if not validated:
-        raise HTTPException(
-            status_code=401,
-            detail="Unable to validate the submitted Perplexity session token",
-        )
+    _configured_session_state.update({"status": "active", "source": "admin", "message": None})
     return {"status": "ok", "message": "Cookie updated and validated", "models_loaded": len(MODEL_MAP)}
 
 

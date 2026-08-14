@@ -370,16 +370,21 @@ class RefreshCookieEndpointTests(unittest.TestCase):
             return b""
 
     def test_refresh_cookie_rejects_token_that_does_not_validate(self):
-        async def rejected():
-            return False
+        async def rejected(_cookies):
+            return None
 
         async def run(cache_file):
+            existing={"__Secure-next-auth.session-token": "known-good-token"}
+            client=server.PerplexityClient(existing)
             with patch.object(server, "COOKIE_FILE", cache_file), \
-                 patch.object(server, "_client", None), \
-                 patch.object(server, "session_keepalive_once", new=rejected):
+                 patch.object(server, "_client", client), \
+                 patch.object(server, "_validate_session_cookies", new=rejected):
+                server.save_cookies(existing)
                 with self.assertRaises(server.HTTPException) as context:
                     await server.refresh_cookie_endpoint(self.JsonRequest())
                 self.assertEqual(context.exception.status_code, 401)
+                self.assertEqual(server.load_cookies()["__Secure-next-auth.session-token"], "known-good-token")
+                self.assertIs(server._client, client)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             asyncio.run(run(Path(temp_dir) / ".cookie_cache.json"))
@@ -387,34 +392,97 @@ class RefreshCookieEndpointTests(unittest.TestCase):
     def test_refresh_cookie_reports_success_only_after_validation(self):
         validation_calls=[]
 
-        async def accepted():
-            validation_calls.append(True)
-            return True
+        async def accepted(cookies):
+            validation_calls.append(cookies["__Secure-next-auth.session-token"])
+            return {"__Secure-next-auth.session-token": "validated-token"}
 
         async def run(cache_file):
             with patch.object(server, "COOKIE_FILE", cache_file), \
                  patch.object(server, "_client", None), \
-                 patch.object(server, "session_keepalive_once", new=accepted):
+                 patch.object(server, "_validate_session_cookies", new=accepted):
                 response=await server.refresh_cookie_endpoint(self.JsonRequest())
                 self.assertEqual(response["status"], "ok")
                 self.assertIn("validated", response["message"])
-                self.assertEqual(validation_calls, [True])
+                self.assertEqual(validation_calls, ["candidate-token"])
+                self.assertEqual(server.load_cookies()["__Secure-next-auth.session-token"], "validated-token")
 
         with tempfile.TemporaryDirectory() as temp_dir:
             asyncio.run(run(Path(temp_dir) / ".cookie_cache.json"))
 
     def test_refresh_cookie_clears_model_preflight_cache(self):
-        async def accepted():
-            return True
+        async def accepted(cookies):
+            return cookies
 
         async def run(cache_file):
             preflight_cache={"claude50sonnet": (0.0, False)}
             with patch.object(server, "COOKIE_FILE", cache_file), \
                  patch.object(server, "_client", None), \
                  patch.object(server, "_model_preflight_cache", preflight_cache), \
-                 patch.object(server, "session_keepalive_once", new=accepted):
+                 patch.object(server, "_validate_session_cookies", new=accepted):
                 await server.refresh_cookie_endpoint(self.JsonRequest())
                 self.assertEqual(preflight_cache, {})
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            asyncio.run(run(Path(temp_dir) / ".cookie_cache.json"))
+
+
+class ConfiguredCookieTests(unittest.TestCase):
+    def test_reconcile_replaces_cache_when_configured_cookie_is_valid(self):
+        configured={"__Secure-next-auth.session-token": "new-token"}
+
+        async def accepted(cookies):
+            self.assertEqual(cookies, configured)
+            return {"__Secure-next-auth.session-token": "rotated-new-token"}
+
+        async def run(cache_file):
+            state={"status": "unchecked", "source": None, "message": None}
+            with patch.object(server, "COOKIE_FILE", cache_file), \
+                 patch.object(server, "PPLX_COOKIE", json.dumps(configured)), \
+                 patch.object(server, "_client", None), \
+                 patch.object(server, "_configured_session_state", state), \
+                 patch.object(server, "_validate_session_cookies", new=accepted):
+                server.save_cookies({"__Secure-next-auth.session-token": "old-token"})
+                self.assertTrue(await server.reconcile_configured_session())
+                self.assertEqual(server.load_cookies()["__Secure-next-auth.session-token"], "rotated-new-token")
+                self.assertEqual(state["status"], "active")
+                self.assertEqual(state["source"], "env")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            asyncio.run(run(Path(temp_dir) / ".cookie_cache.json"))
+
+    def test_reconcile_keeps_cache_when_configured_cookie_is_invalid(self):
+        configured={"__Secure-next-auth.session-token": "invalid-token"}
+
+        async def rejected(_cookies):
+            return None
+
+        async def run(cache_file):
+            state={"status": "unchecked", "source": None, "message": None}
+            with patch.object(server, "COOKIE_FILE", cache_file), \
+                 patch.object(server, "PPLX_COOKIE", json.dumps(configured)), \
+                 patch.object(server, "_client", None), \
+                 patch.object(server, "_configured_session_state", state), \
+                 patch.object(server, "_validate_session_cookies", new=rejected):
+                server.save_cookies({"__Secure-next-auth.session-token": "known-good-token"})
+                self.assertFalse(await server.reconcile_configured_session())
+                self.assertEqual(server.load_cookies()["__Secure-next-auth.session-token"], "known-good-token")
+                self.assertEqual(state["status"], "invalid")
+                self.assertEqual(state["source"], "cache")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            asyncio.run(run(Path(temp_dir) / ".cookie_cache.json"))
+
+
+class HealthTests(unittest.TestCase):
+    def test_health_reports_configured_session_state(self):
+        async def run(cache_file):
+            state={"status": "invalid", "source": "cache", "message": "Configured session is invalid"}
+            rate_limit={"remaining_pro": 10, "remaining_research": 2, "updated_at": server.time.time(), "last_error": None}
+            with patch.object(server, "COOKIE_FILE", cache_file), \
+                 patch.object(server, "_configured_session_state", state), \
+                 patch.object(server, "_rate_limit", rate_limit):
+                response=await server.health()
+                self.assertEqual(response["configured_session"], state)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             asyncio.run(run(Path(temp_dir) / ".cookie_cache.json"))
