@@ -557,19 +557,53 @@ class PerplexityClient:
             except json.JSONDecodeError:
                 continue
 
+            blocks=chunk.get("blocks", [])
             display_model=chunk.get("display_model")
             if isinstance(display_model, str) and display_model:
-                actual_model=display_model
-                if not _model_matches_preference(model_pref, actual_model):
-                    message=f"Perplexity substituted requested model '{model_pref}' with '{actual_model}'"
-                    log.warning(message)
-                    yield {
-                        "error": message,
-                        "requested_model": model_pref,
-                        "actual_model": actual_model,
-                        "model_fallback": True,
-                    }
-                    return
+                if _model_matches_preference(model_pref, display_model):
+                    actual_model=display_model
+                else:
+                    switch_answer_blocks=[
+                        block for block in blocks
+                        if block.get("intended_usage", "").startswith("ask_text")
+                        and block.get("markdown_block")
+                    ]
+                    switch_answer_block=next(
+                        (block for block in switch_answer_blocks if block.get("intended_usage") == answer_usage),
+                        switch_answer_blocks[0] if switch_answer_blocks else None,
+                    )
+                    switch_chars=0
+                    if switch_answer_block:
+                        switch_mb=switch_answer_block["markdown_block"]
+                        switch_text="".join(switch_mb.get("chunks", []))
+                        if switch_mb.get("progress") == "DONE":
+                            switch_chars=max(0, len(switch_text) - seen_len)
+                        else:
+                            switch_chars=len(switch_text)
+                    selected_model=chunk.get("user_selected_model", "")
+                    minor_auxiliary_tail=(
+                        _model_matches_preference(model_pref, selected_model)
+                        and seen_len > 0
+                        and (
+                            switch_chars == 0
+                            or (switch_chars <= 16 and switch_chars / seen_len <= 0.05)
+                        )
+                    )
+                    if minor_auxiliary_tail:
+                        log.info(
+                            f"Perplexity used auxiliary model '{display_model}' for a "
+                            f"{switch_chars}-character tail after '{actual_model}' produced {seen_len} characters"
+                        )
+                    else:
+                        message=f"Perplexity substituted requested model '{model_pref}' with '{display_model}'"
+                        log.warning(message)
+                        yield {
+                            "error": message,
+                            "requested_model": model_pref,
+                            "actual_model": display_model,
+                            "model_fallback": True,
+                        }
+                        return
 
             if "backend_uuid" in chunk:
                 backend_uuid=chunk["backend_uuid"]
@@ -577,7 +611,6 @@ class PerplexityClient:
                 web_results=chunk["web_results"]
 
             # Extract thinking content from search/plan blocks
-            blocks=chunk.get("blocks", [])
             for block in blocks:
                 usage=block.get("intended_usage", "")
 
@@ -1460,7 +1493,8 @@ def _version_distance(orig_ma, orig_mi, cur_ma, cur_mi, minor_width: int=1) -> f
 async def probe_model(client, pref) -> bool:
     """Test if a model_preference is valid."""
     try:
-        async for chunk in client.search("2+2=?", "pro", pref, ["web"], "en-US"):
+        query="Explain one concrete tradeoff between optimistic and pessimistic database locking in 80 to 120 words."
+        async for chunk in client.search(query, "pro", pref, ["web"], "en-US"):
             if chunk.get("error"):
                 return False
             if chunk.get("done"):
@@ -1861,9 +1895,20 @@ async def get_models_admin(_=Depends(verify_api_key)):
 
 KEEPALIVE_HOURS=int(os.getenv("KEEPALIVE_HOURS", "6"))
 PROBE_INTERVAL_HOURS=int(os.getenv("PROBE_INTERVAL_HOURS", "24"))
-NTFY_TOPIC=os.getenv("NTFY_TOPIC", "pplx-proxy")
+
+def _normalize_ntfy_topic(value: str) -> str:
+    """Disable the public, shared default topic instead of leaking alerts across instances."""
+    topic=str(value or "").strip()
+    return "" if topic == "pplx-proxy" else topic
+
+
+_NTFY_TOPIC_CONFIG=os.getenv("NTFY_TOPIC", "")
+NTFY_TOPIC=_normalize_ntfy_topic(_NTFY_TOPIC_CONFIG)
 NTFY_URL=os.getenv("NTFY_URL", "https://ntfy.sh")
 _last_ntfy_ts=0.0
+
+if _NTFY_TOPIC_CONFIG.strip() and not NTFY_TOPIC:
+    log.warning("The shared public NTFY_TOPIC is disabled; configure a unique, unguessable topic")
 
 async def notify_cookie_expired(reason: str):
     """Send push notification via ntfy.sh when cookie needs manual update."""

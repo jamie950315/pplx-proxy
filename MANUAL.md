@@ -106,7 +106,7 @@ All settings live in the `.env` file. Here is the full reference:
 | `PPLX_PROXY_PORT` | `8892` | Port to listen on |
 | `KEEPALIVE_HOURS` | `6` | Interval between session validation and cookie-rotation persistence |
 | `PROBE_INTERVAL_HOURS` | `24` | Interval between auto-discovery model checks |
-| `NTFY_TOPIC` | `pplx-proxy` | ntfy.sh push notification topic |
+| `NTFY_TOPIC` | disabled | Unique, unguessable ntfy.sh topic; the shared public `pplx-proxy` name is rejected |
 | `NTFY_URL` | `https://ntfy.sh` | ntfy server URL |
 | `NTFY_COOLDOWN_SECS` | `3600` | Minimum interval between push notifications |
 | `PUBLIC_URL` | `http://localhost:8892` | Public URL shown in ntfy messages and used for MCP host validation |

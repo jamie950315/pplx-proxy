@@ -221,8 +221,70 @@ class ResponseParsingTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_small_auxiliary_tail_does_not_discard_selected_model_answer(self):
+        selected_answer="The selected model produced the complete substantive answer with enough detail to identify it as the primary generator"
+
+        class FakeResponse:
+            status_code=200
+
+            async def aiter_lines(self, delimiter):
+                for payload in [
+                    {
+                        "display_model": "claude50sonnet",
+                        "user_selected_model": "claude50sonnet",
+                        "blocks": [{"intended_usage": "ask_text", "markdown_block": {"progress": "IN_PROGRESS", "chunks": [selected_answer]}}],
+                    },
+                    {
+                        "display_model": "gpt5_nano",
+                        "user_selected_model": "claude50sonnet",
+                        "blocks": [{"intended_usage": "ask_text", "markdown_block": {"progress": "IN_PROGRESS", "chunks": ["."]}}],
+                    },
+                    {
+                        "display_model": "gpt5_nano",
+                        "user_selected_model": "claude50sonnet",
+                        "blocks": [{"intended_usage": "ask_text", "markdown_block": {"progress": "DONE", "chunks": [selected_answer + "."]}}],
+                    },
+                ]:
+                    yield f"event: message\r\ndata: {json.dumps(payload)}"
+                yield "event: end_of_stream"
+
+        class FakeSession:
+            async def post(self, *args, **kwargs):
+                return FakeResponse()
+
+        async def run():
+            client=server.PerplexityClient({})
+            client.session=FakeSession()
+            client._initialized=True
+            chunks=[chunk async for chunk in client.search("test", "pro", "claude50sonnet")]
+            self.assertEqual(chunks[-1]["answer"], selected_answer + ".")
+            self.assertEqual(chunks[-1]["actual_model"], "claude50sonnet")
+            self.assertFalse(chunks[-1]["model_fallback"])
+
+        asyncio.run(run())
+
 
 class ModelProbeTests(unittest.TestCase):
+    def test_probe_uses_representative_prompt_instead_of_trivial_router_prompt(self):
+        class ComplexitySensitiveClient:
+            async def search(self, query, _mode, pref, *_args, **_kwargs):
+                if "2+2" in query:
+                    yield {
+                        "answer": "4",
+                        "actual_model": "gpt5_nano",
+                        "model_fallback": True,
+                        "done": True,
+                    }
+                else:
+                    yield {
+                        "answer": "A substantive answer from the selected model.",
+                        "actual_model": pref,
+                        "model_fallback": False,
+                        "done": True,
+                    }
+
+        self.assertTrue(asyncio.run(server.probe_model(ComplexitySensitiveClient(), "gemini31pro_high")))
+
     def test_probe_model_rejects_provider_substitution(self):
         class FallbackClient:
             async def search(self, *_args, **_kwargs):
@@ -296,6 +358,14 @@ class ExplicitModelAvailabilityTests(unittest.TestCase):
 
 
 class SessionKeepaliveTests(unittest.TestCase):
+    def test_public_default_ntfy_topic_is_disabled(self):
+        self.assertEqual(server._normalize_ntfy_topic("pplx-proxy"), "")
+        self.assertEqual(server._normalize_ntfy_topic(""), "")
+        self.assertEqual(
+            server._normalize_ntfy_topic("pplx-proxy-private-a1b2c3d4"),
+            "pplx-proxy-private-a1b2c3d4",
+        )
+
     def test_keepalive_persists_rotated_cookie_for_restart(self):
         class FakeResponse:
             status_code=200
