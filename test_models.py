@@ -358,6 +358,10 @@ class ExplicitModelAvailabilityTests(unittest.TestCase):
 
 
 class SessionKeepaliveTests(unittest.TestCase):
+    def test_invalid_ntfy_topic_format_is_disabled(self):
+        self.assertEqual(server._normalize_ntfy_topic("x" * 65), "")
+        self.assertEqual(server._normalize_ntfy_topic("topic/with/slashes"), "")
+
     def test_public_default_ntfy_topic_is_disabled(self):
         self.assertEqual(server._normalize_ntfy_topic("pplx-proxy"), "")
         self.assertEqual(server._normalize_ntfy_topic(""), "")

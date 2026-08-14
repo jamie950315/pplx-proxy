@@ -1897,9 +1897,13 @@ KEEPALIVE_HOURS=int(os.getenv("KEEPALIVE_HOURS", "6"))
 PROBE_INTERVAL_HOURS=int(os.getenv("PROBE_INTERVAL_HOURS", "24"))
 
 def _normalize_ntfy_topic(value: str) -> str:
-    """Disable the public, shared default topic instead of leaking alerts across instances."""
+    """Accept only private topic names that conform to ntfy's documented format."""
     topic=str(value or "").strip()
-    return "" if topic == "pplx-proxy" else topic
+    if not topic or topic == "pplx-proxy":
+        return ""
+    if len(topic) > 64 or not re.fullmatch(r"[-_A-Za-z0-9]+", topic):
+        return ""
+    return topic
 
 
 _NTFY_TOPIC_CONFIG=os.getenv("NTFY_TOPIC", "")
@@ -1908,7 +1912,7 @@ NTFY_URL=os.getenv("NTFY_URL", "https://ntfy.sh")
 _last_ntfy_ts=0.0
 
 if _NTFY_TOPIC_CONFIG.strip() and not NTFY_TOPIC:
-    log.warning("The shared public NTFY_TOPIC is disabled; configure a unique, unguessable topic")
+    log.warning("Invalid or shared public NTFY_TOPIC is disabled; configure a unique topic of at most 64 characters")
 
 async def notify_cookie_expired(reason: str):
     """Send push notification via ntfy.sh when cookie needs manual update."""

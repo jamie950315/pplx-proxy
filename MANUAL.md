@@ -106,7 +106,7 @@ All settings live in the `.env` file. Here is the full reference:
 | `PPLX_PROXY_PORT` | `8892` | Port to listen on |
 | `KEEPALIVE_HOURS` | `6` | Interval between session validation and cookie-rotation persistence |
 | `PROBE_INTERVAL_HOURS` | `24` | Interval between auto-discovery model checks |
-| `NTFY_TOPIC` | disabled | Unique, unguessable ntfy.sh topic; the shared public `pplx-proxy` name is rejected |
+| `NTFY_TOPIC` | disabled | Unique ntfy.sh topic: maximum 64 characters using letters, numbers, `_`, or `-`; the shared public `pplx-proxy` name is rejected |
 | `NTFY_URL` | `https://ntfy.sh` | ntfy server URL |
 | `NTFY_COOLDOWN_SECS` | `3600` | Minimum interval between push notifications |
 | `PUBLIC_URL` | `http://localhost:8892` | Public URL shown in ntfy messages and used for MCP host validation |
@@ -115,6 +115,12 @@ All settings live in the `.env` file. Here is the full reference:
 | `USER_AGENT` | Chrome 130 string | HTTP User-Agent header |
 | `COOKIE_MAX_AGE_HOURS` | `168` | Maximum age before cookie cache is considered stale |
 | `LOG_LEVEL` | `INFO` | Python logging level |
+
+On macOS, copy the configured private topic without exposing it or adding a trailing newline:
+
+```bash
+ssh YOUR_PI 'value=$(sed -n "s/^NTFY_TOPIC=//p" ~/pplx-proxy/.env); printf %s "$value"' | pbcopy
+```
 
 ---
 

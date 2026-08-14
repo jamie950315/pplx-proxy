@@ -225,7 +225,7 @@ Manual trigger: `POST /admin/discover-models`
 | `KEEPALIVE_HOURS` | `6` | Session ping interval |
 | `PROBE_INTERVAL_HOURS` | `24` | Auto-discovery interval |
 | `FLARESOLVERR_URL` | `http://localhost:8191` | FlareSolverr endpoint for `/health` quota data |
-| `NTFY_TOPIC` | disabled | Unique, unguessable ntfy.sh topic; the shared public `pplx-proxy` name is rejected |
+| `NTFY_TOPIC` | disabled | Unique ntfy.sh topic: maximum 64 characters using letters, numbers, `_`, or `-`; the shared public `pplx-proxy` name is rejected |
 | `NTFY_URL` | `https://ntfy.sh` | ntfy server URL |
 | `NTFY_COOLDOWN_SECS` | `3600` | Min interval between alerts |
 | `PUBLIC_URL` | `http://localhost:8892` | URL in ntfy messages |
@@ -234,6 +234,12 @@ Manual trigger: `POST /admin/discover-models`
 | `USER_AGENT` | Chrome/130 | HTTP User-Agent |
 | `COOKIE_MAX_AGE_HOURS` | `168` | Cookie cache max age |
 | `LOG_LEVEL` | `INFO` | Logging level |
+
+On macOS, copy the configured private topic without exposing it or adding a trailing newline:
+
+```bash
+ssh YOUR_PI 'value=$(sed -n "s/^NTFY_TOPIC=//p" ~/pplx-proxy/.env); printf %s "$value"' | pbcopy
+```
 
 ## Deployment (systemd)
 
