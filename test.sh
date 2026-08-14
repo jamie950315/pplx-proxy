@@ -14,14 +14,14 @@ echo "--- Chat (non-streaming) ---"
 curl -s "$BASE/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $KEY" \
-  -d '{"model":"sonnet","messages":[{"role":"user","content":"What is 2+2? Answer in one word."}],"stream":false}' \
+  -d '{"model":"auto","messages":[{"role":"user","content":"What is 2+2? Answer in one word."}],"stream":false}' \
   | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'  {d[\"choices\"][0][\"finish_reason\"]}: {d[\"choices\"][0][\"message\"][\"content\"][:60]}')" 2>/dev/null
 
 echo "--- Chat (streaming) ---"
 timeout 15 curl -sN "$BASE/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $KEY" \
-  -d '{"model":"sonnet","messages":[{"role":"user","content":"Say hello in 3 words"}],"stream":true}' 2>/dev/null \
+  -d '{"model":"auto","messages":[{"role":"user","content":"Say hello in 3 words"}],"stream":true}' 2>/dev/null \
   | head -8
 
 echo ""

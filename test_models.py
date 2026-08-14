@@ -188,6 +188,112 @@ class ResponseParsingTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_model_substitution_is_reported_before_completion(self):
+        class FakeResponse:
+            status_code=200
+
+            async def aiter_lines(self, delimiter):
+                for payload in [
+                    {
+                        "display_model": "claude50sonnet",
+                        "blocks": [{"intended_usage": "ask_text", "markdown_block": {"progress": "IN_PROGRESS", "chunks": ["Partial"]}}],
+                    },
+                    {
+                        "display_model": "gpt5_nano",
+                        "blocks": [{"intended_usage": "ask_text", "markdown_block": {"progress": "IN_PROGRESS", "chunks": [" answer"]}}],
+                    },
+                ]:
+                    yield f"event: message\r\ndata: {json.dumps(payload)}"
+                yield "event: end_of_stream"
+
+        class FakeSession:
+            async def post(self, *args, **kwargs):
+                return FakeResponse()
+
+        async def run():
+            client=server.PerplexityClient({})
+            client.session=FakeSession()
+            client._initialized=True
+            chunks=[chunk async for chunk in client.search("test", "pro", "claude50sonnet")]
+            self.assertTrue(chunks[-1].get("model_fallback"))
+            self.assertEqual(chunks[-1].get("actual_model"), "gpt5_nano")
+            self.assertIn("substituted", chunks[-1].get("error", ""))
+
+        asyncio.run(run())
+
+
+class ModelProbeTests(unittest.TestCase):
+    def test_probe_model_rejects_provider_substitution(self):
+        class FallbackClient:
+            async def search(self, *_args, **_kwargs):
+                yield {"answer": "Four", "actual_model": "claude50sonnet", "done": False}
+                yield {
+                    "answer": "Four",
+                    "actual_model": "gpt5_nano",
+                    "model_fallback": True,
+                    "done": True,
+                }
+
+        self.assertFalse(asyncio.run(server.probe_model(FallbackClient(), "claude50sonnet")))
+
+    def test_probe_model_accepts_matching_provider_model(self):
+        class MatchingClient:
+            async def search(self, *_args, **_kwargs):
+                yield {
+                    "answer": "Four",
+                    "actual_model": "claude50sonnet",
+                    "model_fallback": False,
+                    "done": True,
+                }
+
+        self.assertTrue(asyncio.run(server.probe_model(MatchingClient(), "claude50sonnet")))
+
+
+class ModelPreflightTests(unittest.TestCase):
+    def test_model_preflight_reuses_a_fresh_verification(self):
+        calls=[]
+
+        async def verified(_client, pref):
+            calls.append(pref)
+            return True
+
+        async def run():
+            with patch.object(server, "_model_preflight_cache", {}, create=True), \
+                 patch.object(server, "probe_model", new=verified):
+                self.assertTrue(await server.ensure_model_available(object(), "claude50sonnet"))
+                self.assertTrue(await server.ensure_model_available(object(), "claude50sonnet"))
+                self.assertEqual(calls, ["claude50sonnet"])
+
+        asyncio.run(run())
+
+
+class ExplicitModelAvailabilityTests(unittest.TestCase):
+    class ChatRequest:
+        async def json(self):
+            return {
+                "model": "sonnet",
+                "messages": [{"role": "user", "content": "test"}],
+                "stream": False,
+            }
+
+    def test_chat_rejects_an_explicit_model_that_fails_preflight(self):
+        class FakeClient:
+            async def search(self, *_args, **_kwargs):
+                yield {"answer": "Wrong model answer", "done": True}
+
+        async def unavailable(_client, _pref):
+            return False
+
+        async def run():
+            with patch.object(server, "get_model_map", return_value={"sonnet": ("pro", "claude50sonnet")}), \
+                 patch.object(server, "get_client", return_value=FakeClient()), \
+                 patch.object(server, "ensure_model_available", new=unavailable):
+                with self.assertRaises(server.HTTPException) as context:
+                    await server.chat_completions(self.ChatRequest())
+                self.assertEqual(context.exception.status_code, 503)
+
+        asyncio.run(run())
+
 
 class SessionKeepaliveTests(unittest.TestCase):
     def test_keepalive_persists_rotated_cookie_for_restart(self):
@@ -293,6 +399,22 @@ class RefreshCookieEndpointTests(unittest.TestCase):
                 self.assertEqual(response["status"], "ok")
                 self.assertIn("validated", response["message"])
                 self.assertEqual(validation_calls, [True])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            asyncio.run(run(Path(temp_dir) / ".cookie_cache.json"))
+
+    def test_refresh_cookie_clears_model_preflight_cache(self):
+        async def accepted():
+            return True
+
+        async def run(cache_file):
+            preflight_cache={"claude50sonnet": (0.0, False)}
+            with patch.object(server, "COOKIE_FILE", cache_file), \
+                 patch.object(server, "_client", None), \
+                 patch.object(server, "_model_preflight_cache", preflight_cache), \
+                 patch.object(server, "session_keepalive_once", new=accepted):
+                await server.refresh_cookie_endpoint(self.JsonRequest())
+                self.assertEqual(preflight_cache, {})
 
         with tempfile.TemporaryDirectory() as temp_dir:
             asyncio.run(run(Path(temp_dir) / ".cookie_cache.json"))

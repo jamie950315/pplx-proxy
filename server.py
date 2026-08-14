@@ -41,9 +41,27 @@ PPLX_API_VERSION=os.getenv("PPLX_API_VERSION", "2.18")
 PPLX_IMPERSONATE=os.getenv("PPLX_IMPERSONATE", "chrome")
 COOKIE_MAX_AGE_HOURS=int(os.getenv("COOKIE_MAX_AGE_HOURS", "168"))
 NTFY_COOLDOWN_SECS=int(os.getenv("NTFY_COOLDOWN_SECS", "3600"))
+MODEL_PREFLIGHT_TTL_SECS=int(os.getenv("MODEL_PREFLIGHT_TTL_SECS", "900"))
 USER_AGENT=os.getenv("USER_AGENT", "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
 ENV_FILE=Path(__file__).parent / ".env"
 FLARESOLVERR_URL=os.getenv("FLARESOLVERR_URL", "http://localhost:8191").rstrip("/")
+
+_MODEL_DISPLAY_ALIASES={
+    "pplx_pro": {"pplx_pro", "turbo"},
+}
+_model_preflight_cache={}
+
+def _model_matches_preference(requested_model: str, actual_model: str) -> bool:
+    """Return whether Perplexity used the requested model or its known alias."""
+    if not actual_model:
+        return False
+    if actual_model == requested_model:
+        return True
+    if actual_model in _MODEL_DISPLAY_ALIASES.get(requested_model, set()):
+        return True
+    if requested_model.endswith("thinking") and actual_model == requested_model.removesuffix("thinking"):
+        return True
+    return False
 
 # ─── Rate Limit Tracker ────────────────────────────────────────────────────
 
@@ -522,6 +540,7 @@ class PerplexityClient:
         web_results=[]
         seen_len=0
         answer_usage=None
+        actual_model=None
         _seen_thinking=set()  # dedup thinking content
 
         async for line in resp.aiter_lines(delimiter=b"\r\n\r\n"):
@@ -536,6 +555,20 @@ class PerplexityClient:
                 chunk=json.loads(data_str)
             except json.JSONDecodeError:
                 continue
+
+            display_model=chunk.get("display_model")
+            if isinstance(display_model, str) and display_model:
+                actual_model=display_model
+                if not _model_matches_preference(model_pref, actual_model):
+                    message=f"Perplexity substituted requested model '{model_pref}' with '{actual_model}'"
+                    log.warning(message)
+                    yield {
+                        "error": message,
+                        "requested_model": model_pref,
+                        "actual_model": actual_model,
+                        "model_fallback": True,
+                    }
+                    return
 
             if "backend_uuid" in chunk:
                 backend_uuid=chunk["backend_uuid"]
@@ -625,7 +658,16 @@ class PerplexityClient:
                     seen_len=len(cumulative)
                     yield {"delta": delta, "answer": full_answer, "backend_uuid": backend_uuid, "web_results": web_results, "done": False}
 
-        yield {"delta": "", "answer": full_answer, "backend_uuid": backend_uuid, "web_results": web_results, "done": True}
+        yield {
+            "delta": "",
+            "answer": full_answer,
+            "backend_uuid": backend_uuid,
+            "web_results": web_results,
+            "requested_model": model_pref,
+            "actual_model": actual_model,
+            "model_fallback": not _model_matches_preference(model_pref, actual_model),
+            "done": True,
+        }
 
 
 # ─── Cookie Management ──────────────────────────���──────────────────────────
@@ -920,6 +962,8 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
         model_name="auto"
 
     client=get_client()
+    if model_name != "auto" and not await ensure_model_available(client, model_pref):
+        raise HTTPException(503, f"Perplexity cannot use requested model '{model_name}' without substituting another model. Use 'auto' or try again later.")
     resp_id=f"resp_{uuid4().hex[:12]}"
     created=int(time.time())
 
@@ -1184,6 +1228,8 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
         raise HTTPException(400, "No valid message content after processing. Ensure at least one user message has non-empty content.")
 
     client=get_client()
+    if model_name != "auto" and not await ensure_model_available(client, model_pref):
+        raise HTTPException(503, f"Perplexity cannot use requested model '{model_name}' without substituting another model. Use 'auto' or try again later.")
     cid=f"chatcmpl-{uuid4().hex[:12]}"
     created=int(time.time())
 
@@ -1339,11 +1385,22 @@ async def probe_model(client, pref) -> bool:
         async for chunk in client.search("2+2=?", "pro", pref, ["web"], "en-US"):
             if chunk.get("error"):
                 return False
-            if chunk.get("answer", "").strip():
-                return True
+            if chunk.get("done"):
+                return bool(chunk.get("answer", "").strip()) and _model_matches_preference(pref, chunk.get("actual_model", ""))
         return False
     except Exception:
         return False
+
+
+async def ensure_model_available(client, pref) -> bool:
+    """Use a short-lived verified result before accepting an explicit model."""
+    now=time.monotonic()
+    cached=_model_preflight_cache.get(pref)
+    if cached and now-cached[0] < MODEL_PREFLIGHT_TTL_SECS:
+        return cached[1]
+    available=await probe_model(client, pref)
+    _model_preflight_cache[pref]=(now, available)
+    return available
 
 
 async def _discover_known_missing_models(client, report: dict, sleep_seconds: float=2.0) -> bool:
@@ -1807,7 +1864,7 @@ async def refresh_cookie_endpoint(request: Request, _=Depends(verify_api_key)):
         return {"status": "error", "message": "Send session token as plain text body or JSON {\"session_token\": \"...\"}"}
     cookies={"__Secure-next-auth.session-token": token}
     save_cookies(cookies)
-    global _client, _rate_limit_refresh_task
+    global _client, _rate_limit_refresh_task, _model_preflight_cache
     if _client:
         _client.reset(cookies)
     else:
@@ -1819,6 +1876,7 @@ async def refresh_cookie_endpoint(request: Request, _=Depends(verify_api_key)):
     _rate_limit["remaining_research"]=None
     _rate_limit["updated_at"]=0
     _rate_limit["last_error"]=None
+    _model_preflight_cache.clear()
     # Reload model map from file if it exists
     global MODEL_MAP
     MODEL_MAP=load_model_map()
