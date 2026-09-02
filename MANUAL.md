@@ -184,14 +184,14 @@ curl -X POST http://localhost:8892/v1/chat/completions \
 | `gpt` / `gpt-5.6-terra` | GPT-5.6 Terra | pro | OpenAI's latest |
 | `gpt-5.6-sol` | GPT-5.6 Sol | max | Highest-capability GPT-5.6 variant |
 | `gpt-5.5` | GPT-5.5 | pro | Previous GPT model |
-| `gpt-5.4` | GPT-5.4 | pro | Previous GPT flagship |
 | `gpt-mini` | GPT-5 Mini | pro | Smaller GPT model |
 | `gpt-nano` | GPT-5 Nano | pro | Fastest GPT model |
 | `sonnet` / `sonnet-5` | Claude Sonnet 5 | pro | Anthropic's latest Sonnet |
 | `sonnet-4.6` | Claude Sonnet 4.6 | pro | Previous Sonnet version |
 | `gemini` | Gemini 3.1 Pro | pro | Google's flagship |
 | `gemini-flash` | Gemini 3.5 Flash | pro | Faster Gemini model |
-| `grok` / `grok-4.5` | Grok 4.5 | pro | xAI's latest Grok |
+| `grok` / `grok-4.6` | Grok 4.6 | pro | xAI's latest Grok |
+| `grok-4.5` | Grok 4.5 | pro | Previous Grok version |
 | `grok-4` | Grok 4 | pro | Previous Grok version |
 | `grok-reasoning` | Grok 4.20 Reasoning | pro | xAI reasoning model |
 | `grok-non-reasoning` | Grok 4.20 Non Reasoning | pro | xAI non-reasoning model |
@@ -199,6 +199,7 @@ curl -X POST http://localhost:8892/v1/chat/completions \
 | `nemotron-3-super` | Nemotron 3 Super | pro | Previous Nemotron version |
 | `glm-5.2` | GLM-5.2 | pro | Z.ai's reasoning model |
 | `kimi-k2.6` | Kimi K2.6 | pro | Moonshot AI model |
+| `kimi-k3` | Kimi K3 | pro | Moonshot AI model (thinking always on) |
 | `opus` / `opus-4.8` | Claude Opus 4.8 | max | Anthropic's most capable |
 | `opus-4.7` | Claude Opus 4.7 | max | Previous Opus version |
 | `opus-4.6` | Claude Opus 4.6 | max | Previous Opus flagship |
@@ -386,10 +387,9 @@ In streaming mode, reasoning chunks arrive before content chunks with `delta.rea
 | `gpt` / `gpt-5.6-terra` | `gpt56_terra_thinking` |
 | `gpt-5.6-sol` | `gpt56_sol_thinking` |
 | `gpt-5.5` | `gpt55_thinking` |
-| `gpt-5.4` | `gpt54_thinking` |
 | `sonnet` / `sonnet-5` | `claude50sonnetthinking` |
 | `sonnet-4.6` | `claude46sonnetthinking` |
-| `grok` / `grok-4.5` | `grok45medium` |
+| `grok-4.5` | `grok45medium` |
 | `kimi-k2.6` | `kimik26thinking` |
 | `opus` / `opus-4.8` | `claude48opusthinking` |
 | `opus-4.7` | `claude47opusthinking` |

@@ -336,7 +336,6 @@ _MODEL_REGISTRY={
     "gpt-5.6-terra": {"entry": ("pro", "gpt56_terra"), "tier": "pro", "label": "GPT-5.6 Terra", "thinking": ("pro", "gpt56_terra_thinking")},
     "gpt-5.6-sol": {"entry": ("pro", "gpt56_sol"), "tier": "max", "label": "GPT-5.6 Sol", "thinking": ("pro", "gpt56_sol_thinking")},
     "gpt-5.5": {"entry": ("pro", "gpt55"), "tier": "pro", "label": "GPT-5.5", "thinking": ("pro", "gpt55_thinking")},
-    "gpt-5.4": {"entry": ("pro", "gpt54"), "tier": "pro", "label": "GPT-5.4", "thinking": ("pro", "gpt54_thinking")},
     "gpt-mini": {"entry": ("pro", "gpt5_mini"), "tier": "pro", "label": "GPT-5 Mini"},
     "gpt-nano": {"entry": ("pro", "gpt5_nano"), "tier": "pro", "label": "GPT-5 Nano"},
     "gemini": {"entry": ("pro", "gemini31pro_high"), "tier": "pro", "label": "Gemini 3.1 Pro"},
@@ -350,7 +349,8 @@ _MODEL_REGISTRY={
     "opus-4.8": {"entry": ("pro", "claude48opus"), "tier": "max", "label": "Claude Opus 4.8", "thinking": ("pro", "claude48opusthinking")},
     "opus-4.7": {"entry": ("pro", "claude47opus"), "tier": "max", "label": "Claude Opus 4.7", "thinking": ("pro", "claude47opusthinking")},
     "opus-4.6": {"entry": ("pro", "claude46opus"), "tier": "max", "label": "Claude Opus 4.6", "thinking": ("pro", "claude46opusthinking")},
-    "grok": {"entry": ("pro", "grok45low"), "tier": "pro", "label": "Grok 4.5", "thinking": ("pro", "grok45medium")},
+    "grok": {"entry": ("pro", "grok46low"), "tier": "pro", "label": "Grok 4.6"},
+    "grok-4.6": {"entry": ("pro", "grok46low"), "tier": "pro", "label": "Grok 4.6"},
     "grok-4.5": {"entry": ("pro", "grok45low"), "tier": "pro", "label": "Grok 4.5", "thinking": ("pro", "grok45medium")},
     "grok-4": {"entry": ("pro", "grok4"), "tier": "pro", "label": "Grok 4"},
     "grok-reasoning": {"entry": ("pro", "grok420reasoning"), "tier": "pro", "label": "Grok 4.20 Reasoning"},
@@ -360,12 +360,28 @@ _MODEL_REGISTRY={
     "nemotron-3-super": {"entry": ("pro", "nv_nemotron_3_super"), "tier": "pro", "label": "Nemotron 3 Super"},
     "glm-5.2": {"entry": ("pro", "glm_5_2"), "tier": "pro", "label": "GLM-5.2"},
     "kimi-k2.6": {"entry": ("pro", "kimik26instant"), "tier": "pro", "label": "Kimi K2.6", "thinking": ("pro", "kimik26thinking")},
+    "kimi-k3": {"entry": ("pro", "kimik3"), "tier": "pro", "label": "Kimi K3"},
 }
 
 # All known models (superset)
 _ALL_MODELS={k: v["entry"] for k, v in _MODEL_REGISTRY.items()}
 _MODEL_LABELS={k: v["label"] for k, v in _MODEL_REGISTRY.items()}
+_PREF_LABELS={}
+for _spec in _MODEL_REGISTRY.values():
+    _PREF_LABELS[_spec["entry"][1]]=_spec["label"]
+    if "thinking" in _spec:
+        _PREF_LABELS[_spec["thinking"][1]]=f"{_spec['label']} Thinking"
 _ENABLED_MODEL_IDS={k for k, v in _MODEL_REGISTRY.items() if v.get("enabled", True)}
+
+def _substitution_notice(requested_pref, actual_model) -> str:
+    """Visible marker when Perplexity answered with a different model."""
+    if not actual_model or _model_matches_preference(requested_pref, actual_model):
+        return ""
+    label=_PREF_LABELS.get(actual_model, actual_model)
+    return f"\n\n[Substituted by Perplexity with {label}]"
+
+def _response_suffix(requested_pref, actual_model) -> str:
+    return _substitution_notice(requested_pref, actual_model)+_remaining_notice()
 
 # Thinking variants — activated via thinking=true parameter
 _THINKING_MAP={k: v["thinking"] for k, v in _MODEL_REGISTRY.items() if "thinking" in v}
@@ -542,6 +558,7 @@ class PerplexityClient:
         seen_len=0
         answer_usage=None
         actual_model=None
+        substituted=False
         _seen_thinking=set()  # dedup thinking content
 
         async for line in resp.aiter_lines(delimiter=b"\r\n\r\n"):
@@ -561,8 +578,9 @@ class PerplexityClient:
             display_model=chunk.get("display_model")
             if isinstance(display_model, str) and display_model:
                 if _model_matches_preference(model_pref, display_model):
-                    actual_model=display_model
-                else:
+                    if not substituted:
+                        actual_model=display_model
+                elif not substituted:
                     switch_answer_blocks=[
                         block for block in blocks
                         if block.get("intended_usage", "").startswith("ask_text")
@@ -597,13 +615,8 @@ class PerplexityClient:
                     else:
                         message=f"Perplexity substituted requested model '{model_pref}' with '{display_model}'"
                         log.warning(message)
-                        yield {
-                            "error": message,
-                            "requested_model": model_pref,
-                            "actual_model": display_model,
-                            "model_fallback": True,
-                        }
-                        return
+                        substituted=True
+                        actual_model=display_model
 
             if "backend_uuid" in chunk:
                 backend_uuid=chunk["backend_uuid"]
@@ -699,7 +712,7 @@ class PerplexityClient:
             "web_results": web_results,
             "requested_model": model_pref,
             "actual_model": actual_model,
-            "model_fallback": not _model_matches_preference(model_pref, actual_model),
+            "model_fallback": substituted or not _model_matches_preference(model_pref, actual_model),
             "done": True,
         }
 
@@ -933,6 +946,13 @@ import re as _re
 
 _CITATION_RE=_re.compile(r'\[\d+\]')
 _REMAINING_NOTICE_RE=_re.compile(r'\s*\[Remaining Pro Search: \d+\]\s*')
+_SUBSTITUTION_NOTICE_RE=_re.compile(r'\s*\[(?:Substituted by Perplexity with|被 Perplexity 替換成) [^\]]+\]\s*')
+
+def _strip_appended_notices(text: str) -> str:
+    text=_REMAINING_NOTICE_RE.sub("", text or "")
+    text=_SUBSTITUTION_NOTICE_RE.sub("", text)
+    return text.strip()
+
 _GROK_TAG_RE=_re.compile(r'<grok:[^>]*>.*?</grok:[^>]*>', _re.DOTALL)
 _GROK_SELF_RE=_re.compile(r'<grok:[^>]*/>')
 _MULTI_SPACE=_re.compile(r' {2,}')
@@ -1001,7 +1021,7 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
                 role="system"
         content=msg.get("content") or ""
         # Strip rate limit notices from previous responses
-        content=_REMAINING_NOTICE_RE.sub("", content).strip()
+        content=_strip_appended_notices(content)
         if role=="system":
             system_msg+=content+"\n"
         elif role=="user":
@@ -1073,8 +1093,6 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
         model_name="auto"
 
     client=get_client()
-    if model_name != "auto" and not await ensure_model_available(client, model_pref):
-        raise HTTPException(503, f"Perplexity cannot use requested model '{model_name}' without substituting another model. Use 'auto' or try again later.")
     resp_id=f"resp_{uuid4().hex[:12]}"
     created=int(time.time())
 
@@ -1096,9 +1114,12 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
             _resp_backend_uuid=None
             _thinking_parts=[]
             _thinking_done=False
+            _actual_model=None
             async for ch in client.search(query, mode, model_pref, ["web"], "en-US", follow_up_uuid):
                 if ch.get("backend_uuid"):
                     _resp_backend_uuid=ch["backend_uuid"]
+                if ch.get("actual_model"):
+                    _actual_model=ch["actual_model"]
                 if ch.get("error"):
                     yield f"event: error\ndata: {json.dumps({'error': ch['error']})}\n\n"
                     break
@@ -1111,6 +1132,7 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
                     continue
                 if ch.get("done"):
                     full=ch.get("answer", full)
+                    _actual_model=ch.get("actual_model", _actual_model)
                     # Close reasoning if still open
                     if not _thinking_done:
                         _thinking_done=True
@@ -1134,9 +1156,9 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
 
             full=_clean_response(full)
 
-            # Rate limit decrement + notice
+            # Rate limit decrement + notices
             _decrement_pro()
-            notice=_remaining_notice()
+            notice=_response_suffix(model_pref, _actual_model)
             if notice:
                 evt_n={"type": "response.output_text.delta", "item_id": msg_id, "delta": notice}
                 yield f"event: response.output_text.delta\ndata: {json.dumps(evt_n)}\n\n"
@@ -1146,7 +1168,7 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
             yield f"event: response.output_text.done\ndata: {json.dumps({'type': 'response.output_text.done', 'item_id': msg_id, 'text': full})}\n\n"
 
             # Store session for next turn (use cleaned text before notice)
-            _clean_full=_REMAINING_NOTICE_RE.sub("", full).strip()
+            _clean_full=_strip_appended_notices(full)
             _session_store(history, current_msg, _clean_full, _resp_backend_uuid)
 
             # Emit response.completed
@@ -1165,13 +1187,17 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
         # Non-streaming: collect full response
         full=""
         resp_backend_uuid=None
+        actual_model=None
         async for ch in client.search(query, mode, model_pref, ["web"], "en-US", follow_up_uuid):
             if ch.get("backend_uuid"):
                 resp_backend_uuid=ch["backend_uuid"]
+            if ch.get("actual_model"):
+                actual_model=ch["actual_model"]
             if ch.get("error"):
                 raise HTTPException(502, ch)
             if ch.get("done"):
                 full=ch.get("answer", full)
+                actual_model=ch.get("actual_model", actual_model)
                 break
             full=ch.get("answer", full)
         full=_clean_response(full)
@@ -1179,9 +1205,9 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
         # Store session for next turn
         _session_store(history, current_msg, full, resp_backend_uuid)
 
-        # Rate limit decrement + notice
+        # Rate limit decrement + notices
         _decrement_pro()
-        notice=_remaining_notice()
+        notice=_response_suffix(model_pref, actual_model)
         if notice:
             full+=notice
 
@@ -1271,7 +1297,7 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
             text_parts=[ct.get("text", "") for ct in content if ct.get("type") == "text"]
             content=" ".join(text_parts)
         # Strip rate limit notices from previous responses
-        content=_REMAINING_NOTICE_RE.sub("", content).strip()
+        content=_strip_appended_notices(content)
         if not content or not content.strip():
             continue
         if role == "system":
@@ -1339,8 +1365,6 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
         raise HTTPException(400, "No valid message content after processing. Ensure at least one user message has non-empty content.")
 
     client=get_client()
-    if model_name != "auto" and not await ensure_model_available(client, model_pref):
-        raise HTTPException(503, f"Perplexity cannot use requested model '{model_name}' without substituting another model. Use 'auto' or try again later.")
     cid=f"chatcmpl-{uuid4().hex[:12]}"
     created=int(time.time())
 
@@ -1354,9 +1378,12 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
     full=""
     resp_backend_uuid=None
     thinking_parts=[]
+    actual_model=None
     async for chunk in client.search(query, mode, model_pref, sources, language, follow_up_uuid):
         if chunk.get("backend_uuid"):
             resp_backend_uuid=chunk["backend_uuid"]
+        if chunk.get("actual_model"):
+            actual_model=chunk["actual_model"]
         if chunk.get("error"):
             raise HTTPException(502, chunk)
         if chunk.get("thinking"):
@@ -1364,6 +1391,7 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
             continue
         if chunk.get("done"):
             full=chunk.get("answer", full)
+            actual_model=chunk.get("actual_model", actual_model)
             break
         full=chunk.get("answer", full)
     reasoning_content="\n".join(thinking_parts) if thinking_parts else None
@@ -1372,10 +1400,10 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
     # Store session for next turn
     _session_store(history, current_msg, full, resp_backend_uuid)
 
-    # Rate limit: decrement + append notice
+    # Rate limit: decrement + append notices
     if mode != "auto":  # Pro queries only (copilot mode)
         _decrement_pro()
-    notice=_remaining_notice()
+    notice=_response_suffix(model_pref, actual_model)
     if notice:
         full+=notice
 
@@ -1397,9 +1425,12 @@ async def _stream_openai(client, query, mode, model_pref, model_name, cid, creat
 
     _resp_backend_uuid=None
     _full_answer=""
+    _actual_model=None
     async for chunk in client.search(query, mode, model_pref, sources, language, follow_up_uuid):
         if chunk.get("backend_uuid"):
             _resp_backend_uuid=chunk["backend_uuid"]
+        if chunk.get("actual_model"):
+            _actual_model=chunk["actual_model"]
         if chunk.get("answer"):
             _full_answer=chunk["answer"]
         # Stream thinking content as reasoning_content deltas
@@ -1437,9 +1468,9 @@ async def _stream_openai(client, query, mode, model_pref, model_name, cid, creat
                    "choices": [{"index": 0, "delta": {"content": cites}, "finish_reason": None, "logprobs": None}]}
                 yield f"data: {json.dumps(c)}\n\n"
 
-            # Rate limit decrement + notice
+            # Rate limit decrement + notices
             _decrement_pro()
-            notice=_remaining_notice()
+            notice=_response_suffix(model_pref, chunk.get("actual_model", _actual_model))
             if notice:
                 nd={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
                     "choices": [{"index": 0, "delta": {"content": notice}, "finish_reason": None, "logprobs": None}]}
@@ -1488,6 +1519,32 @@ def _increment_version(major: int, minor: int, minor_width: int=1) -> tuple:
 def _version_distance(orig_ma, orig_mi, cur_ma, cur_mi, minor_width: int=1) -> float:
     """Calculate version distance: e.g., 5.4 → 7.4 = 2.0"""
     return (cur_ma - orig_ma) + (cur_mi - orig_mi) / (10.0 ** minor_width)
+
+MAX_VERSION_UPGRADE_PROBES=10
+
+def _version_upgrade_candidates(pref: str):
+    """Yield next version prefs within +1.0, capped to prevent two-digit runaway."""
+    for pattern, template in _VERSION_PATTERNS:
+        m=pattern.match(pref)
+        if not m:
+            continue
+        groups=m.groups()
+        if len(groups) == 4:
+            prefix, orig_ma_s, orig_mi_s, suffix=groups
+            suffix=suffix or ""
+            orig_ma, orig_mi=int(orig_ma_s), int(orig_mi_s)
+            minor_width=len(orig_mi_s)
+            ma, mi=orig_ma, orig_mi
+            for _ in range(MAX_VERSION_UPGRADE_PROBES):
+                ma, mi=_increment_version(ma, mi, minor_width)
+                if _version_distance(orig_ma, orig_mi, ma, mi, minor_width) > 1.0:
+                    return
+                yield template.format(prefix=prefix, ma=ma, mi=mi, suffix=suffix)
+        elif len(groups) == 3:
+            prefix, gen_s, suffix=groups
+            orig_gen=int(gen_s)
+            yield template.format(prefix=prefix, ma=orig_gen+1, suffix=suffix)
+        return
 
 
 async def probe_model(client, pref) -> bool:
@@ -1585,54 +1642,20 @@ async def discover_models(request: Request, _=Depends(verify_api_key)):
             continue
 
         # Dead — search for next version
-        groups=m.groups()
-        if len(groups) == 4:
-            prefix, orig_ma_s, orig_mi_s, suffix=groups
-            suffix=suffix or ""
-            orig_ma, orig_mi=int(orig_ma_s), int(orig_mi_s)
-            ma, mi=orig_ma, orig_mi
-            minor_width=len(orig_mi_s)
-            found=False
-
-            while True:
-                ma, mi=_increment_version(ma, mi, minor_width)
-                if _version_distance(orig_ma, orig_mi, ma, mi, minor_width) > 1.0:
-                    break
-                new_pref=template.format(prefix=prefix, ma=ma, mi=mi, suffix=suffix)
-                report["probed"]+=1
-                log.info(f"Discovery: {model_id} dead, trying {new_pref}...")
-                if await probe_model(client, new_pref):
-                    # Upgrade base
-                    global MODEL_MAP
-                    MODEL_MAP[model_id]=(mode, new_pref)
-                    upgrade={"old": pref, "new": new_pref}
-
-                    # Thinking variants auto-derived from _THINKING_MAP
-
-                    report["upgraded"][model_id]=upgrade
-                    log.info(f"Discovery: {model_id} upgraded {pref} → {new_pref}")
-                    found=True
-                    break
-                await asyncio.sleep(2)
-
-            if not found:
-                report["dead"].append({"model": model_id, "pref": pref, "reason": "no valid version within +1.0"})
-
-        elif len(groups) == 3:
-            prefix, gen_s, suffix=groups
-            orig_gen=int(gen_s)
-            found=False
-            for gen in range(orig_gen+1, orig_gen+2):
-                new_pref=template.format(prefix=prefix, ma=gen, suffix=suffix)
-                report["probed"]+=1
-                if await probe_model(client, new_pref):
-                    MODEL_MAP[model_id]=(mode, new_pref)
-                    report["upgraded"][model_id]={"old": pref, "new": new_pref}
-                    found=True
-                    break
-                await asyncio.sleep(2)
-            if not found:
-                report["dead"].append({"model": model_id, "pref": pref, "reason": "no next gen found"})
+        found=False
+        for new_pref in _version_upgrade_candidates(pref):
+            report["probed"]+=1
+            log.info(f"Discovery: {model_id} dead, trying {new_pref}...")
+            if await probe_model(client, new_pref):
+                global MODEL_MAP
+                MODEL_MAP[model_id]=(mode, new_pref)
+                report["upgraded"][model_id]={"old": pref, "new": new_pref}
+                log.info(f"Discovery: {model_id} upgraded {pref} → {new_pref}")
+                found=True
+                break
+            await asyncio.sleep(2)
+        if not found:
+            report["dead"].append({"model": model_id, "pref": pref, "reason": "no valid version within +1.0 or probe cap"})
 
     added=await _discover_known_missing_models(client, report)
 
@@ -1698,11 +1721,16 @@ if HAS_MCP:
             return f"Error: Invalid sources: {invalid_src}. Valid: {sorted(VALID_SOURCES)}"
         client=get_client()
         r=""
+        actual_model=None
         async for ch in client.search(query, mode, pref, src, language):
             if ch.get("error"): return f"Error: {ch['error']}"
-            if ch.get("done"): r=ch.get("answer", r); break
+            if ch.get("actual_model"): actual_model=ch["actual_model"]
+            if ch.get("done"):
+                r=ch.get("answer", r)
+                actual_model=ch.get("actual_model", actual_model)
+                break
             r=ch.get("answer", r)
-        return r
+        return r+_substitution_notice(pref, actual_model)
 
     @mcp.tool()
     async def perplexity_ask(query: str, language: str="en-US") -> str:
@@ -1740,11 +1768,16 @@ if HAS_MCP:
             mode, pref=mm[base]
         client=get_client()
         r=""
+        actual_model=None
         async for ch in client.search(query, mode, pref, ["web"], language):
             if ch.get("error"): return f"Error: {ch['error']}"
-            if ch.get("done"): r=ch.get("answer", r); break
+            if ch.get("actual_model"): actual_model=ch["actual_model"]
+            if ch.get("done"):
+                r=ch.get("answer", r)
+                actual_model=ch.get("actual_model", actual_model)
+                break
             r=ch.get("answer", r)
-        return r
+        return r+_substitution_notice(pref, actual_model)
 
     @mcp.tool()
     async def perplexity_research(query: str, language: str="en-US") -> str:
@@ -2052,27 +2085,16 @@ async def auto_discover_loop():
                 ok=await probe_model(client, pref)
                 if ok:
                     continue
-                # Dead — try upgrading
-                groups=m.groups()
-                if len(groups)==4:
-                    prefix,oma_s,omi_s,suffix=groups
-                    suffix=suffix or ""
-                    oma,omi=int(oma_s),int(omi_s)
-                    minor_width=len(omi_s)
-                    ma,mi=oma,omi
-                    while True:
-                        ma,mi=_increment_version(ma,mi,minor_width)
-                        if _version_distance(oma,omi,ma,mi,minor_width)>1.0:
-                            break
-                        new_pref=template.format(prefix=prefix,ma=ma,mi=mi,suffix=suffix)
-                        if await probe_model(client, new_pref):
-                            MODEL_MAP[model_id]=(mode, new_pref)
-                            # Thinking variants auto-derived from _THINKING_MAP, no separate upgrade needed
-                            save_model_map(MODEL_MAP)
-                            log.info(f"Auto-discovery: {model_id} upgraded {pref} → {new_pref}")
-                            await notify_cookie_expired(f"Model {model_id} auto-upgraded: {pref} → {new_pref}")
-                            break
-                        await asyncio.sleep(2)
+                # Dead — try upgrading, capped to avoid two-digit runaway
+                for new_pref in _version_upgrade_candidates(pref):
+                    if await probe_model(client, new_pref):
+                        MODEL_MAP[model_id]=(mode, new_pref)
+                        # Thinking variants auto-derived from _THINKING_MAP, no separate upgrade needed
+                        save_model_map(MODEL_MAP)
+                        log.info(f"Auto-discovery: {model_id} upgraded {pref} → {new_pref}")
+                        await notify_cookie_expired(f"Model {model_id} auto-upgraded: {pref} → {new_pref}")
+                        break
+                    await asyncio.sleep(2)
                 await asyncio.sleep(2)
         except Exception as e:
             log.error(f"Auto-discovery error: {e}")

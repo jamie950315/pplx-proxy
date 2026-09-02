@@ -15,7 +15,6 @@ class ModelRegistryTests(unittest.TestCase):
         for model_id in [
             "gpt",
             "gpt-5.6-terra",
-            "gpt-5.4",
             "gpt-mini",
             "gpt-nano",
             "sonnet",
@@ -23,19 +22,25 @@ class ModelRegistryTests(unittest.TestCase):
             "gemini",
             "gemini-flash",
             "grok",
+            "grok-4.6",
             "grok-4.5",
             "grok-reasoning",
             "grok-non-reasoning",
             "nemotron",
             "glm-5.2",
             "kimi-k2.6",
+            "kimi-k3",
         ]:
             self.assertIn(model_id, model_map)
+        self.assertEqual(model_map["grok"], ("pro", "grok46low"))
+        self.assertEqual(model_map["kimi-k3"], ("pro", "kimik3"))
+        self.assertEqual(model_map["sonnet-4.6"], ("pro", "claude46sonnet"))
         self.assertNotIn("opus", model_map)
         self.assertNotIn("gpt-5.6-sol", model_map)
         self.assertNotIn("grok-multi", model_map)
         self.assertNotIn("haiku", model_map)
         self.assertNotIn("gemini-flash-lite", model_map)
+        self.assertNotIn("gpt-5.4", model_map)
 
     def test_max_tier_includes_max_only_models(self):
         with patch.object(server, "ACCOUNT_TYPE", "max"):
@@ -48,10 +53,12 @@ class ModelRegistryTests(unittest.TestCase):
 
     def test_thinking_map_tracks_latest_defaults(self):
         self.assertEqual(server._THINKING_MAP["gpt"], ("pro", "gpt56_terra_thinking"))
-        self.assertEqual(server._THINKING_MAP["gpt-5.4"], ("pro", "gpt54_thinking"))
+        self.assertNotIn("gpt-5.4", server._THINKING_MAP)
         self.assertEqual(server._THINKING_MAP["sonnet"], ("pro", "claude50sonnetthinking"))
-        self.assertEqual(server._THINKING_MAP["grok"], ("pro", "grok45medium"))
+        self.assertNotIn("grok", server._THINKING_MAP)
+        self.assertEqual(server._THINKING_MAP["grok-4.5"], ("pro", "grok45medium"))
         self.assertEqual(server._THINKING_MAP["opus"], ("pro", "claude48opusthinking"))
+        self.assertNotIn("kimi-k3", server._THINKING_MAP)
 
     def test_tier_error_uses_model_minimum_tier(self):
         with patch.object(server, "ACCOUNT_TYPE", "free"):
@@ -64,6 +71,12 @@ class ModelRegistryTests(unittest.TestCase):
         self.assertEqual(server._increment_version(4, 20, 2), (4, 21))
         self.assertAlmostEqual(server._version_distance(4, 20, 4, 21, 2), 0.01)
 
+    def test_version_upgrade_candidates_are_capped_for_two_digit_minor(self):
+        prefs=list(server._version_upgrade_candidates("grok420reasoning"))
+        self.assertEqual(len(prefs), 10)
+        self.assertEqual(prefs[0], "grok421reasoning")
+        self.assertEqual(prefs[-1], "grok430reasoning")
+
 
 class DiscoveryTests(unittest.TestCase):
     def test_known_missing_models_are_added_when_probe_passes(self):
@@ -71,7 +84,7 @@ class DiscoveryTests(unittest.TestCase):
         report={"added": {}, "unavailable": [], "probed": 0}
 
         async def fake_probe(_client, pref):
-            return pref in {"claude50sonnet", "grok45low", "claude45haiku"}
+            return pref in {"claude50sonnet", "grok46low", "claude45haiku", "kimik3"}
 
         async def no_sleep(_seconds):
             return None
@@ -84,10 +97,12 @@ class DiscoveryTests(unittest.TestCase):
                 changed=await server._discover_known_missing_models(object(), report, sleep_seconds=0)
                 self.assertTrue(changed)
                 self.assertEqual(server.MODEL_MAP["sonnet"], ("pro", "claude50sonnet"))
-                self.assertEqual(server.MODEL_MAP["grok"], ("pro", "grok45low"))
+                self.assertEqual(server.MODEL_MAP["grok"], ("pro", "grok46low"))
+                self.assertEqual(server.MODEL_MAP["kimi-k3"], ("pro", "kimik3"))
                 self.assertEqual(server.MODEL_MAP["haiku"], ("pro", "claude45haiku"))
                 self.assertIn("sonnet", report["added"])
                 self.assertIn("grok", report["added"])
+                self.assertIn("kimi-k3", report["added"])
                 self.assertIn("haiku", report["added"])
                 self.assertNotIn("opus", server.MODEL_MAP)
 
@@ -188,7 +203,7 @@ class ResponseParsingTests(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_model_substitution_is_reported_before_completion(self):
+    def test_model_substitution_completes_with_fallback(self):
         class FakeResponse:
             status_code=200
 
@@ -215,9 +230,11 @@ class ResponseParsingTests(unittest.TestCase):
             client.session=FakeSession()
             client._initialized=True
             chunks=[chunk async for chunk in client.search("test", "pro", "claude50sonnet")]
+            self.assertFalse(any(chunk.get("error") for chunk in chunks))
+            self.assertEqual(chunks[-1].get("answer"), "Partial answer")
             self.assertTrue(chunks[-1].get("model_fallback"))
             self.assertEqual(chunks[-1].get("actual_model"), "gpt5_nano")
-            self.assertIn("substituted", chunks[-1].get("error", ""))
+            self.assertNotIn("error", chunks[-1])
 
         asyncio.run(run())
 
@@ -338,10 +355,16 @@ class ExplicitModelAvailabilityTests(unittest.TestCase):
                 "stream": False,
             }
 
-    def test_chat_rejects_an_explicit_model_that_fails_preflight(self):
+    def test_chat_appends_substitution_notice_instead_of_blocking(self):
         class FakeClient:
             async def search(self, *_args, **_kwargs):
-                yield {"answer": "Wrong model answer", "done": True}
+                yield {
+                    "delta": "Wrong model answer",
+                    "answer": "Wrong model answer",
+                    "actual_model": "gpt5_nano",
+                    "model_fallback": True,
+                    "done": True,
+                }
 
         async def unavailable(_client, _pref):
             return False
@@ -349,12 +372,28 @@ class ExplicitModelAvailabilityTests(unittest.TestCase):
         async def run():
             with patch.object(server, "get_model_map", return_value={"sonnet": ("pro", "claude50sonnet")}), \
                  patch.object(server, "get_client", return_value=FakeClient()), \
-                 patch.object(server, "ensure_model_available", new=unavailable):
-                with self.assertRaises(server.HTTPException) as context:
-                    await server.chat_completions(self.ChatRequest())
-                self.assertEqual(context.exception.status_code, 503)
+                 patch.object(server, "ensure_model_available", new=unavailable), \
+                 patch.object(server, "_remaining_notice", return_value=""), \
+                 patch.object(server, "_session_store"):
+                result=await server.chat_completions(self.ChatRequest())
+                content=result["choices"][0]["message"]["content"]
+                self.assertIn("Wrong model answer", content)
+                self.assertTrue(content.endswith("[Substituted by Perplexity with GPT-5 Nano]"))
 
         asyncio.run(run())
+
+    def test_substitution_notice_is_stripped_from_follow_up_history(self):
+        raw="Answer text\n\n[Substituted by Perplexity with GPT-5 Nano]\n\n[Remaining Pro Search: 150]"
+        self.assertEqual(server._strip_appended_notices(raw), "Answer text")
+        self.assertEqual(
+            server._strip_appended_notices("Answer text\n\n[被 Perplexity 替換成 GPT-5 Nano]"),
+            "Answer text",
+        )
+        self.assertEqual(
+            server._substitution_notice("claude50sonnet", "gpt5_nano"),
+            "\n\n[Substituted by Perplexity with GPT-5 Nano]",
+        )
+        self.assertEqual(server._substitution_notice("claude50sonnet", "claude50sonnet"), "")
 
 
 class SessionKeepaliveTests(unittest.TestCase):

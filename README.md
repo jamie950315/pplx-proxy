@@ -24,6 +24,7 @@ All queries use `search_focus: "internet"` — Perplexity's built-in web search 
 - **Auto-discovery** — background task checks model health every 24h, auto-upgrades when versions change
 - **Response cleaning** — strips Perplexity citations `[1][2]`, `<grok:*>` tags, `<?xml?>` declarations, `<script>` tags
 - **Rate limit tracking** — tracks Pro Search quota, auto-fallback to free model when exhausted, notices at every 5th decrement
+- **Substitution notice** — if Perplexity swaps the requested model, the answer still returns with `[Substituted by Perplexity with ...]` at the end
 - **Session continuity** — tracks Perplexity `backend_uuid` so follow-up turns skip history/instructions entirely, sending only the new query
 - **Session keep-alive** — validates at startup and every 6 hours, then persists any rotated cookie returned by Perplexity
 - **Push notifications** — [ntfy.sh](https://ntfy.sh) alerts on cookie expiry or model upgrades
@@ -91,14 +92,14 @@ FlareSolverr is optional for chat, streaming, MCP, and Responses API. Without it
 | `gpt` / `gpt-5.6-terra` | GPT-5.6 Terra | pro+ | `gpt56_terra_thinking` |
 | `gpt-5.6-sol` | GPT-5.6 Sol | max | `gpt56_sol_thinking` |
 | `gpt-5.5` | GPT-5.5 | pro+ | `gpt55_thinking` |
-| `gpt-5.4` | GPT-5.4 | pro+ | `gpt54_thinking` |
 | `gpt-mini` | GPT-5 Mini | pro+ | — |
 | `gpt-nano` | GPT-5 Nano | pro+ | — |
 | `sonnet` / `sonnet-5` | Claude Sonnet 5 | pro+ | `claude50sonnetthinking` |
 | `sonnet-4.6` | Claude Sonnet 4.6 | pro+ | `claude46sonnetthinking` |
 | `gemini` | Gemini 3.1 Pro | pro+ | — |
 | `gemini-flash` | Gemini 3.5 Flash | pro+ | — |
-| `grok` / `grok-4.5` | Grok 4.5 | pro+ | `grok45medium` |
+| `grok` / `grok-4.6` | Grok 4.6 | pro+ | — |
+| `grok-4.5` | Grok 4.5 | pro+ | `grok45medium` |
 | `grok-4` | Grok 4 | pro+ | — |
 | `grok-reasoning` | Grok 4.20 Reasoning | pro+ | — |
 | `grok-non-reasoning` | Grok 4.20 Non Reasoning | pro+ | — |
@@ -106,6 +107,7 @@ FlareSolverr is optional for chat, streaming, MCP, and Responses API. Without it
 | `nemotron-3-super` | Nemotron 3 Super | pro+ | — |
 | `glm-5.2` | GLM-5.2 | pro+ | — |
 | `kimi-k2.6` | Kimi K2.6 | pro+ | `kimik26thinking` |
+| `kimi-k3` | Kimi K3 | pro+ | — |
 | `opus` / `opus-4.8` | Claude Opus 4.8 | max | `claude48opusthinking` |
 | `opus-4.7` | Claude Opus 4.7 | max | `claude47opusthinking` |
 | `opus-4.6` | Claude Opus 4.6 | max | `claude46opusthinking` |
@@ -207,7 +209,7 @@ All responses strictly match the [OpenAI Chat Completions API spec](https://plat
 
 ## Auto-Discovery
 
-Every `PROBE_INTERVAL_HOURS` (default 24h), pplx-proxy checks if models are still alive. If one dies, it increments the version number (e.g., `gpt54` → `gpt55` → ... up to +1.0) and auto-upgrades. It also probes known new model names that are missing from a persisted `.models.json`, so newly added families such as Grok, Haiku, Flash, Mini, and Nano can be added instead of only version-bumping old IDs. Thinking variants are auto-derived from `_THINKING_MAP`.
+Every `PROBE_INTERVAL_HOURS` (default 24h), pplx-proxy checks if models are still alive. If one dies, it increments the version number (e.g., `gpt54` → `gpt55` → ... up to +1.0, capped at 10 probes) and auto-upgrades. It also probes known new model names that are missing from a persisted `.models.json`, so newly added families such as Grok, Haiku, Flash, Mini, and Nano can be added instead of only version-bumping old IDs. Thinking variants are auto-derived from `_THINKING_MAP`.
 
 Manual trigger: `POST /admin/discover-models`
 

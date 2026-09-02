@@ -26,7 +26,7 @@ Single FastAPI app (`server.py`, ~1750 lines) that:
 
 **Model Map**: dict of `{model_id: (mode, internal_pref)}`. Loaded from `.models.json` (persisted) or defaults. Filtered by tier at runtime.
 
-**Thinking Variants**: activated via `thinking: true` or `reasoning_effort != "none"`. Maps from `_THINKING_MAP` (e.g., `gpt → gpt55_thinking`, `sonnet → claude46sonnetthinking`). Perplexity does NOT expose internal thinking blocks — `reasoning_content` is populated from search steps (queries, URLs, plan goals).
+**Thinking Variants**: activated via `thinking: true` or `reasoning_effort != "none"`. Maps from `_THINKING_MAP` (e.g., `gpt → gpt56_terra_thinking`, `sonnet → claude50sonnetthinking`). Perplexity does NOT expose internal thinking blocks — `reasoning_content` is populated from search steps (queries, URLs, plan goals).
 
 
 **Context Management**: request payloads are assembled as JSON with `instructions` / `history` / `query`. Total query capped at 96K chars (~32K tokens). Consecutive same-role messages deduped (keeps last — fixes LibreChat branch artifacts). Generic clients still use whitelist-filtered system prompts from `.prompt_whitelist.txt`, but LobeHub requests now discard upstream system/developer prompt content entirely and prepend local `CUSTOM_PROMPTS` on every turn.
@@ -35,7 +35,7 @@ Single FastAPI app (`server.py`, ~1750 lines) that:
 
 **Response Cleaning** (`_clean_response`): strips `[1]` `[2]` citations, `<grok:*>` tags, `<?xml?>` declarations, `<response>` wrappers, `<script>` tags.
 
-**Auto-Discovery**: every `PROBE_INTERVAL_HOURS`, checks if models are alive. Dead models get version-incremented (e.g., `gpt54` → `gpt55`) up to +1.0. It also probes known missing model names from `_MODEL_REGISTRY`, so a persisted `.models.json` can gain newly added IDs such as Grok, Haiku, GPT Mini/Nano, and Gemini Flash. Sends ntfy on upgrade or new-model discovery.
+**Auto-Discovery**: every `PROBE_INTERVAL_HOURS`, checks if models are alive. Dead models get version-incremented (e.g., `gpt54` → `gpt55`) up to +1.0, capped at 10 probes. It also probes known missing model names from `_MODEL_REGISTRY`, so a persisted `.models.json` can gain newly added IDs such as Grok, Haiku, GPT Mini/Nano, and Gemini Flash. Sends ntfy on upgrade or new-model discovery.
 
 ## File Structure
 
@@ -112,15 +112,15 @@ Validates: empty query, invalid model, invalid sources, tier restrictions.
 Only base models are probed. Thinking variants auto-derived from `_THINKING_MAP`.
 
 - `sonar` (`experimental`) → alive check only, no version pattern
-- `gpt` (`gpt55`) → gpt56...gpt65 (max 10)
-- `gpt-5.4` (`gpt54`) → gpt55...gpt64 (max 10)
-- `sonnet` (`claude46sonnet`) → claude47...claude56 (max 10)
-- `opus` (`claude47opus`) → claude48...claude57 (max 10)
+- `gpt` (`gpt56_terra`) → gpt57...gpt66 (max 10)
+- `sonnet` (`claude50sonnet`) → claude51...claude60 (max 10)
+- `opus` (`claude48opus`) → claude49...claude58 (max 10)
 - `opus-4.6` (`claude46opus`) → claude47...claude56 (max 10)
 - `gemini` (`gemini31pro_high`) → gemini32...gemini41 (max 10)
-- `grok` (`grok4`) → alive check only, no verified version pattern yet
-- `grok-reasoning` (`grok420reasoning`) → grok421reasoning... (max +1.0)
+- `grok` (`grok46low`) → grok47low...grok56low (max 10)
+- `grok-reasoning` (`grok420reasoning`) → grok421reasoning... (max 10, not unbounded +1.0)
 - `nemotron` (`nv_nemotron_3_super`) → nv_nemotron_4 (max 1)
+- `kimi-k3` (`kimik3`) → alive check only
 
 ## Code Style
 
@@ -173,7 +173,10 @@ Every 1 hour → FlareSolverr re-sync (background)
 At multiples of 5 (or ≤5), appended to response content:
 `[Remaining Pro Search: 155]`
 
-Stripped from message history via `_REMAINING_NOTICE_RE` regex before sending to Perplexity.
+If Perplexity answers with a different model than requested, the answer is still returned and this is appended:
+`[Substituted by Perplexity with GPT-5 Nano]`
+
+Both notices are stripped from message history via `_strip_appended_notices` before sending to Perplexity. Tiny auxiliary tails from `gpt5_nano` after the selected model already wrote the answer are not treated as substitution.
 
 ### Quota Fallback
 When `remaining_pro <= 0`: all non-auto models auto-downgrade to `auto` (pplx_pro).
