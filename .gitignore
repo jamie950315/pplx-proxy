@@ -6,3 +6,4 @@ CUSTOM_PROMPTS
 venv/
 __pycache__/
 *.pyc
+.responses_store.json

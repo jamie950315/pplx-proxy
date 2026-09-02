@@ -25,6 +25,13 @@ timeout 15 curl -sN "$BASE/v1/chat/completions" \
   | head -8
 
 echo ""
+echo "--- Responses (non-streaming) ---"
+curl -s "$BASE/v1/responses" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $KEY" \
+  -d '{"model":"auto","input":"What is 2+2? Answer in one word.","store":true}' \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'  {d.get(\"status\")}: {str(d.get(\"output_text\",\"!\"))[:60]} id={d.get(\"id\")}')" 2>/dev/null
+
 echo "--- Debug page ---"
 echo "  Open $BASE/chat to test interactively"
 

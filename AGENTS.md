@@ -55,6 +55,7 @@ pplx-proxy.service   # systemd unit
 .env                 # Secrets + config
 .cookie_cache.json   # Cached cookie + timestamp
 .models.json         # Persisted model map
+.responses_store.json # Stored Responses API objects for retrieve/previous_response_id
 CUSTOM_PROMPTS       # Local prompt block prepended to every LobeHub request
 ```
 
@@ -73,7 +74,11 @@ CUSTOM_PROMPTS       # Local prompt block prepended to every LobeHub request
 **Auth required** (Bearer token):
 - `GET /v1/models` — tier-filtered model list (OpenAI-compatible format)
 - `POST /v1/chat/completions` — chat (streaming + non-streaming, thinking). `tools` parameter silently ignored.
-- `POST /v1/responses` — OpenAI Responses API compatibility (translates to chat/completions internally, used by LobeHub web search mode)
+- `POST /v1/responses` — OpenAI Responses API compatibility (direct Perplexity call, used by LobeHub web search and official SDKs)
+- `GET /v1/responses/{id}` — retrieve stored response
+- `DELETE /v1/responses/{id}` — delete stored response
+- `POST /v1/responses/{id}/cancel` — cancel background in-progress response
+- `GET /v1/responses/{id}/input_items` — list stored input items
 - `GET /admin/models` — full model map with internal details
 - `POST /admin/update-models` — modify models
 - `POST /admin/refresh-cookie` — inject new token

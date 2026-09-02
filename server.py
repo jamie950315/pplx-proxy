@@ -12,6 +12,8 @@ import asyncio
 import logging
 import re
 import hashlib
+import copy
+import threading
 from uuid import uuid4
 from typing import Optional, AsyncGenerator
 from pathlib import Path
@@ -34,6 +36,7 @@ DATA_DIR=Path(os.getenv("DATA_DIR", str(Path(__file__).parent)))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 COOKIE_FILE=DATA_DIR / ".cookie_cache.json"
 MODELS_FILE=DATA_DIR / ".models.json"
+RESPONSES_FILE=DATA_DIR / ".responses_store.json"
 DEFAULT_MODEL=os.getenv("DEFAULT_MODEL", "gpt")
 ACCOUNT_TYPE=os.getenv("ACCOUNT_TYPE", "pro").lower()  # free, pro, max
 PUBLIC_URL=os.getenv("PUBLIC_URL", "http://localhost:8892")
@@ -854,6 +857,16 @@ async def reconcile_configured_session() -> bool:
     return True
 
 
+class OpenAIAPIError(Exception):
+    def __init__(self, status_code: int, message: str, err_type: str="invalid_request_error", param: str=None, code: str=None):
+        self.status_code=status_code
+        self.message=message
+        self.err_type=err_type
+        self.param=param
+        self.code=code
+        super().__init__(message)
+
+
 # ─── Auth middleware ───────────────────────────────────────────────────────
 
 async def verify_api_key(request: Request):
@@ -876,6 +889,13 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 @app.exception_handler(RuntimeError)
 async def runtime_error_handler(request: Request, exc: RuntimeError):
     return JSONResponse(status_code=503, content={"error": {"message": str(exc), "type": "service_unavailable"}})
+
+@app.exception_handler(OpenAIAPIError)
+async def openai_api_error_handler(request: Request, exc: OpenAIAPIError):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": {"message": exc.message, "type": exc.err_type, "param": exc.param, "code": exc.code}},
+    )
 
 
 from fastapi.responses import FileResponse as _FileResponse
@@ -957,12 +977,35 @@ def _message_content_text(content) -> str:
     if isinstance(content, list):
         parts=[]
         for item in content:
-            if not isinstance(item, dict) or item.get("type") not in ("input_text", "text"):
+            if isinstance(item, str):
+                if item:
+                    parts.append(item)
                 continue
-            text=item.get("text", "")
-            if isinstance(text, str) and text:
-                parts.append(text)
+            if not isinstance(item, dict):
+                continue
+            typ=item.get("type")
+            if typ in ("input_text", "output_text", "text", "summary_text"):
+                text=item.get("text", "")
+                if isinstance(text, str) and text:
+                    parts.append(text)
+            elif typ == "refusal":
+                text=item.get("refusal") or item.get("text") or ""
+                if text:
+                    parts.append(str(text))
+            elif typ == "input_image":
+                url=item.get("image_url")
+                if isinstance(url, dict):
+                    url=url.get("url")
+                if isinstance(url, str) and url:
+                    parts.append(f"[image: {url}]")
+            elif typ == "input_file":
+                name=item.get("filename") or item.get("file_id") or "file"
+                parts.append(f"[file: {name}]")
         return " ".join(parts)
+    if isinstance(content, dict):
+        if content.get("type"):
+            return _message_content_text([content])
+        return str(content)
     if isinstance(content, str):
         return content
     if content is None:
@@ -990,82 +1033,296 @@ def _clean_response(text: str, strip: bool=True) -> str:
     return text
 
 
-@app.post("/v1/responses")
-async def responses_api(request: Request, _=Depends(verify_api_key)):
-    """OpenAI Responses API compatibility. Supports streaming SSE.
-    Used by LobeHub when 'use built-in web search' is enabled."""
-    body=await request.json()
-    stream=body.get("stream", False)
-    model_name=body.get("model", DEFAULT_MODEL)
-    inp=body.get("input", "")
-    instructions=body.get("instructions", "")
-    tools_raw=body.get("tools", [])
-    log.info(f"Responses API: model={model_name}, stream={stream}")
+# ─── Responses API store and helpers ───────────────────────────────────────
 
-    # Build messages from Responses API input
-    messages=[]
-    if instructions:
-        messages.append({"role": "system", "content": instructions})
+_RESPONSES_MAX_ENTRIES=300
+_RESPONSES_MAX_AGE=86400 * 7
+_SYSTEM_PROMPT_HINTS=("you are ", "you must ", "your role", "ccsearch", "加載", "技能", "available_skills", "<skill", "<user_memory", "<available_tools", "<tool_selection", "<credentials", "<best_practices", "<memory_effort", "<session_context")
+_responses_store={}
+_conversations_index={}
+_responses_tasks={}
+_responses_loaded=False
+_responses_file_lock=threading.Lock()
+
+def _responses_reset_memory():
+    global _responses_loaded
+    _responses_store.clear()
+    _conversations_index.clear()
+    _responses_tasks.clear()
+    _responses_loaded=False
+
+def _responses_load():
+    global _responses_loaded, _responses_store, _conversations_index
+    if _responses_loaded:
+        return
+    _responses_loaded=True
+    try:
+        if not RESPONSES_FILE.exists():
+            return
+        data=json.loads(RESPONSES_FILE.read_text())
+        recs=data.get("responses") if isinstance(data, dict) else data
+        convs=data.get("conversations") if isinstance(data, dict) else {}
+        now=time.time()
+        restored={}
+        for rid, rec in (recs or {}).items():
+            if not isinstance(rec, dict):
+                continue
+            created=rec.get("created_at") or 0
+            if now - created > _RESPONSES_MAX_AGE:
+                continue
+            if rec.get("status") == "in_progress":
+                rec["status"]="failed"
+                rec["error"]={"code": "server_error", "message": "Response interrupted by server restart"}
+            restored[rid]=rec
+        _responses_store=restored
+        _conversations_index={k: v for k, v in (convs or {}).items() if v in restored}
+    except Exception as e:
+        log.warning(f"Failed to load responses store: {e}")
+
+def _responses_persist():
+    try:
+        RESPONSES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        durable={k: v for k, v in _responses_store.items() if v.get("store", True)}
+        payload={"responses": durable, "conversations": {k: v for k, v in _conversations_index.items() if v in durable}}
+        tmp=RESPONSES_FILE.with_name(f".{RESPONSES_FILE.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False))
+        tmp.replace(RESPONSES_FILE)
+    except Exception as e:
+        log.warning(f"Failed to persist responses store: {e}")
+
+def _responses_evict():
+    now=time.time()
+    expired=[rid for rid, rec in _responses_store.items() if now - (rec.get("created_at") or 0) > _RESPONSES_MAX_AGE]
+    for rid in expired:
+        _responses_store.pop(rid, None)
+    if len(_responses_store) <= _RESPONSES_MAX_ENTRIES:
+        return
+    extra=len(_responses_store) - _RESPONSES_MAX_ENTRIES
+    oldest=sorted(_responses_store.items(), key=lambda kv: kv[1].get("created_at") or 0)[:extra]
+    for rid, _rec in oldest:
+        _responses_store.pop(rid, None)
+
+def _responses_put(rec: dict, persist: bool=True):
+    _responses_load()
+    _responses_store[rec["id"]]=rec
+    conv=rec.get("conversation")
+    conv_id=conv.get("id") if isinstance(conv, dict) else conv
+    if conv_id:
+        _conversations_index[conv_id]=rec["id"]
+    _responses_evict()
+    if persist and rec.get("store", True):
+        with _responses_file_lock:
+            _responses_persist()
+
+def _responses_get(response_id: str):
+    _responses_load()
+    return _responses_store.get(response_id)
+
+def _responses_delete(response_id: str) -> bool:
+    _responses_load()
+    rec=_responses_store.pop(response_id, None)
+    if not rec:
+        return False
+    conv=rec.get("conversation")
+    conv_id=conv.get("id") if isinstance(conv, dict) else conv
+    if conv_id and _conversations_index.get(conv_id) == response_id:
+        _conversations_index.pop(conv_id, None)
+    with _responses_file_lock:
+        _responses_persist()
+    return True
+
+def _responses_public(rec: dict) -> dict:
+    return {k: copy.deepcopy(v) for k, v in rec.items() if not str(k).startswith("_")}
+
+def _estimate_tokens(text: str) -> int:
+    return max(0, len(text or "") // 4)
+
+def _responses_usage(query: str, output: str, reasoning: str="") -> dict:
+    inp=_estimate_tokens(query)
+    reason=_estimate_tokens(reasoning)
+    out=_estimate_tokens(output)+reason
+    return {
+        "input_tokens": inp,
+        "output_tokens": out,
+        "total_tokens": inp+out,
+        "input_tokens_details": {"cached_tokens": 0},
+        "output_tokens_details": {"reasoning_tokens": reason},
+    }
+
+def _sse_pack(event: str, data: dict, seq: int) -> tuple[str, int]:
+    payload=dict(data)
+    payload.setdefault("type", event)
+    payload.setdefault("sequence_number", seq)
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n", seq+1
+
+def _responses_output_items(msg_id: str, text: str, reasoning_text: str="", rs_id: str=None) -> list:
+    items=[]
+    if reasoning_text:
+        items.append({
+            "id": rs_id or f"rs_{uuid4().hex[:12]}",
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": reasoning_text}],
+        })
+    items.append({
+        "id": msg_id,
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": text, "annotations": []}],
+    })
+    return items
+
+def _responses_normalize_input_items(inp) -> list:
+    if inp is None or inp == "":
+        return []
     if isinstance(inp, str):
-        messages.append({"role": "user", "content": inp})
-    elif isinstance(inp, list):
-        for item in inp:
-            if isinstance(item, str):
-                messages.append({"role": "user", "content": item})
+        return [{
+            "id": f"msg_{uuid4().hex[:8]}",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": inp}],
+        }]
+    if not isinstance(inp, list):
+        return []
+    items=[]
+    for item in inp:
+        if isinstance(item, str):
+            items.append({
+                "id": f"msg_{uuid4().hex[:8]}",
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": item}],
+            })
+            continue
+        if not isinstance(item, dict):
+            continue
+        cloned=dict(item)
+        cloned.setdefault("id", f"msg_{uuid4().hex[:8]}")
+        if "type" not in cloned:
+            cloned["type"]="message"
+            cloned.setdefault("role", "user")
+            if isinstance(cloned.get("content"), str):
+                cloned["content"]=[{"type": "input_text", "text": cloned["content"]}]
+        items.append(cloned)
+    return items
+
+def _responses_parse_input(inp, instructions="") -> list:
+    messages=[]
+    if isinstance(instructions, str) and instructions.strip():
+        messages.append({"role": "system", "content": instructions})
+    elif isinstance(instructions, list):
+        for item in instructions:
+            if isinstance(item, str) and item.strip():
+                messages.append({"role": "system", "content": item})
             elif isinstance(item, dict):
-                role=item.get("role", "user")
-                if role=="developer": role="system"
-                content=_message_content_text(item.get("content", ""))
+                content=_message_content_text(item.get("content", item.get("text", "")))
                 if content:
-                    messages.append({"role": role, "content": content})
+                    messages.append({"role": "system", "content": content})
+    if isinstance(inp, str):
+        if inp.strip():
+            messages.append({"role": "user", "content": inp})
+        return messages
+    if inp is None:
+        return messages
+    if not isinstance(inp, list):
+        raise OpenAIAPIError(400, "input must be a string or an array of items", param="input")
+    for i, item in enumerate(inp):
+        if isinstance(item, str):
+            if item.strip():
+                messages.append({"role": "user", "content": item})
+            continue
+        if not isinstance(item, dict):
+            raise OpenAIAPIError(400, f"input[{i}] must be a string or object", param="input")
+        typ=item.get("type")
+        if typ in (None, "message", "input_message"):
+            role=item.get("role", "user")
+            if role == "developer":
+                role="system"
+            content=_message_content_text(item.get("content", ""))
+            if content:
+                messages.append({"role": role, "content": content})
+        elif typ == "function_call_output":
+            output=item.get("output", "")
+            call_id=item.get("call_id", "")
+            messages.append({"role": "user", "content": f"[tool output {call_id}]: {output}"})
+        elif typ in ("function_call", "reasoning", "item_reference", "web_search_call", "file_search_call", "computer_call", "mcp_call", "image_generation_call"):
+            continue
+        else:
+            role=item.get("role")
+            content=_message_content_text(item.get("content", item.get("text", item.get("output", ""))))
+            if role and content:
+                if role == "developer":
+                    role="system"
+                messages.append({"role": role, "content": content})
+    return messages
 
-    if not messages or not any(m.get("role")=="user" for m in messages):
-        raise HTTPException(400, "No user message found in input")
+def _responses_apply_previous(messages: list, previous_response_id, conversation):
+    prev_id=previous_response_id
+    conv_id=None
+    if conversation and prev_id:
+        raise OpenAIAPIError(400, "previous_response_id cannot be used together with conversation", param="previous_response_id")
+    if isinstance(conversation, dict):
+        conv_id=conversation.get("id")
+    elif isinstance(conversation, str) and conversation:
+        conv_id=conversation
+    if conv_id and not prev_id:
+        _responses_load()
+        prev_id=_conversations_index.get(conv_id)
+        if not prev_id:
+            return messages, None, conv_id
+    if not prev_id:
+        return messages, None, conv_id
+    rec=_responses_get(prev_id)
+    if not rec:
+        raise OpenAIAPIError(404, f"No model response found with id '{prev_id}'.", param="previous_response_id")
+    prior=[{"role": r, "content": c} for r, c in rec.get("_history_messages") or []]
+    system_msgs=[m for m in messages if m.get("role") == "system"]
+    other=[m for m in messages if m.get("role") != "system"]
+    return system_msgs+prior+other, prev_id, conv_id
 
-    # Build query using same logic as chat/completions
+def _prepare_pplx_from_messages(messages: list, log_source: str, extra_instructions: list=None):
     system_msg=""
     history=[]
     for msg in messages:
-        role=msg.get("role","user")
-        # Detect user messages that are actually system prompts
-        if role=="user":
-            _ct=(msg.get("content") or "")[:200].lower()
-            if any(kw in _ct for kw in ["you are ", "you must ", "your role", "ccsearch", "加載", "技能", "available_skills", "<skill", "<user_memory", "<available_tools", "<tool_selection", "<credentials", "<best_practices", "<memory_effort", "<session_context"]):
+        role=msg.get("role", "user")
+        if role == "developer":
+            role="system"
+        content=_message_content_text(msg.get("content"))
+        if role == "user":
+            _ct=content[:200].lower()
+            if any(kw in _ct for kw in _SYSTEM_PROMPT_HINTS):
                 role="system"
-        content=msg.get("content") or ""
-        # Strip rate limit notices from previous responses
         content=_strip_appended_notices(content)
-        if role=="system":
+        if not content or not content.strip():
+            continue
+        if role == "system":
             system_msg+=content+"\n"
-        elif role=="user":
+        elif role == "tool":
             history.append(("user", content))
-        elif role=="assistant":
-            history.append(("assistant", content))
-
-    # Dedup consecutive assistants
+        elif role in ("user", "assistant"):
+            history.append((role, content))
     deduped=[]
-    for role,content in history:
-        if deduped and role=="assistant" and deduped[-1][0]=="assistant":
-            deduped[-1]=(role,content)
+    for role, content in history:
+        if deduped and role == "assistant" and deduped[-1][0] == "assistant":
+            deduped[-1]=(role, content)
         else:
-            deduped.append((role,content))
+            deduped.append((role, content))
     history=deduped
-
     current_msg=""
-    if history and history[-1][0]=="user":
+    if history and history[-1][0] == "user":
         current_msg=history[-1][1]
         history=history[:-1]
-
     request_source=_detect_request_source(system_msg, messages)
     is_lobehub=request_source == "lobehub"
     is_first_user_turn=is_lobehub and not history
-
-    # Session continuity: check if we can skip history/instructions
     follow_up_uuid=_session_lookup(history)
+    extra_instructions=list(extra_instructions or [])
     if follow_up_uuid:
         query=current_msg
-        final_instructions=[]
-        log.info(f"SESSION CONTINUE [responses_api] source={request_source} follow_up={follow_up_uuid[:12]}...")
+        final_instructions=extra_instructions
+        if extra_instructions:
+            query=("\n".join(extra_instructions)+"\n"+current_msg).strip()
+        log.info(f"SESSION CONTINUE [{log_source}] source={request_source} follow_up={follow_up_uuid[:12]}...")
     else:
         custom_prompts=_load_custom_prompts() if is_lobehub else ""
         final_instructions=[]
@@ -1074,8 +1331,7 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
                 final_instructions.append(custom_prompts)
         else:
             final_instructions=_filter_system_prompt(system_msg) if system_msg else []
-
-        # Build query as JSON for clear block separation
+        final_instructions.extend(extra_instructions)
         query_obj={}
         if final_instructions:
             query_obj["instructions"]=final_instructions
@@ -1085,155 +1341,444 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
             query_obj["query"]=current_msg
         elif not history:
             query_obj["query"]=""
-
         query=json.dumps(query_obj, ensure_ascii=False)
         if len(query) > 96000:
             query=query[-96000:]
+    _log_prompt_payload(log_source, request_source, system_msg, final_instructions, history, current_msg, query, is_first_user_turn, not bool(follow_up_uuid) and bool(final_instructions))
+    return {
+        "system_msg": system_msg,
+        "history": history,
+        "current_msg": current_msg,
+        "request_source": request_source,
+        "is_first_user_turn": is_first_user_turn,
+        "follow_up_uuid": follow_up_uuid,
+        "final_instructions": final_instructions,
+        "query": query,
+    }
 
-    _log_prompt_payload("responses_api", request_source, system_msg, final_instructions, history, current_msg, query, is_first_user_turn, not bool(follow_up_uuid) and bool(final_instructions))
-    if not query.strip():
-        raise HTTPException(400, "Empty query after processing")
-
+def _responses_resolve_model(model_name: str, use_thinking: bool):
     mm=get_model_map()
+    tier_err=check_tier(model_name)
+    if tier_err:
+        raise OpenAIAPIError(403, tier_err, param="model")
     if model_name not in mm:
-        raise HTTPException(400, f"Unknown model: {model_name}")
-    mode, model_pref=mm[model_name]
-
-    # Quota fallback: auto-downgrade when Pro quota exhausted
+        raise OpenAIAPIError(400, f"Unknown model: {model_name}. Available: {list(mm.keys())}", param="model")
+    if use_thinking and model_name in _THINKING_MAP:
+        mode, model_pref=_THINKING_MAP[model_name]
+        log.info(f"thinking on → {model_name} using {model_pref}")
+    else:
+        try:
+            mode, model_pref=mm[model_name]
+        except (ValueError, TypeError):
+            raise OpenAIAPIError(500, f"Corrupted model entry for {model_name}", err_type="server_error", param="model")
     if _rate_limit.get("remaining_pro") is not None and _rate_limit["remaining_pro"] <= 0 and model_name != "auto":
         log.warning(f"Pro quota exhausted (remaining_pro={_rate_limit['remaining_pro']}), falling back {model_name}→auto")
         mode, model_pref=mm.get("auto", ("pro", "pplx_pro"))
         model_name="auto"
+    return model_name, mode, model_pref
+
+def _responses_new_record(model_name, instructions, max_output_tokens, previous_response_id, reasoning, store_flag, temperature, text_cfg, tool_choice, tools_raw, top_p, truncation, metadata, user, background, conv_id, input_items, query, parallel_tool_calls):
+    resp_id=f"resp_{uuid4().hex}"
+    msg_id=f"msg_{uuid4().hex[:12]}"
+    rs_id=f"rs_{uuid4().hex[:12]}"
+    created=int(time.time())
+    if isinstance(instructions, list):
+        instructions_value=json.dumps(instructions, ensure_ascii=False)
+    elif isinstance(instructions, str) and instructions:
+        instructions_value=instructions
+    else:
+        instructions_value=None
+    return {
+        "id": resp_id,
+        "object": "response",
+        "created_at": created,
+        "status": "in_progress",
+        "error": None,
+        "incomplete_details": None,
+        "instructions": instructions_value,
+        "max_output_tokens": max_output_tokens,
+        "model": model_name,
+        "output": [],
+        "parallel_tool_calls": parallel_tool_calls,
+        "previous_response_id": previous_response_id,
+        "reasoning": reasoning if isinstance(reasoning, dict) else None,
+        "store": store_flag,
+        "temperature": temperature,
+        "text": text_cfg if text_cfg else {"format": {"type": "text"}},
+        "tool_choice": tool_choice if tool_choice is not None else "auto",
+        "tools": tools_raw if isinstance(tools_raw, list) else [],
+        "top_p": top_p,
+        "truncation": truncation or "disabled",
+        "usage": None,
+        "metadata": metadata if isinstance(metadata, dict) else {},
+        "output_text": "",
+        "user": user,
+        "background": bool(background),
+        "conversation": {"id": conv_id} if conv_id else None,
+        "_input_items": input_items,
+        "_history_messages": [],
+        "_backend_uuid": None,
+        "_query": query,
+        "_msg_id": msg_id,
+        "_rs_id": rs_id,
+    }
+
+def _responses_finalize(rec, query, full, thinking_parts, backend_uuid, actual_model, history, current_msg, mode, model_pref):
+    full=_clean_response(full)
+    _session_store(history, current_msg, full, backend_uuid)
+    if mode != "auto":
+        _decrement_pro()
+    notice=_response_suffix(model_pref, actual_model)
+    if notice:
+        full+=notice
+    reasoning_text="\n".join(thinking_parts) if thinking_parts else ""
+    rec["output"]=_responses_output_items(rec["_msg_id"], full, reasoning_text, rec.get("_rs_id"))
+    rec["output_text"]=full
+    rec["status"]="completed"
+    rec["error"]=None
+    rec["usage"]=_responses_usage(query, _strip_appended_notices(full), reasoning_text)
+    rec["_backend_uuid"]=backend_uuid
+    new_hist=list(history)
+    if current_msg:
+        new_hist.append(("user", current_msg))
+    new_hist.append(("assistant", _strip_appended_notices(full)))
+    rec["_history_messages"]=new_hist
+    rec["_query"]=query
+    _responses_put(rec, persist=rec.get("store", True))
+    return rec
+
+async def _responses_collect_answer(client, query, mode, model_pref, follow_up_uuid):
+    full=""
+    thinking_parts=[]
+    backend_uuid=None
+    actual_model=None
+    async for ch in client.search(query, mode, model_pref, ["web"], "en-US", follow_up_uuid):
+        if ch.get("backend_uuid"):
+            backend_uuid=ch["backend_uuid"]
+        if ch.get("actual_model"):
+            actual_model=ch["actual_model"]
+        if ch.get("error"):
+            return {"error": ch["error"], "full": full, "thinking_parts": thinking_parts, "backend_uuid": backend_uuid, "actual_model": actual_model}
+        if ch.get("thinking"):
+            thinking_parts.append(ch["thinking"])
+            continue
+        if ch.get("done"):
+            full=ch.get("answer", full)
+            actual_model=ch.get("actual_model", actual_model)
+            break
+        full=ch.get("answer", full)
+    return {"error": None, "full": full, "thinking_parts": thinking_parts, "backend_uuid": backend_uuid, "actual_model": actual_model}
+
+async def _responses_background_job(resp_id, query, mode, model_pref, follow_up_uuid, history, current_msg):
+    try:
+        client=get_client()
+        result=await _responses_collect_answer(client, query, mode, model_pref, follow_up_uuid)
+        rec=_responses_get(resp_id)
+        if not rec or rec.get("status") == "cancelled":
+            return
+        if result["error"]:
+            rec["status"]="failed"
+            rec["error"]={"code": "server_error", "message": str(result["error"])}
+            _responses_put(rec, persist=rec.get("store", True))
+            return
+        _responses_finalize(rec, query, result["full"], result["thinking_parts"], result["backend_uuid"], result["actual_model"], history, current_msg, mode, model_pref)
+    except asyncio.CancelledError:
+        rec=_responses_get(resp_id)
+        if rec and rec.get("status") == "in_progress":
+            rec["status"]="cancelled"
+            rec["incomplete_details"]={"reason": "cancelled"}
+            _responses_put(rec, persist=rec.get("store", True))
+        raise
+    except Exception as e:
+        log.exception("background response failed")
+        rec=_responses_get(resp_id)
+        if rec:
+            rec["status"]="failed"
+            rec["error"]={"code": "server_error", "message": str(e)}
+            _responses_put(rec, persist=rec.get("store", True))
+    finally:
+        _responses_tasks.pop(resp_id, None)
+
+async def _stream_responses_api(client, rec, query, mode, model_pref, follow_up_uuid, history, current_msg):
+    seq=0
+    msg_id=rec["_msg_id"]
+    rs_id=rec["_rs_id"]
+    def _wrap(event, rec_obj):
+        public=_responses_public(rec_obj)
+        payload=dict(public)
+        payload["response"]=public
+        return _sse_pack(event, payload, seq)
+    chunk, seq=_wrap("response.created", rec)
+    yield chunk
+    chunk, seq=_wrap("response.in_progress", rec)
+    yield chunk
+
+    full=""
+    backend_uuid=None
+    thinking_parts=[]
+    thinking_started=False
+    thinking_closed=False
+    message_started=False
+    actual_model=None
+    msg_output_index=0
+
+    async for ch in client.search(query, mode, model_pref, ["web"], "en-US", follow_up_uuid):
+        if ch.get("backend_uuid"):
+            backend_uuid=ch["backend_uuid"]
+        if ch.get("actual_model"):
+            actual_model=ch["actual_model"]
+        if ch.get("error"):
+            rec["status"]="failed"
+            rec["error"]={"code": "server_error", "message": str(ch["error"])}
+            _responses_put(rec, persist=rec.get("store", True))
+            chunk, seq=_wrap("response.failed", rec)
+            yield chunk
+            chunk, seq=_sse_pack("error", {"error": ch["error"]}, seq)
+            yield chunk
+            return
+        if ch.get("thinking"):
+            t=ch["thinking"]
+            thinking_parts.append(t)
+            if not thinking_started:
+                thinking_started=True
+                item={"id": rs_id, "type": "reasoning", "summary": []}
+                chunk, seq=_sse_pack("response.output_item.added", {"output_index": 0, "item": item}, seq)
+                yield chunk
+                chunk, seq=_sse_pack("response.reasoning_summary_part.added", {"item_id": rs_id, "output_index": 0, "summary_index": 0, "part": {"type": "summary_text", "text": ""}}, seq)
+                yield chunk
+            evt={"item_id": rs_id, "output_index": 0, "summary_index": 0, "delta": t+"\n"}
+            chunk, seq=_sse_pack("response.reasoning_summary_text.delta", evt, seq)
+            yield chunk
+            continue
+        if ch.get("done"):
+            full=ch.get("answer", full)
+            actual_model=ch.get("actual_model", actual_model)
+            break
+        delta=ch.get("delta", "")
+        if delta:
+            delta=_clean_response(delta, strip=False)
+        if not delta:
+            if ch.get("answer"):
+                full=ch.get("answer", full)
+            continue
+        if thinking_started and not thinking_closed:
+            thinking_closed=True
+            think_full="\n".join(thinking_parts)
+            chunk, seq=_sse_pack("response.reasoning_summary_text.done", {"item_id": rs_id, "output_index": 0, "summary_index": 0, "text": think_full}, seq)
+            yield chunk
+            chunk, seq=_sse_pack("response.reasoning_summary_part.done", {"item_id": rs_id, "output_index": 0, "summary_index": 0, "part": {"type": "summary_text", "text": think_full}}, seq)
+            yield chunk
+            chunk, seq=_sse_pack("response.output_item.done", {"output_index": 0, "item": {"id": rs_id, "type": "reasoning", "summary": [{"type": "summary_text", "text": think_full}]}}, seq)
+            yield chunk
+            msg_output_index=1
+        if not message_started:
+            message_started=True
+            item={"id": msg_id, "type": "message", "status": "in_progress", "role": "assistant", "content": []}
+            chunk, seq=_sse_pack("response.output_item.added", {"output_index": msg_output_index, "item": item, "id": msg_id, "role": "assistant"}, seq)
+            yield chunk
+            chunk, seq=_sse_pack("response.content_part.added", {"item_id": msg_id, "output_index": msg_output_index, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}}, seq)
+            yield chunk
+        evt={"item_id": msg_id, "output_index": msg_output_index, "content_index": 0, "delta": delta}
+        chunk, seq=_sse_pack("response.output_text.delta", evt, seq)
+        yield chunk
+
+    if thinking_started and not thinking_closed:
+        thinking_closed=True
+        think_full="\n".join(thinking_parts)
+        chunk, seq=_sse_pack("response.reasoning_summary_text.done", {"item_id": rs_id, "output_index": 0, "summary_index": 0, "text": think_full}, seq)
+        yield chunk
+        chunk, seq=_sse_pack("response.reasoning_summary_part.done", {"item_id": rs_id, "output_index": 0, "summary_index": 0, "part": {"type": "summary_text", "text": think_full}}, seq)
+        yield chunk
+        chunk, seq=_sse_pack("response.output_item.done", {"output_index": 0, "item": {"id": rs_id, "type": "reasoning", "summary": [{"type": "summary_text", "text": think_full}]}}, seq)
+        yield chunk
+        msg_output_index=1
+
+    rec=_responses_finalize(rec, query, full, thinking_parts, backend_uuid, actual_model, history, current_msg, mode, model_pref)
+    final_text=rec.get("output_text") or ""
+    raw_full=_clean_response(full)
+    streamed_notice=final_text[len(raw_full):] if final_text.startswith(raw_full) else ""
+    if not message_started:
+        message_started=True
+        item={"id": msg_id, "type": "message", "status": "in_progress", "role": "assistant", "content": []}
+        chunk, seq=_sse_pack("response.output_item.added", {"output_index": msg_output_index, "item": item, "id": msg_id, "role": "assistant"}, seq)
+        yield chunk
+        chunk, seq=_sse_pack("response.content_part.added", {"item_id": msg_id, "output_index": msg_output_index, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}}, seq)
+        yield chunk
+        if raw_full:
+            chunk, seq=_sse_pack("response.output_text.delta", {"item_id": msg_id, "output_index": msg_output_index, "content_index": 0, "delta": raw_full}, seq)
+            yield chunk
+    if streamed_notice:
+        chunk, seq=_sse_pack("response.output_text.delta", {"item_id": msg_id, "output_index": msg_output_index, "content_index": 0, "delta": streamed_notice}, seq)
+        yield chunk
+    chunk, seq=_sse_pack("response.output_text.done", {"item_id": msg_id, "output_index": msg_output_index, "content_index": 0, "text": final_text}, seq)
+    yield chunk
+    chunk, seq=_sse_pack("response.content_part.done", {"item_id": msg_id, "output_index": msg_output_index, "content_index": 0, "part": {"type": "output_text", "text": final_text, "annotations": []}}, seq)
+    yield chunk
+    msg_item={"id": msg_id, "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": final_text, "annotations": []}]}
+    chunk, seq=_sse_pack("response.output_item.done", {"output_index": msg_output_index, "item": msg_item}, seq)
+    yield chunk
+    chunk, seq=_wrap("response.completed", rec)
+    yield chunk
+
+@app.post("/v1/responses")
+async def responses_api(request: Request, _=Depends(verify_api_key)):
+    """OpenAI Responses API compatibility: create, stream, store, and chain turns."""
+    try:
+        body=await request.json()
+    except Exception:
+        raise OpenAIAPIError(400, "Invalid or empty JSON body")
+    if not isinstance(body, dict):
+        raise OpenAIAPIError(400, "Request body must be an object")
+
+    stream=body.get("stream", False)
+    if isinstance(stream, dict):
+        stream=True
+    stream=bool(stream)
+    background=bool(body.get("background", False))
+    if background and stream:
+        raise OpenAIAPIError(400, "background=true cannot be combined with stream=true", param="background")
+
+    model_name=body.get("model", DEFAULT_MODEL)
+    inp=body.get("input", "")
+    instructions=body.get("instructions", "")
+    tools_raw=body.get("tools", [])
+    previous_response_id=body.get("previous_response_id")
+    conversation=body.get("conversation")
+    store_flag=True if body.get("store") is None else bool(body.get("store"))
+    metadata=body.get("metadata") or {}
+    reasoning=body.get("reasoning")
+    temperature=body.get("temperature", 1.0)
+    top_p=body.get("top_p", 1.0)
+    max_output_tokens=body.get("max_output_tokens")
+    tool_choice=body.get("tool_choice", "auto")
+    truncation=body.get("truncation") or "disabled"
+    parallel_tool_calls=True if body.get("parallel_tool_calls") is None else bool(body.get("parallel_tool_calls"))
+    user=body.get("user")
+    text_cfg=body.get("text") if isinstance(body.get("text"), dict) else {}
+    log.info(f"Responses API: model={model_name}, stream={stream}, background={background}")
+
+    effort=None
+    if isinstance(reasoning, dict):
+        effort=reasoning.get("effort")
+    use_thinking=bool(effort) and str(effort).lower() not in ("none", "null")
+
+    model_name, mode, model_pref=_responses_resolve_model(model_name, use_thinking)
+    messages=_responses_parse_input(inp, instructions)
+    extra_instructions=[]
+    fmt=text_cfg.get("format") if isinstance(text_cfg.get("format"), dict) else {}
+    if fmt.get("type") == "json_object":
+        extra_instructions.append("Return a valid JSON object only, with no markdown.")
+    elif fmt.get("type") == "json_schema":
+        schema=fmt.get("schema") or (fmt.get("json_schema") or {}).get("schema") or {}
+        extra_instructions.append("Return JSON matching this schema: "+json.dumps(schema, ensure_ascii=False))
+
+    messages, prev_id, conv_id=_responses_apply_previous(messages, previous_response_id, conversation)
+    if not messages or not any(m.get("role") == "user" for m in messages):
+        raise OpenAIAPIError(400, "No user message found in input", param="input")
+
+    prepared=_prepare_pplx_from_messages(messages, "responses_api", extra_instructions)
+    query=prepared["query"]
+    if not (query or "").strip():
+        raise OpenAIAPIError(400, "Empty query after processing", param="input")
+
+    rec=_responses_new_record(
+        model_name, instructions, max_output_tokens, prev_id, reasoning, store_flag,
+        temperature, text_cfg, tool_choice, tools_raw, top_p, truncation, metadata, user,
+        background, conv_id, _responses_normalize_input_items(inp), query, parallel_tool_calls,
+    )
+    rec["_history_messages"]=list(prepared["history"])+[("user", prepared["current_msg"])] if prepared["current_msg"] else list(prepared["history"])
+    _responses_put(rec, persist=store_flag)
+
+    if background:
+        task=asyncio.create_task(_responses_background_job(
+            rec["id"], query, mode, model_pref, prepared["follow_up_uuid"],
+            prepared["history"], prepared["current_msg"],
+        ))
+        _responses_tasks[rec["id"]]=task
+        return _responses_public(rec)
 
     client=get_client()
-    resp_id=f"resp_{uuid4().hex[:12]}"
-    created=int(time.time())
-
     if stream:
-        async def _stream_responses_api():
-            # Emit response.created
-            resp_obj={"id": resp_id, "object": "response", "created_at": created,
-                      "model": model_name, "status": "in_progress", "output": []}
-            yield f"event: response.created\ndata: {json.dumps(resp_obj)}\n\n"
+        return StreamingResponse(
+            _stream_responses_api(client, rec, query, mode, model_pref, prepared["follow_up_uuid"], prepared["history"], prepared["current_msg"]),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
-            # Emit output_item.added
-            msg_id=f"msg_{uuid4().hex[:8]}"
-            yield f"event: response.output_item.added\ndata: {json.dumps({'type': 'message', 'id': msg_id, 'role': 'assistant'})}\n\n"
+    result=await _responses_collect_answer(client, query, mode, model_pref, prepared["follow_up_uuid"])
+    if result["error"]:
+        rec["status"]="failed"
+        rec["error"]={"code": "server_error", "message": str(result["error"])}
+        _responses_put(rec, persist=store_flag)
+        raise OpenAIAPIError(502, str(result["error"]), err_type="server_error")
+    rec=_responses_finalize(rec, query, result["full"], result["thinking_parts"], result["backend_uuid"], result["actual_model"], prepared["history"], prepared["current_msg"], mode, model_pref)
+    return _responses_public(rec)
 
-            # Start reasoning summary part
-            yield f"event: response.reasoning_summary_part.added\ndata: {json.dumps({'type': 'reasoning_summary_part', 'item_id': msg_id})}\n\n"
 
-            full=""
-            _resp_backend_uuid=None
-            _thinking_parts=[]
-            _thinking_done=False
-            _actual_model=None
-            async for ch in client.search(query, mode, model_pref, ["web"], "en-US", follow_up_uuid):
-                if ch.get("backend_uuid"):
-                    _resp_backend_uuid=ch["backend_uuid"]
-                if ch.get("actual_model"):
-                    _actual_model=ch["actual_model"]
-                if ch.get("error"):
-                    yield f"event: error\ndata: {json.dumps({'error': ch['error']})}\n\n"
-                    break
-                if ch.get("thinking"):
-                    t=ch["thinking"]
-                    # Emit as reasoning summary delta (OpenAI Responses API format)
-                    _thinking_parts.append(t)
-                    evt={"type": "response.reasoning_summary_text.delta", "item_id": msg_id, "delta": t+"\n"}
-                    yield f"event: response.reasoning_summary_text.delta\ndata: {json.dumps(evt)}\n\n"
-                    continue
-                if ch.get("done"):
-                    full=ch.get("answer", full)
-                    _actual_model=ch.get("actual_model", _actual_model)
-                    # Close reasoning if still open
-                    if not _thinking_done:
-                        _thinking_done=True
-                        think_full="\n".join(_thinking_parts)
-                        yield f"event: response.reasoning_summary_text.done\ndata: {json.dumps({'type': 'response.reasoning_summary_text.done', 'item_id': msg_id, 'text': think_full})}\n\n"
-                        yield f"event: response.reasoning_summary_part.done\ndata: {json.dumps({'type': 'reasoning_summary_part', 'item_id': msg_id})}\n\n"
-                    break
-                # Close reasoning summary on first content chunk
-                if not _thinking_done:
-                    _thinking_done=True
-                    think_full="\n".join(_thinking_parts)
-                    yield f"event: response.reasoning_summary_text.done\ndata: {json.dumps({'type': 'response.reasoning_summary_text.done', 'item_id': msg_id, 'text': think_full})}\n\n"
-                    yield f"event: response.reasoning_summary_part.done\ndata: {json.dumps({'type': 'reasoning_summary_part', 'item_id': msg_id})}\n\n"
-                # Stream delta
-                delta=ch.get("delta", "")
-                if delta:
-                    delta=_clean_response(delta, strip=False)
-                    if delta:
-                        evt={"type": "response.output_text.delta", "item_id": msg_id, "delta": delta}
-                        yield f"event: response.output_text.delta\ndata: {json.dumps(evt)}\n\n"
+@app.get("/v1/responses/{response_id}")
+async def retrieve_response(response_id: str, _=Depends(verify_api_key)):
+    rec=_responses_get(response_id)
+    if not rec:
+        raise OpenAIAPIError(404, f"No model response found with id '{response_id}'.", param="response_id")
+    return _responses_public(rec)
 
-            full=_clean_response(full)
 
-            # Rate limit decrement + notices
-            _decrement_pro()
-            notice=_response_suffix(model_pref, _actual_model)
-            if notice:
-                evt_n={"type": "response.output_text.delta", "item_id": msg_id, "delta": notice}
-                yield f"event: response.output_text.delta\ndata: {json.dumps(evt_n)}\n\n"
-                full+=notice
+@app.delete("/v1/responses/{response_id}")
+async def delete_response(response_id: str, _=Depends(verify_api_key)):
+    if not _responses_delete(response_id):
+        raise OpenAIAPIError(404, f"No model response found with id '{response_id}'.", param="response_id")
+    task=_responses_tasks.pop(response_id, None)
+    if task:
+        task.cancel()
+    return {"id": response_id, "object": "response", "deleted": True}
 
-            # Emit output_text.done
-            yield f"event: response.output_text.done\ndata: {json.dumps({'type': 'response.output_text.done', 'item_id': msg_id, 'text': full})}\n\n"
 
-            # Store session for next turn (use cleaned text before notice)
-            _clean_full=_strip_appended_notices(full)
-            _session_store(history, current_msg, _clean_full, _resp_backend_uuid)
+@app.post("/v1/responses/{response_id}/cancel")
+async def cancel_response(response_id: str, _=Depends(verify_api_key)):
+    rec=_responses_get(response_id)
+    if not rec:
+        raise OpenAIAPIError(404, f"No model response found with id '{response_id}'.", param="response_id")
+    if rec.get("status") != "in_progress":
+        raise OpenAIAPIError(400, "Only in-progress responses can be cancelled.", param="response_id")
+    task=_responses_tasks.get(response_id)
+    if task:
+        task.cancel()
+    rec["status"]="cancelled"
+    rec["incomplete_details"]={"reason": "cancelled"}
+    _responses_put(rec, persist=rec.get("store", True))
+    return _responses_public(rec)
 
-            # Emit response.completed
-            done_resp={"id": resp_id, "object": "response", "created_at": created,
-                       "model": model_name, "status": "completed",
-                       "output": [{"type": "message", "id": msg_id, "role": "assistant", "status": "completed",
-                                   "content": [{"type": "output_text", "text": full, "annotations": []}]}],
-                       "output_text": full,
-                       "usage": {"prompt_tokens": len(query)//4, "completion_tokens": len(full)//4, "total_tokens": (len(query)+len(full))//4}}
-            yield f"event: response.completed\ndata: {json.dumps(done_resp)}\n\n"
 
-        return StreamingResponse(_stream_responses_api(), media_type="text/event-stream",
-                                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-
-    else:
-        # Non-streaming: collect full response
-        full=""
-        resp_backend_uuid=None
-        actual_model=None
-        async for ch in client.search(query, mode, model_pref, ["web"], "en-US", follow_up_uuid):
-            if ch.get("backend_uuid"):
-                resp_backend_uuid=ch["backend_uuid"]
-            if ch.get("actual_model"):
-                actual_model=ch["actual_model"]
-            if ch.get("error"):
-                raise HTTPException(502, ch)
-            if ch.get("done"):
-                full=ch.get("answer", full)
-                actual_model=ch.get("actual_model", actual_model)
-                break
-            full=ch.get("answer", full)
-        full=_clean_response(full)
-
-        # Store session for next turn
-        _session_store(history, current_msg, full, resp_backend_uuid)
-
-        # Rate limit decrement + notices
-        _decrement_pro()
-        notice=_response_suffix(model_pref, actual_model)
-        if notice:
-            full+=notice
-
-        return {
-            "id": resp_id, "object": "response", "created_at": created, "model": model_name,
-            "output": [{"type": "message", "id": f"msg_{uuid4().hex[:8]}", "role": "assistant",
-                        "status": "completed",
-                        "content": [{"type": "output_text", "text": full, "annotations": []}]}],
-            "output_text": full,
-            "status": "completed",
-            "usage": {"prompt_tokens": len(query)//4, "completion_tokens": len(full)//4,
-                      "total_tokens": (len(query)+len(full))//4},
-        }
+@app.get("/v1/responses/{response_id}/input_items")
+async def list_response_input_items(response_id: str, limit: int=20, after: str=None, before: str=None, order: str="asc", _=Depends(verify_api_key)):
+    rec=_responses_get(response_id)
+    if not rec:
+        raise OpenAIAPIError(404, f"No model response found with id '{response_id}'.", param="response_id")
+    items=list(rec.get("_input_items") or [])
+    if (order or "asc").lower() == "desc":
+        items=list(reversed(items))
+    if after:
+        ids=[x.get("id") for x in items]
+        if after in ids:
+            items=items[ids.index(after)+1:]
+    if before:
+        ids=[x.get("id") for x in items]
+        if before in ids:
+            items=items[:ids.index(before)]
+    try:
+        limit=int(limit)
+    except Exception:
+        limit=20
+    limit=min(max(limit, 1), 100)
+    has_more=len(items) > limit
+    items=items[:limit]
+    return {
+        "object": "list",
+        "data": items,
+        "first_id": items[0].get("id") if items else None,
+        "last_id": items[-1].get("id") if items else None,
+        "has_more": has_more,
+    }
 
 
 @app.post("/v1/chat/completions")

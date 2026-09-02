@@ -124,7 +124,11 @@ Tracked candidates such as Claude Haiku 4.5, Gemini 3.1 Flash Lite, and Grok 4.2
 | `GET` | `/chat` | No | **Debug chat UI with OpenAI format validator** |
 | `GET` | `/v1/models` | Yes | List tier-available models |
 | `POST` | `/v1/chat/completions` | Yes | Chat (streaming + non-streaming + tools + thinking) |
-| `POST` | `/v1/responses` | Yes | OpenAI Responses API compatibility (used by LobeHub web search) |
+| `POST` | `/v1/responses` | Yes | OpenAI Responses API (stream, store, previous_response_id) |
+| `GET` | `/v1/responses/{id}` | Yes | Retrieve a stored response |
+| `DELETE` | `/v1/responses/{id}` | Yes | Delete a stored response |
+| `POST` | `/v1/responses/{id}/cancel` | Yes | Cancel an in-progress background response |
+| `GET` | `/v1/responses/{id}/input_items` | Yes | List input items for a stored response |
 | `POST` | `/<api-key>/mcp` | Key in URL | MCP Streamable HTTP |
 | `GET` | `/<api-key>/sse` | Key in URL | MCP SSE |
 | `GET` | `/admin/models` | Yes | Full model map |
@@ -134,7 +138,14 @@ Tracked candidates such as Claude Haiku 4.5, Gemini 3.1 Flash Lite, and Grok 4.2
 
 ## Usage
 
+### Responses API
+
+`POST /v1/responses` accepts OpenAI Responses API requests (`input`, `instructions`, `previous_response_id`, `stream`, `store`, `reasoning`, `text.format`). Responses are stored so you can `GET` / `DELETE` them and continue a thread with `previous_response_id`.
+
+Built-in web search is always on. Function calling, file search, code interpreter, computer use, and image generation are accepted in the request body but not executed.
+
 ### OpenAI API
+
 
 ```bash
 # Basic chat

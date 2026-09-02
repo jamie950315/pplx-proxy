@@ -214,7 +214,11 @@ Tracked candidates such as Claude Haiku 4.5, Gemini 3.1 Flash Lite, and Grok 4.2
 | GET | `/chat` | No | Debug chat UI |
 | GET | `/v1/models` | Bearer | List available models |
 | POST | `/v1/chat/completions` | Bearer | Chat completions |
-| POST | `/v1/responses` | Bearer | OpenAI Responses API compatibility (streaming with reasoning) |
+| POST | `/v1/responses` | Bearer | OpenAI Responses API create (stream/store/previous_response_id) |
+| GET | `/v1/responses/{id}` | Bearer | Retrieve a stored response |
+| DELETE | `/v1/responses/{id}` | Bearer | Delete a stored response |
+| POST | `/v1/responses/{id}/cancel` | Bearer | Cancel an in-progress background response |
+| GET | `/v1/responses/{id}/input_items` | Bearer | List input items for a stored response |
 | POST | `/{api_key}/mcp` | URL key | MCP Streamable HTTP |
 | GET | `/{api_key}/sse` | URL key | MCP SSE transport |
 | GET | `/admin/models` | Bearer | Full model map |
@@ -417,21 +421,40 @@ This notice is automatically stripped from message history in subsequent API cal
 
 ### Responses API (`/v1/responses`)
 
-The `/v1/responses` endpoint provides OpenAI Responses API compatibility, primarily used by LobeHub when "built-in web search" is enabled. It accepts the same input format as OpenAI's Responses API and returns results in the same format.
+The `/v1/responses` endpoint implements OpenAI Responses API compatibility. It is used by LobeHub when "built-in web search" is enabled, and also works with the official OpenAI SDK `client.responses.create()`.
+
+Supported:
+
+- `POST /v1/responses` — create a response (`input` string or item list, `instructions`, `stream`, `store`, `previous_response_id`, `conversation`, `reasoning`, `background`, `text.format`)
+- `GET /v1/responses/{id}` — retrieve a stored response
+- `DELETE /v1/responses/{id}` — delete a stored response
+- `POST /v1/responses/{id}/cancel` — cancel an in-progress background response
+- `GET /v1/responses/{id}/input_items` — list the original input items
+
+Multi-turn: pass `previous_response_id` from the previous response. Previous `instructions` are not reused; send new ones if needed. `conversation` can also continue the last stored turn for that conversation id.
+
+Stored responses live in `.responses_store.json` (max 300, 7-day TTL). `store: false` keeps them in memory only.
 
 When streaming is enabled, the endpoint emits these SSE events in order:
 
 1. `response.created` — response object with status `in_progress`
-2. `response.output_item.added` — assistant message item
-3. `response.reasoning_summary_part.added` — reasoning block starts
-4. `response.reasoning_summary_text.delta` — search step info (Found URLs, search queries), repeated per step
-5. `response.reasoning_summary_text.done` — full reasoning text
-6. `response.reasoning_summary_part.done` — reasoning block ends
-7. `response.output_text.delta` — answer text chunks, repeated
-8. `response.output_text.done` — full answer text
-9. `response.completed` — final response with output and usage
+2. `response.in_progress` — same object, still running
+3. `response.output_item.added` — reasoning item (only if search/thinking steps exist)
+4. `response.reasoning_summary_part.added` — reasoning block starts
+5. `response.reasoning_summary_text.delta` — search step info (Found URLs, search queries), repeated per step
+6. `response.reasoning_summary_text.done` — full reasoning text
+7. `response.reasoning_summary_part.done` — reasoning block ends
+8. `response.output_item.done` — reasoning item complete
+9. `response.output_item.added` — assistant message item
+10. `response.content_part.added` — text part starts
+11. `response.output_text.delta` — answer text chunks, repeated
+12. `response.output_text.done` — full answer text
+13. `response.content_part.done` / `response.output_item.done` — message complete
+14. `response.completed` — final response with output and usage
 
 The `developer` role is accepted and mapped to `system` internally. Web search tools (`web_search_preview`) are silently ignored since `search_focus: "internet"` is always active.
+
+Not supported as real OpenAI tools: function calling, file search, code interpreter, computer use, image generation, and encrypted reasoning items. Those fields are accepted and echoed, but Perplexity cannot execute them.
 
 ---
 
