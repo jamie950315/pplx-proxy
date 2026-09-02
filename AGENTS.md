@@ -35,7 +35,7 @@ Single FastAPI app (`server.py`, ~1750 lines) that:
 
 **Response Cleaning** (`_clean_response`): strips `[1]` `[2]` citations, `<grok:*>` tags, `<?xml?>` declarations, `<response>` wrappers, `<script>` tags.
 
-**Auto-Discovery**: every `PROBE_INTERVAL_HOURS`, checks if models are alive. Dead models get version-incremented (e.g., `gpt54` → `gpt55`) up to +1.0, capped at 10 probes. It also probes known missing model names from `_MODEL_REGISTRY`, so a persisted `.models.json` can gain newly added IDs such as Grok, Haiku, GPT Mini/Nano, and Gemini Flash. Sends ntfy on upgrade or new-model discovery.
+**Auto-Discovery**: every `PROBE_INTERVAL_HOURS`, checks if models are alive. Dead models get version-incremented (e.g., `gpt54` → `gpt55`) up to +1.0, capped at 10 probes. If Perplexity substitutes another model, that is treated as temporary unavailability, not a dead version, so discovery does not bump IDs. Pinned names such as `sonnet-4.6` are never auto-upgraded onto a later generation. It also probes known missing model names from `_MODEL_REGISTRY`, so a persisted `.models.json` can gain newly added IDs such as Grok, Haiku, GPT Mini/Nano, and Gemini Flash. Sends ntfy on upgrade or new-model discovery.
 
 ## File Structure
 

@@ -77,6 +77,14 @@ class ModelRegistryTests(unittest.TestCase):
         self.assertEqual(prefs[0], "grok421reasoning")
         self.assertEqual(prefs[-1], "grok430reasoning")
 
+    def test_pinned_model_ids_are_fixed_generations(self):
+        self.assertTrue(server._is_pinned_model_id("sonnet-4.6"))
+        self.assertTrue(server._is_pinned_model_id("gpt-5.5"))
+        self.assertTrue(server._is_pinned_model_id("grok-4"))
+        self.assertFalse(server._is_pinned_model_id("sonnet"))
+        self.assertFalse(server._is_pinned_model_id("gpt"))
+        self.assertFalse(server._is_pinned_model_id("grok"))
+
 
 class DiscoveryTests(unittest.TestCase):
     def test_known_missing_models_are_added_when_probe_passes(self):
@@ -326,6 +334,102 @@ class ModelProbeTests(unittest.TestCase):
                 }
 
         self.assertTrue(asyncio.run(server.probe_model(MatchingClient(), "claude50sonnet")))
+
+    def test_probe_model_status_distinguishes_substitution_from_dead(self):
+        class FallbackClient:
+            async def search(self, *_args, **_kwargs):
+                yield {
+                    "answer": "Four",
+                    "actual_model": "gpt5_nano",
+                    "model_fallback": True,
+                    "done": True,
+                }
+
+        class DeadClient:
+            async def search(self, *_args, **_kwargs):
+                yield {"error": "HTTP 500", "done": True}
+
+        self.assertEqual(
+            asyncio.run(server.probe_model_status(FallbackClient(), "claude50sonnet")),
+            server.PROBE_SUBSTITUTED,
+        )
+        self.assertEqual(
+            asyncio.run(server.probe_model_status(DeadClient(), "claude50sonnet")),
+            server.PROBE_DEAD,
+        )
+
+
+class VersionUpgradeSkipTests(unittest.TestCase):
+    def test_substituted_model_is_not_version_upgraded(self):
+        probes=[]
+
+        async def fake_status(_client, pref):
+            probes.append(pref)
+            return server.PROBE_SUBSTITUTED
+
+        async def fail_sleep(_seconds):
+            raise AssertionError("version upgrade should not run after substitution")
+
+        async def run():
+            report={"alive": [], "upgraded": {}, "unavailable": [], "dead": [], "probed": 0}
+            with patch.object(server, "MODEL_MAP", {"grok": ("pro", "grok46low")}), \
+                 patch.object(server, "probe_model_status", new=fake_status), \
+                 patch.object(server.asyncio, "sleep", new=fail_sleep):
+                upgraded=await server._try_upgrade_model(object(), "grok", "pro", "grok46low", report, sleep_seconds=0)
+                self.assertFalse(upgraded)
+                self.assertEqual(server.MODEL_MAP["grok"], ("pro", "grok46low"))
+                self.assertEqual(probes, ["grok46low"])
+                self.assertEqual(report["upgraded"], {})
+                self.assertEqual(report["unavailable"][0]["model"], "grok")
+
+        asyncio.run(run())
+
+    def test_pinned_version_name_is_not_upgraded_to_another_model(self):
+        probes=[]
+
+        async def fake_status(_client, pref):
+            probes.append(pref)
+            return server.PROBE_DEAD
+
+        async def fail_sleep(_seconds):
+            raise AssertionError("pinned names must not search later versions")
+
+        async def run():
+            report={"alive": [], "upgraded": {}, "unavailable": [], "dead": [], "probed": 0}
+            with patch.object(server, "MODEL_MAP", {"sonnet-4.6": ("pro", "claude46sonnet")}), \
+                 patch.object(server, "probe_model_status", new=fake_status), \
+                 patch.object(server.asyncio, "sleep", new=fail_sleep):
+                upgraded=await server._try_upgrade_model(object(), "sonnet-4.6", "pro", "claude46sonnet", report, sleep_seconds=0)
+                self.assertFalse(upgraded)
+                self.assertEqual(server.MODEL_MAP["sonnet-4.6"], ("pro", "claude46sonnet"))
+                self.assertEqual(probes, ["claude46sonnet"])
+                self.assertEqual(report["upgraded"], {})
+                self.assertEqual(report["dead"][0]["reason"], "pinned version name, no upgrade")
+
+        asyncio.run(run())
+
+    def test_dead_model_still_upgrades_to_next_alive_version(self):
+        async def fake_status(_client, pref):
+            if pref == "grok46low":
+                return server.PROBE_DEAD
+            if pref == "grok47low":
+                return server.PROBE_ALIVE
+            return server.PROBE_DEAD
+
+        async def no_sleep(_seconds):
+            return None
+
+        async def run():
+            report={"alive": [], "upgraded": {}, "unavailable": [], "dead": [], "probed": 0}
+            with patch.object(server, "MODEL_MAP", {"grok": ("pro", "grok46low")}), \
+                 patch.object(server, "probe_model_status", new=fake_status), \
+                 patch.object(server.asyncio, "sleep", new=no_sleep):
+                upgraded=await server._try_upgrade_model(object(), "grok", "pro", "grok46low", report, sleep_seconds=0)
+                self.assertTrue(upgraded)
+                self.assertEqual(server.MODEL_MAP["grok"], ("pro", "grok47low"))
+                self.assertEqual(report["upgraded"]["grok"]["new"], "grok47low")
+
+        asyncio.run(run())
 
 
 class ModelPreflightTests(unittest.TestCase):

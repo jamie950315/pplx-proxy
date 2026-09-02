@@ -1547,18 +1547,71 @@ def _version_upgrade_candidates(pref: str):
         return
 
 
-async def probe_model(client, pref) -> bool:
-    """Test if a model_preference is valid."""
+PROBE_ALIVE="alive"
+PROBE_SUBSTITUTED="substituted"
+PROBE_DEAD="dead"
+
+async def probe_model_status(client, pref) -> str:
+    """Classify a model_preference as alive, substituted, or dead."""
     try:
         query="Explain one concrete tradeoff between optimistic and pessimistic database locking in 80 to 120 words."
         async for chunk in client.search(query, "pro", pref, ["web"], "en-US"):
             if chunk.get("error"):
-                return False
+                return PROBE_DEAD
             if chunk.get("done"):
-                return bool(chunk.get("answer", "").strip()) and _model_matches_preference(pref, chunk.get("actual_model", ""))
-        return False
+                if not chunk.get("answer", "").strip():
+                    return PROBE_DEAD
+                if _model_matches_preference(pref, chunk.get("actual_model", "")):
+                    return PROBE_ALIVE
+                return PROBE_SUBSTITUTED
+        return PROBE_DEAD
     except Exception:
+        return PROBE_DEAD
+
+async def probe_model(client, pref) -> bool:
+    """Test if a model_preference is valid."""
+    return await probe_model_status(client, pref) == PROBE_ALIVE
+
+def _is_pinned_model_id(model_id: str) -> bool:
+    """Fixed generation names such as sonnet-4.6 must not jump to another model."""
+    return bool(_re.search(r"\d+\.\d+", model_id) or _re.search(r"-\d+$", model_id))
+
+async def _try_upgrade_model(client, model_id, mode, pref, report=None, sleep_seconds=2.0) -> bool:
+    """Upgrade a dead versioned model. Skip when Perplexity only substituted it."""
+    global MODEL_MAP
+    status=await probe_model_status(client, pref)
+    if report is not None:
+        report["probed"]=report.get("probed", 0)+1
+    if status == PROBE_ALIVE:
+        if report is not None:
+            report.setdefault("alive", []).append(model_id)
         return False
+    if status == PROBE_SUBSTITUTED:
+        log.info(f"Discovery: {model_id} substituted by Perplexity, skipping version upgrade")
+        if report is not None:
+            report.setdefault("unavailable", []).append({"model": model_id, "pref": pref, "reason": "provider substituted another model"})
+        return False
+    if _is_pinned_model_id(model_id):
+        log.info(f"Discovery: {model_id} is a pinned version name, skipping version upgrade")
+        if report is not None:
+            report.setdefault("dead", []).append({"model": model_id, "pref": pref, "reason": "pinned version name, no upgrade"})
+        return False
+    found=False
+    for new_pref in _version_upgrade_candidates(pref):
+        if report is not None:
+            report["probed"]=report.get("probed", 0)+1
+        log.info(f"Discovery: {model_id} dead, trying {new_pref}...")
+        if await probe_model_status(client, new_pref) == PROBE_ALIVE:
+            MODEL_MAP[model_id]=(mode, new_pref)
+            if report is not None:
+                report.setdefault("upgraded", {})[model_id]={"old": pref, "new": new_pref}
+            log.info(f"Discovery: {model_id} upgraded {pref} → {new_pref}")
+            found=True
+            break
+        await asyncio.sleep(sleep_seconds)
+    if not found and report is not None:
+        report.setdefault("dead", []).append({"model": model_id, "pref": pref, "reason": "no valid version within +1.0 or probe cap"})
+    return found
 
 
 async def ensure_model_available(client, pref) -> bool:
@@ -1625,37 +1678,18 @@ async def discover_models(request: Request, _=Depends(verify_api_key)):
         if not matched:
             # Non-versioned (pplx_pro, experimental, etc.) — just check alive
             report["probed"]+=1
-            ok=await probe_model(client, pref)
-            if ok:
+            status=await probe_model_status(client, pref)
+            if status == PROBE_ALIVE:
                 report["alive"].append(model_id)
+            elif status == PROBE_SUBSTITUTED:
+                report["unavailable"].append({"model": model_id, "pref": pref, "reason": "provider substituted another model"})
             else:
                 report["dead"].append({"model": model_id, "pref": pref, "reason": "non-versioned, no upgrade path"})
             await asyncio.sleep(2)
             continue
 
-        # Versioned — check if alive
-        report["probed"]+=1
-        ok=await probe_model(client, pref)
-        if ok:
-            report["alive"].append(model_id)
-            await asyncio.sleep(2)
-            continue
-
-        # Dead — search for next version
-        found=False
-        for new_pref in _version_upgrade_candidates(pref):
-            report["probed"]+=1
-            log.info(f"Discovery: {model_id} dead, trying {new_pref}...")
-            if await probe_model(client, new_pref):
-                global MODEL_MAP
-                MODEL_MAP[model_id]=(mode, new_pref)
-                report["upgraded"][model_id]={"old": pref, "new": new_pref}
-                log.info(f"Discovery: {model_id} upgraded {pref} → {new_pref}")
-                found=True
-                break
-            await asyncio.sleep(2)
-        if not found:
-            report["dead"].append({"model": model_id, "pref": pref, "reason": "no valid version within +1.0 or probe cap"})
+        await _try_upgrade_model(client, model_id, mode, pref, report)
+        await asyncio.sleep(2)
 
     added=await _discover_known_missing_models(client, report)
 
@@ -1668,6 +1702,7 @@ async def discover_models(request: Request, _=Depends(verify_api_key)):
         "upgraded": len(report["upgraded"]),
         "added": len(report["added"]),
         "dead": len(report["dead"]),
+        "unavailable": len(report["unavailable"]),
         "probed": report["probed"],
         
         "details": report,
@@ -2082,19 +2117,12 @@ async def auto_discover_loop():
                         break
                 if not matched:
                     continue
-                ok=await probe_model(client, pref)
-                if ok:
-                    continue
-                # Dead — try upgrading, capped to avoid two-digit runaway
-                for new_pref in _version_upgrade_candidates(pref):
-                    if await probe_model(client, new_pref):
-                        MODEL_MAP[model_id]=(mode, new_pref)
-                        # Thinking variants auto-derived from _THINKING_MAP, no separate upgrade needed
-                        save_model_map(MODEL_MAP)
-                        log.info(f"Auto-discovery: {model_id} upgraded {pref} → {new_pref}")
-                        await notify_cookie_expired(f"Model {model_id} auto-upgraded: {pref} → {new_pref}")
-                        break
-                    await asyncio.sleep(2)
+                upgraded=await _try_upgrade_model(client, model_id, mode, pref)
+                if upgraded:
+                    save_model_map(MODEL_MAP)
+                    new_pref=MODEL_MAP[model_id][1]
+                    log.info(f"Auto-discovery: {model_id} upgraded {pref} → {new_pref}")
+                    await notify_cookie_expired(f"Model {model_id} auto-upgraded: {pref} → {new_pref}")
                 await asyncio.sleep(2)
         except Exception as e:
             log.error(f"Auto-discovery error: {e}")
