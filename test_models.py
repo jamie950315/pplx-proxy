@@ -8,6 +8,22 @@ from unittest.mock import patch
 import server
 
 
+class MessageContentTests(unittest.TestCase):
+    def test_content_parts_accept_codex_input_text(self):
+        self.assertEqual(
+            server._message_content_text([
+                {"type": "input_text", "text": "hello"},
+                {"type": "text", "text": "world"},
+                {"type": "image_url", "image_url": "ignored"},
+            ]),
+            "hello world",
+        )
+
+    def test_non_text_content_does_not_break_prompt_detection(self):
+        self.assertEqual(server._message_content_text(None), "")
+        self.assertEqual(server._message_content_text({"value": 1}), "{'value': 1}")
+
+
 class ModelRegistryTests(unittest.TestCase):
     def test_default_pro_models_include_new_names(self):
         with patch.object(server, "ACCOUNT_TYPE", "pro"):

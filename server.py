@@ -953,6 +953,22 @@ def _strip_appended_notices(text: str) -> str:
     text=_SUBSTITUTION_NOTICE_RE.sub("", text)
     return text.strip()
 
+def _message_content_text(content) -> str:
+    if isinstance(content, list):
+        parts=[]
+        for item in content:
+            if not isinstance(item, dict) or item.get("type") not in ("input_text", "text"):
+                continue
+            text=item.get("text", "")
+            if isinstance(text, str) and text:
+                parts.append(text)
+        return " ".join(parts)
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    return str(content)
+
 _GROK_TAG_RE=_re.compile(r'<grok:[^>]*>.*?</grok:[^>]*>', _re.DOTALL)
 _GROK_SELF_RE=_re.compile(r'<grok:[^>]*/>')
 _MULTI_SPACE=_re.compile(r' {2,}')
@@ -999,10 +1015,7 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
             elif isinstance(item, dict):
                 role=item.get("role", "user")
                 if role=="developer": role="system"
-                content=item.get("content", "")
-                if isinstance(content, list):
-                    text_parts=[ct.get("text","") for ct in content if isinstance(ct, dict) and ct.get("type") in ("input_text","text")]
-                    content=" ".join(text_parts) if text_parts else str(content)
+                content=_message_content_text(item.get("content", ""))
                 if content:
                     messages.append({"role": role, "content": content})
 
@@ -1286,16 +1299,13 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
     for msg in messages:
         role=msg.get("role", "user")
         if role=="developer": role="system"
+        content=_message_content_text(msg.get("content"))
         # Detect user messages that are actually system prompts (LobeHub sends
         # Jamie's custom system prompt as role:user after the developer message)
         if role=="user":
-            _ct=(msg.get("content") or "")[:200].lower()
+            _ct=content[:200].lower()
             if any(kw in _ct for kw in ["you are ", "you must ", "your role", "ccsearch", "加載", "技能", "available_skills", "<skill", "<user_memory", "<available_tools", "<tool_selection", "<credentials", "<best_practices", "<memory_effort", "<session_context"]):
                 role="system"
-        content=msg.get("content") or ""
-        if isinstance(content, list):
-            text_parts=[ct.get("text", "") for ct in content if ct.get("type") == "text"]
-            content=" ".join(text_parts)
         # Strip rate limit notices from previous responses
         content=_strip_appended_notices(content)
         if not content or not content.strip():
