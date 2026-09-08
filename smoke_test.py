@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 def main():
     load_dotenv(Path(__file__).with_name(".env"))
     base=sys.argv[1].rstrip("/") if len(sys.argv) > 1 else "http://localhost:8892"
-    headers={"Content-Type": "application/json"}
+    headers={"Content-Type": "application/json", "User-Agent": "pplx-proxy-smoke/1.0"}
     key=os.environ.get("PPLX_PROXY_API_KEY", "")
     if key:
         headers["Authorization"]="Bearer " + key
