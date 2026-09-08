@@ -4,6 +4,10 @@ A comprehensive guide to installing, configuring, and using pplx-proxy — a sel
 
 ---
 
+## Current Deployment and Branch Status (2026-09-09)
+
+Production is `main` commit `420991e`, managed by `pplx-proxy.service` on port **8892**. The **`codex/attachments-function-tools`** branch is **not deployed**. A real PNG input passed an official OpenAI SDK test. One complete Responses function loop also passed, but a repeated auto-selection test failed because the model returned non-JSON output; the prompt bridge remains experimental and unreliable. Local file upload/read/delete works, but document reading is **incomplete**: Perplexity's attachment-processing subscription currently receives Cloudflare 403, and the proxy reports HTTP 502.
+
 ## Table of Contents
 
 1. [What Is pplx-proxy?](#1-what-is-pplx-proxy)
@@ -214,11 +218,14 @@ Tracked candidates such as Claude Haiku 4.5, Gemini 3.1 Flash Lite, and Grok 4.2
 | GET | `/chat` | No | Debug chat UI |
 | GET | `/v1/models` | Bearer | List available models |
 | POST | `/v1/chat/completions` | Bearer | Chat completions |
-| POST | `/v1/responses` | Bearer | OpenAI Responses API create (stream/store/previous_response_id) |
+| POST | `/v1/responses` | Bearer | OpenAI Responses API create; branch adds image input and function bridge |
 | GET | `/v1/responses/{id}` | Bearer | Retrieve a stored response |
 | DELETE | `/v1/responses/{id}` | Bearer | Delete a stored response |
 | POST | `/v1/responses/{id}/cancel` | Bearer | Cancel an in-progress background response |
 | GET | `/v1/responses/{id}/input_items` | Bearer | List input items for a stored response |
+| POST / GET | `/v1/files` | Bearer | Branch only: upload/list local files |
+| GET / DELETE | `/v1/files/{id}` | Bearer | Branch only: read metadata/delete local file |
+| GET | `/v1/files/{id}/content` | Bearer | Branch only: read local file bytes |
 | POST | `/{api_key}/mcp` | URL key | MCP Streamable HTTP |
 | GET | `/{api_key}/sse` | URL key | MCP SSE transport |
 | GET | `/admin/models` | Bearer | Full model map |
@@ -434,9 +441,9 @@ Multi-turn: pass `previous_response_id` from the previous response. Previous `in
 
 Stored responses live in `.responses_store.json` (max 300, 7-day TTL). `store: false` does not retain the response, so retrieval and continuation by that response ID are unavailable.
 
-Background requests require `store: true`; only active background responses can be cancelled. `tool_choice` accepts only `auto`. Custom `temperature`/`top_p` values other than 1, `max_output_tokens`, `truncation: "auto"`, and strict JSON schemas are rejected. JSON-object mode and non-strict schemas use prompt instructions only; output conformance is not guaranteed. Store read/write failures are reported instead of treating failed persistence as success.
+Background requests require `store: true`; only active background responses can be cancelled. Built-in web-search requests accept only `tool_choice: "auto"`; the branch-only function choices are described below. Custom `temperature`/`top_p` values other than 1, `max_output_tokens`, `truncation: "auto"`, and strict text-output JSON schemas are rejected. JSON-object mode and non-strict text schemas use prompt instructions only; output conformance is not guaranteed. Store read/write failures are reported instead of treating failed persistence as success.
 
-When streaming succeeds, the endpoint emits these SSE events in order:
+For ordinary text requests, successful streaming emits these SSE events in order (the reasoning events are omitted when no reasoning is available):
 
 1. `response.created` — response object with status `in_progress`
 2. `response.in_progress` — same object, still running
@@ -455,7 +462,29 @@ When streaming succeeds, the endpoint emits these SSE events in order:
 
 The `developer` role is accepted and mapped to `system` internally. Built-in web search tools (`web_search` and `web_search_preview`) are accepted since `search_focus: "internet"` is always active.
 
-Not supported as real OpenAI tools: function calling, file search, code interpreter, computer use, image generation, and encrypted reasoning items. Requests using these features or image/file inputs receive an explicit error instead of silently ignoring unsupported content.
+File search, code interpreter, computer use, image generation, and encrypted reasoning are not implemented. Unsupported features return explicit errors.
+
+#### Function calling on `codex/attachments-function-tools`
+
+The branch provides **prompt-mediated Responses function calling**, not native Perplexity tools. One official SDK run passed automatic tool selection, execution by the client application, and a streamed continuation. A repeat returned non-JSON output and produced `response.failed` / `tool_protocol_error`; SDK `get_final_response()` could not return a completed response. This remains experimental, with insufficient reliability for a completed support claim. Unit tests and Docker checks validate error handling and protocol behavior, not model compliance. There is no automatic retry to conceal this limitation. Perplexity produces a JSON proposal; the proxy validates the complete envelope, function name, tool choice, and argument schema before returning any callable item. The proxy does not execute functions.
+
+- Define functions using Responses `tools` entries with `type`, `name`, `description`, and `parameters` (JSON schema). Explicit `strict: true` requires strict schema constraints and is validated locally, not by native constrained generation.
+- Use `tool_choice: "auto"`, `"required"`, `"none"`, or `{"type":"function","name":"lookup_inventory"}`. Set `parallel_tool_calls: false` for at most one call.
+- Read `function_call` output items. Parse `arguments`, execute the named function in your application, and submit `{"type":"function_call_output","call_id":"...","output":"..."}` with the exact returned `call_id`.
+- Continue with `previous_response_id` or send the full input/output history for `store: false`. All outstanding calls need matching results.
+- A stored continuation that omits tool definitions keeps its context but disables new calls (`tool_choice: "none"`). Resend the definitions to allow further calls.
+- Malformed model JSON, unavailable functions, invalid arguments, and violated tool choices produce HTTP 502 with `tool_protocol_error`; an already-open stream emits `response.failed`. There is no fallback to an ordinary successful text answer.
+- Function streams are buffered until validation finishes. Each validated call emits `response.output_item.added`, `response.function_call_arguments.delta`, `response.function_call_arguments.done`, and `response.output_item.done`, followed by `response.completed`.
+
+See the [minimal SDK function loop](README.md#function-loop-with-the-official-python-sdk-development-branch). Chat Completions function-tool requests still return HTTP 400, including the debug UI's unsupported-tools check.
+
+#### Images and local files on the development branch
+
+A real **PNG image** request passed through the official OpenAI SDK. Responses image input uses `input_image` alongside `input_text`; Chat Completions uses its `image_url` content shape. This result establishes PNG input, not every image format or document type.
+
+`POST /v1/files` accepts multipart `file` and `purpose` fields and returns a local file ID. `GET /v1/files/{id}` reads metadata, `GET /v1/files/{id}/content` reads bytes, and `DELETE /v1/files/{id}` removes the file. Limits are **20 MiB per file** and **200 MiB total local storage**. Successful local storage does not establish that Perplexity can parse the file.
+
+Document input remains **incomplete**. After uploading a document upstream, the proxy must wait for `/rest/sse/attachment_processing/subscribe` to report processing completion. Cloudflare currently returns **403** from that endpoint; the proxy returns an explicit **502**, rather than submitting a query with an unreadable document. Do not advertise document reading as supported or deploy this branch as complete on the strength of upload tests alone.
 
 ---
 
@@ -683,7 +712,7 @@ Set `PPLX_COOKIE` in `.env`.
 Cookie expired. Extract a fresh one and use `POST /admin/refresh-cookie` or update `.env` + restart.
 
 ### Tool calls not firing
-Function calling is unsupported and returns an explicit error. Use built-in web search or a provider with native function calling.
+Production and `/v1/chat/completions` do not support function tools. On the undeployed feature branch, use `/v1/responses` and the function bridge described above. HTTP 502 with `tool_protocol_error` means the model did not return a valid call proposal; inspect the error rather than treating it as text.
 
 ### Model says "I can't access real-time data"
 
@@ -700,7 +729,7 @@ This is the most critical issue in pplx-proxy. There are three independent cause
 **How to diagnose:** Check server logs for `PROMPT DEBUG` and `PPLX REQUEST QUERY`. Generic clients should show whitelist-filtered `instructions`. LobeHub should show `instructions=[CUSTOM_PROMPTS]` on every turn, plus `history` and `query` as applicable.
 
 ### Model says "I don't have access to tools"
-Function tools are not supported. Remove function-tool definitions and use Perplexity's built-in web search, or select a different provider that supports function calls.
+The feature branch uses a prompt-mediated proposal, not native Perplexity function execution. A model can refuse or return invalid JSON; the bridge reports that failure explicitly. Verify the selected endpoint, branch, function definitions, and returned error. The client application must execute valid calls and return their results.
 
 ### Streaming hangs
 Ensure your client handles SSE properly. Use `stream=True` in Python requests and iterate over lines.
@@ -715,8 +744,10 @@ Hard-refresh the `/chat` page (Ctrl+Shift+R). The page has no-cache headers but 
 
 ## 19. Known Limitations
 
-- **No function calling** — function-tool requests are rejected; the debug UI can exercise this error path.
-- **Citation stripping** removes `[N]` patterns, which may affect content like `array[0]`.
+- **Function calling is experimental and unreliable** — one complete SDK loop passed, but a repeated auto-selection run returned invalid protocol output. Only branch Responses has the bridge; Chat function tools remain HTTP 400. Invalid proposals fail with HTTP 502 or `response.failed`; no fallback or automatic retry is added.
+- **Document input is incomplete** — Cloudflare 403 blocks upstream processing subscription; document-reading requests fail with HTTP 502 despite successful local upload.
+- **Image verification is limited to PNG** — a real SDK PNG request passed; do not generalize this to every media format.
+- **Citation stripping** removes `[N]` patterns from ordinary text, which may affect content like `array[0]`. Function arguments are preserved without this cleaning.
 - **Context window**: 96K char total query limit (~32K tokens).
 - **Perplexity API changes** may break the proxy without notice. Auto-discovery catches model changes.
 - **Single session** — one cookie per instance. Multiple instances with the same cookie may conflict.

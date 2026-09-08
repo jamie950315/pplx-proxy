@@ -4,9 +4,20 @@
 
 `pplx-proxy` is a self-hosted reverse proxy for Perplexity.ai. Uses your Pro/Max subscription cookie to access all models through OpenAI-compatible REST API and MCP server.
 
+## Current Work and Deployment (2026-09-09)
+
+- Production: `main` commit `420991e`, `pplx-proxy.service`, port **8892**. The service is deployed and separate from feature testing.
+- Active feature branch: **`codex/attachments-function-tools`**, **not deployed**. Do not overwrite the production checkout/service with this branch as part of testing.
+- Real PNG image input passed an official OpenAI SDK test.
+- `/v1/files` local upload/read/delete passed; limits are 20 MiB per file and 200 MiB total. Local storage success is not proof of upstream document reading.
+- Documents remain **incomplete**: upstream upload must be followed by `/rest/sse/attachment_processing/subscribe` and confirmed completion. Cloudflare currently returns 403; document requests explicitly fail with 502. Do not report document support as complete.
+- Responses function bridge is **experimental and unreliable**. One official SDK auto-selection/client-execution/stream-continuation loop passed; a repeat returned non-JSON output and correctly failed with `response.failed` / `tool_protocol_error`, so SDK `get_final_response()` had no completed response. It is **prompt-mediated**, not native Perplexity function calling. Do not claim stable or completed support; do not add fallback or automatic retry to hide failures.
+- Invalid protocol JSON/schema/tool choices fail with 502 (`tool_protocol_error`) or `response.failed`; never fall back to successful text. Function streams wait for complete validation before emitting callable items. Never execute client functions in the proxy.
+- Chat Completions function tools still return 400. When a stored function continuation omits tool definitions, preserve the full context and effective definitions but use `tool_choice: none`. Explicitly resend definitions to enable further calls.
+
 ## Architecture
 
-Single FastAPI app (`server.py`) that:
+FastAPI app (`server.py`) with focused attachment, file-storage, and function-protocol modules that:
 
 1. Receives OpenAI-format chat/completions or MCP requests
 2. Translates to Perplexity's internal SSE (`POST /rest/sse/perplexity_ask`)
@@ -40,7 +51,10 @@ Single FastAPI app (`server.py`) that:
 ## File Structure
 
 ```
-server.py            # Everything: FastAPI, Perplexity client, MCP, admin, discovery
+server.py            # FastAPI, Perplexity client, MCP, admin, discovery, feature integration
+attachments.py       # Resolve/upload attachments and wait for upstream document processing
+file_store.py        # Bounded local /v1/files storage
+function_tools.py    # Validate prompt-mediated function proposals; never executes tools
 static/chat.html     # Debug chat UI with OpenAI format validator
 inject_cookie.sh     # Helper to inject cookie + restart
 test.sh              # Smoke test
@@ -55,7 +69,8 @@ pplx-proxy.service   # systemd unit
 .env                 # Secrets + config
 .cookie_cache.json   # Cached cookie + timestamp
 .models.json         # Persisted model map
-.responses_store.json # Stored Responses API objects for retrieve/previous_response_id
+.responses_store.json # Stored Responses API objects and function history for continuation
+uploads/             # Local uploaded files under DATA_DIR (gitignored)
 CUSTOM_PROMPTS       # Local prompt block prepended to every LobeHub request
 ```
 
@@ -74,7 +89,10 @@ CUSTOM_PROMPTS       # Local prompt block prepended to every LobeHub request
 **Auth required** (Bearer token):
 - `GET /v1/models` — tier-filtered model list (OpenAI-compatible format)
 - `POST /v1/chat/completions` — chat (streaming + non-streaming, thinking). Unsupported function tools and generation controls are rejected with HTTP 400.
-- `POST /v1/responses` — OpenAI Responses API compatibility (direct Perplexity call, used by LobeHub web search and official SDKs)
+- `POST /v1/responses` — OpenAI Responses API compatibility; feature branch adds image input and validated prompt-mediated function calls
+- `POST` / `GET /v1/files` — feature branch local upload/list
+- `GET` / `DELETE /v1/files/{id}` — feature branch local metadata/delete
+- `GET /v1/files/{id}/content` — feature branch local bytes
 - `GET /v1/responses/{id}` — retrieve stored response
 - `DELETE /v1/responses/{id}` — delete stored response
 - `POST /v1/responses/{id}/cancel` — cancel background in-progress response
@@ -434,8 +452,9 @@ Perplexity returns SSE events containing `blocks[]` with these types:
 
 - `store=false` Responses are not retained. Corrupt runtime stores and write failures surface as errors.
 - Health checks return cached quota immediately and schedule stale refreshes without waiting for a browser. Check `flaresolverr.status` and `last_error` for quota-fetch failures.
-- Only text input is supported; images/files and function tools return HTTP 400. Custom sampling/output limits and strict schema enforcement are not implemented and are rejected. JSON prompting via Responses is best effort.
+- Production `420991e` supports text input only. The undeployed feature branch has verified PNG input and local file storage. Responses function proposals remain experimental after a successful loop and a failed repeat; document input still fails during upstream processing. Chat function tools remain 400. Custom sampling/output limits and strict text-output schema enforcement are rejected; function parameter validation is separate.
 - Upstream streams must terminate correctly; interrupted or malformed streams fail. Resources and background tasks close on shutdown. MCP is a required dependency; incompatible installations fail at startup.
 - Prompt bodies are logged only at DEBUG. Docker excludes cookies, response history, and browser state.
+- Current feature verification: 147 Python tests and 7 Node tests passed locally; Docker build and its 147 Python tests passed. Isolated ordinary Chat, streaming, and Responses smoke checks passed. These tests validate proxy behavior, not model protocol compliance, and do not remove the document-processing blocker or the observed function reliability failure.
 - Verify with `venv/bin/python -m unittest discover`, `node --test test_chat.js`, `venv/bin/python -m compileall -q server.py smoke_test.py`, Docker build, and `./test.sh URL` against an isolated service connected to Perplexity.
-- Production remains managed by `pplx-proxy.service` on port 8892. Review integration checks use temporary runtime data on localhost port 18892; do not confuse them with a production rollout.
+- Production remains `main` commit `420991e`, managed by `pplx-proxy.service` on port 8892. Use isolated runtime data and a separate localhost port for feature tests; the feature branch is not deployed.
