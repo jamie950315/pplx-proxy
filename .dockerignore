@@ -8,3 +8,7 @@ __pycache__/
 *.pyc
 venv/
 .pytest_cache/
+
+.responses_store.json
+.browser_data/
+.venv/
