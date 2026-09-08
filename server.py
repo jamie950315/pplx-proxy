@@ -14,6 +14,7 @@ import re
 import hashlib
 import copy
 import threading
+from contextlib import asynccontextmanager, aclosing
 from uuid import uuid4
 from typing import Optional, AsyncGenerator
 from pathlib import Path
@@ -23,6 +24,10 @@ from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from curl_cffi import requests as cffi_requests
+
+
+class UpstreamError(RuntimeError):
+    """The provider failed a request or returned an invalid response."""
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -39,12 +44,13 @@ MODELS_FILE=DATA_DIR / ".models.json"
 RESPONSES_FILE=DATA_DIR / ".responses_store.json"
 DEFAULT_MODEL=os.getenv("DEFAULT_MODEL", "gpt")
 ACCOUNT_TYPE=os.getenv("ACCOUNT_TYPE", "pro").lower()  # free, pro, max
+if ACCOUNT_TYPE not in {"free", "pro", "max"}:
+    raise ValueError("ACCOUNT_TYPE must be free, pro, or max")
 PUBLIC_URL=os.getenv("PUBLIC_URL", "http://localhost:8892")
 PPLX_API_VERSION=os.getenv("PPLX_API_VERSION", "2.18")
 PPLX_IMPERSONATE=os.getenv("PPLX_IMPERSONATE", "chrome")
 COOKIE_MAX_AGE_HOURS=int(os.getenv("COOKIE_MAX_AGE_HOURS", "168"))
 NTFY_COOLDOWN_SECS=int(os.getenv("NTFY_COOLDOWN_SECS", "3600"))
-MODEL_PREFLIGHT_TTL_SECS=int(os.getenv("MODEL_PREFLIGHT_TTL_SECS", "900"))
 USER_AGENT=os.getenv("USER_AGENT", "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
 ENV_FILE=Path(__file__).parent / ".env"
 FLARESOLVERR_URL=os.getenv("FLARESOLVERR_URL", "http://localhost:8191").rstrip("/")
@@ -52,7 +58,6 @@ FLARESOLVERR_URL=os.getenv("FLARESOLVERR_URL", "http://localhost:8191").rstrip("
 _MODEL_DISPLAY_ALIASES={
     "pplx_pro": {"pplx_pro", "turbo"},
 }
-_model_preflight_cache={}
 _configured_session_state={"status": "unchecked", "source": None, "message": None}
 
 def _model_matches_preference(requested_model: str, actual_model: str) -> bool:
@@ -70,12 +75,15 @@ def _model_matches_preference(requested_model: str, actual_model: str) -> bool:
 # ─── Rate Limit Tracker ────────────────────────────────────────────────────
 
 _rate_limit={"remaining_pro": None, "remaining_research": None, "updated_at": 0, "last_error": None}
-_rate_limit_lock=None  # initialized in startup
 _rate_limit_refresh_task=None
+_rate_limit_lock=threading.Lock()
+_rate_limit_generation=0
 
 def _fetch_rate_limit_sync():
     """Fetch rate limits from Perplexity via FlareSolverr. ~10s per call."""
     import urllib.request
+    with _rate_limit_lock:
+        generation=_rate_limit_generation
     try:
         cookies=load_cookies()
         token=cookies.get("__Secure-next-auth.session-token", "")
@@ -89,21 +97,34 @@ def _fetch_rate_limit_sync():
                 "cookies": [{"name": "__Secure-next-auth.session-token", "value": token,
                              "domain": ".perplexity.ai", "path": "/", "secure": True, "httpOnly": True}]
             }).encode(), headers={"Content-Type": "application/json"})
-        resp=urllib.request.urlopen(req, timeout=25)
-        fs=json.loads(resp.read())
-        body=fs.get("solution", {}).get("response", "")
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            fs=json.loads(resp.read())
+        solution=fs.get("solution", {})
+        if fs.get("status") != "ok" or solution.get("status") != 200:
+            raise RuntimeError("FlareSolverr did not return a successful quota response")
+        body=solution.get("response", "")
         import re as _rl_re
         m=_rl_re.search(r"<pre[^>]*>(.*?)</pre>", body, _rl_re.DOTALL)
         raw=m.group(1) if m else body
-        d=json.loads(raw)
-        _rate_limit["remaining_pro"]=d.get("remaining_pro")
-        _rate_limit["remaining_research"]=d.get("remaining_research")
-        _rate_limit["updated_at"]=int(time.time())
-        _rate_limit["last_error"]=None
+        import html
+        d=json.loads(html.unescape(raw))
+        if not isinstance(d, dict) or any(
+            type(d.get(field)) is not int or d[field] < 0
+            for field in ("remaining_pro", "remaining_research")
+        ):
+            raise ValueError("Perplexity returned invalid quota counters")
+        with _rate_limit_lock:
+            if generation != _rate_limit_generation:
+                return None
+            _rate_limit.update({"remaining_pro": d["remaining_pro"],
+                "remaining_research": d["remaining_research"],
+                "updated_at": int(time.time()), "last_error": None})
         log.info(f"Rate limit synced: pro={_rate_limit['remaining_pro']}, research={_rate_limit['remaining_research']}")
         return d
     except Exception as e:
-        _rate_limit["last_error"]=str(e)
+        with _rate_limit_lock:
+            if generation == _rate_limit_generation:
+                _rate_limit["last_error"]=str(e)
         log.warning(f"Rate limit fetch failed: {e}")
         return None
 
@@ -112,8 +133,7 @@ async def _rate_limit_poll_loop():
     while True:
         await asyncio.sleep(3600)  # 1 hour
         try:
-            loop=asyncio.get_event_loop()
-            await loop.run_in_executor(None, _fetch_rate_limit_sync)
+            await _refresh_rate_limit(block=True)
         except Exception as e:
             log.warning(f"Rate limit poll failed: {e}")
 
@@ -133,10 +153,20 @@ async def _refresh_rate_limit(block: bool=False):
     if block:
         await _rate_limit_refresh_task
 
+def _reset_rate_limit():
+    """Invalidate in-flight quota results when credentials change."""
+    global _rate_limit_generation
+    with _rate_limit_lock:
+        _rate_limit_generation+=1
+        _rate_limit.update({"remaining_pro": None, "remaining_research": None,
+            "updated_at": 0, "last_error": None})
+
+
 def _decrement_pro():
     """Decrement local remaining_pro counter after a successful Pro query."""
-    if _rate_limit["remaining_pro"] is not None and _rate_limit["remaining_pro"] > 0:
-        _rate_limit["remaining_pro"] -= 1
+    with _rate_limit_lock:
+        if _rate_limit["remaining_pro"] is not None and _rate_limit["remaining_pro"] > 0:
+            _rate_limit["remaining_pro"]-=1
 
 def _should_show_remaining() -> bool:
     """Show remaining notice at multiples of 5 or when ≤5."""
@@ -168,20 +198,12 @@ def _load_whitelist() -> list:
     if mtime == _whitelist_cache["mtime"]:
         return _whitelist_cache["patterns"]
     patterns=[]
-    try:
-        for line in _WHITELIST_FILE.read_text().splitlines():
-            line=line.strip()
-            if not line or line.startswith("#"):
-                continue
-            try:
-                patterns.append(re.compile(line))
-            except re.error as e:
-                log.warning(f"Invalid whitelist regex: {line!r} — {e}")
-        _whitelist_cache["patterns"]=patterns
-        _whitelist_cache["mtime"]=mtime
-        log.info(f"Loaded {len(patterns)} whitelist patterns from {_WHITELIST_FILE}")
-    except Exception as e:
-        log.warning(f"Failed to load whitelist: {e}")
+    for line in _WHITELIST_FILE.read_text().splitlines():
+        line=line.strip()
+        if line and not line.startswith("#"):
+            patterns.append(re.compile(line))
+    _whitelist_cache.update({"patterns": patterns, "mtime": mtime})
+    log.info("Loaded %s whitelist patterns from %s", len(patterns), _WHITELIST_FILE)
     return patterns
 
 def _load_custom_prompts() -> str:
@@ -192,15 +214,10 @@ def _load_custom_prompts() -> str:
         return ""
     if mtime == _custom_prompts_cache["mtime"]:
         return _custom_prompts_cache["text"]
-    try:
-        text=_CUSTOM_PROMPTS_FILE.read_text().strip()
-        _custom_prompts_cache["text"]=text
-        _custom_prompts_cache["mtime"]=mtime
-        log.info(f"Loaded custom prompts from {_CUSTOM_PROMPTS_FILE} ({len(text)} chars)")
-        return text
-    except Exception as e:
-        log.warning(f"Failed to load custom prompts: {e}")
-        return ""
+    text=_CUSTOM_PROMPTS_FILE.read_text().strip()
+    _custom_prompts_cache.update({"text": text, "mtime": mtime})
+    log.info("Loaded custom prompts from %s (%s chars)", _CUSTOM_PROMPTS_FILE, len(text))
+    return text
 
 
 def _filter_system_prompt(system_msg: str) -> list:
@@ -248,11 +265,13 @@ def _detect_request_source(system_msg: str, messages: list) -> str:
 
 def _log_prompt_payload(source: str, request_source: str, system_msg: str, final_instructions: list, history: list, current_msg: str, query: str, is_first_user_turn: bool=False, custom_prompts_loaded: bool=False):
     """Log raw/final prompt payloads for debugging prompt filtering."""
+    if not log.isEnabledFor(logging.DEBUG):
+        return
     raw_system=system_msg.strip()
     instructions_text="\n".join(final_instructions) if final_instructions else ""
     history_json=json.dumps([{"role": r, "content": ct} for r, ct in history], ensure_ascii=False, indent=2) if history else "[]"
     current_text=current_msg or ""
-    log.info(
+    log.debug(
         f"PROMPT DEBUG [{source}] source_guess={request_source} is_first_user_turn={str(is_first_user_turn).lower()} custom_prompts_loaded={str(custom_prompts_loaded).lower()}\n"
         f"--- RAW SYSTEM PROMPT START ---\n{raw_system or '[empty]'}\n--- RAW SYSTEM PROMPT END ---\n"
         f"--- FINAL INSTRUCTIONS START ---\n{instructions_text or '[empty]'}\n--- FINAL INSTRUCTIONS END ---\n"
@@ -276,10 +295,8 @@ _session_cache={}
 
 def _session_key(history: list) -> str:
     """Compute a stable hash of conversation history for session lookup."""
-    h=hashlib.sha256()
-    for role, content in history:
-        h.update(f"{role}:{content}\n".encode())
-    return h.hexdigest()[:16]
+    serialized=json.dumps(history, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode()).hexdigest()[:16]
 
 def _session_lookup(history: list) -> str | None:
     """Look up a stored backend_uuid for this conversation history. Returns None on miss."""
@@ -389,6 +406,20 @@ def _response_suffix(requested_pref, actual_model) -> str:
 # Thinking variants — activated via thinking=true parameter
 _THINKING_MAP={k: v["thinking"] for k, v in _MODEL_REGISTRY.items() if "thinking" in v}
 
+
+def _thinking_model_entry(model_id: str, base_entry: tuple) -> tuple:
+    """Derive thinking preferences from the active, possibly upgraded base model."""
+    spec=_MODEL_REGISTRY.get(model_id, {})
+    thinking=spec.get("thinking")
+    if not thinking:
+        return base_entry
+    registry_pref=spec["entry"][1]
+    if base_entry[1] == registry_pref:
+        return thinking
+    if thinking[1].startswith(registry_pref):
+        return base_entry[0], base_entry[1]+thinking[1][len(registry_pref):]
+    raise ValueError(f"No verified thinking preference for the changed model '{model_id}'")
+
 # Model availability per account tier
 _TIER_MODELS={
     "free": {"auto"},
@@ -402,21 +433,38 @@ def _default_model_map() -> dict:
     return {k: v for k, v in _ALL_MODELS.items() if k in allowed}
 
 def load_model_map() -> dict:
-    """Load model map from .models.json or use defaults."""
-    if MODELS_FILE.exists():
-        try:
-            data=json.loads(MODELS_FILE.read_text())
-            # format: {"model_id": ["mode", "internal_pref"]}
-            return {k: tuple(v) for k, v in data.items()}
-        except Exception as e:
-            log.warning(f"Failed to load {MODELS_FILE}: {e}")
-    return _default_model_map()
+    """Use defaults only when there is no persisted model map."""
+    try:
+        data=json.loads(MODELS_FILE.read_text())
+    except FileNotFoundError:
+        return _default_model_map()
+    if not isinstance(data, dict) or any(
+        not isinstance(key, str) or not key.strip()
+        or not isinstance(value, list) or len(value) != 2
+        or any(not isinstance(part, str) or not part.strip() for part in value)
+        for key, value in data.items()
+    ):
+        raise ValueError(f"Invalid model map in {MODELS_FILE}: expected model IDs mapped to [mode, preference]")
+    return {key: tuple(value) for key, value in data.items()}
+
+
+def _write_json_atomic(path: Path, data):
+    """Replace runtime data only after a complete owner-readable write."""
+    tmp=path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        with open(tmp, "x", encoding="utf-8", opener=lambda name, flags: os.open(name, flags, 0o600)) as output:
+            json.dump(data, output, ensure_ascii=False)
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
 
 def save_model_map(mm: dict):
-    """Save model map to .models.json."""
+    """Atomically replace the model map so failed writes preserve the previous map."""
     data={k: list(v) for k, v in mm.items()}
-    MODELS_FILE.write_text(json.dumps(data, indent=2))
+    _write_json_atomic(MODELS_FILE, data)
     log.info(f"Model map saved ({len(mm)} models)")
+
 
 def check_tier(model_name: str) -> str:
     """Check if model is available for current account tier. Returns error msg or empty string."""
@@ -428,16 +476,39 @@ def check_tier(model_name: str) -> str:
             # Model exists but not in this tier
             needed=_MODEL_REGISTRY.get(model_name, {}).get("tier", "pro")
             return f"Model '{model_name}' requires {needed} tier (current: {ACCOUNT_TYPE})"
-        return ""  # unknown model, let model_map handle it
+        if model_name in MODEL_MAP and ACCOUNT_TYPE == "free":
+            return f"Model '{model_name}' requires pro tier (current: {ACCOUNT_TYPE})"
+        return ""  # Custom models use pro tier; unknown IDs are validated by the caller.
     return ""
 
 def get_model_map() -> dict:
     """Get current model map filtered by account tier."""
-    global MODEL_MAP
-    allowed=_TIER_MODELS.get(ACCOUNT_TYPE, _TIER_MODELS["pro"])
-    return {k: v for k, v in MODEL_MAP.items() if k in allowed}
+    return {k: v for k, v in MODEL_MAP.items() if not check_tier(k)}
 
 MODEL_MAP=load_model_map()
+
+
+async def _iter_sse_events(response):
+    """Decode SSE fields independently of CRLF/LF framing and network chunks."""
+    event="message"
+    data=[]
+    async for raw_line in response.aiter_lines(delimiter=b"\n"):
+        line=(raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line).rstrip("\r")
+        if not line:
+            if data or event != "message":
+                yield event, "\n".join(data)
+            event="message"
+            data=[]
+        elif not line.startswith(":"):
+            field, _, value=line.partition(":")
+            if value.startswith(" "):
+                value=value[1:]
+            if field == "event":
+                event=value
+            elif field == "data":
+                data.append(value)
+    if data or event != "message":
+        yield event, "\n".join(data)
 
 
 class PerplexityClient:
@@ -447,27 +518,50 @@ class PerplexityClient:
         self.cookies=cookies
         self.session: Optional[cffi_requests.AsyncSession]=None
         self._initialized=False
+        self._init_lock=asyncio.Lock()
 
     async def init(self):
-        if self._initialized:
-            return
-        self.session=cffi_requests.AsyncSession(
-            headers=DEFAULT_HEADERS.copy(),
-            cookies=self.cookies,
-            impersonate=PPLX_IMPERSONATE,
-        )
-        try:
-            resp=await self.session.get(PPLX_AUTH_SESSION)
-            log.info(f"Session init: {resp.status_code}")
-        except Exception as e:
-            log.error(f"Session init failed: {e}")
-        self._initialized=True
+        async with self._init_lock:
+            if self._initialized:
+                return
+            session=cffi_requests.AsyncSession(
+                headers=DEFAULT_HEADERS.copy(),
+                cookies=self.cookies,
+                impersonate=PPLX_IMPERSONATE,
+            )
+            try:
+                resp=await session.get(PPLX_AUTH_SESSION, timeout=30)
+                if resp.status_code != 200:
+                    raise UpstreamError(f"Perplexity session initialization failed: HTTP {resp.status_code}")
+                data=resp.json()
+                if not isinstance(data, dict) or not data.get("user"):
+                    raise UpstreamError("Perplexity session is not authenticated")
+            except asyncio.CancelledError:
+                await session.close()
+                raise
+            except Exception as exc:
+                await session.close()
+                raise UpstreamError(f"Perplexity session initialization failed: {exc}") from exc
+            self.session=session
+            self._initialized=True
 
-    def reset(self, cookies: dict):
-        """Reset client with new cookies."""
-        self.cookies=cookies
-        self.session=None
-        self._initialized=False
+    async def close(self):
+        async with self._init_lock:
+            session=self.session
+            self.session=None
+            self._initialized=False
+            if session is not None:
+                await session.close()
+
+    async def reset(self, cookies: dict):
+        """Close the previous session before accepting replacement cookies."""
+        async with self._init_lock:
+            session=self.session
+            self.session=None
+            self._initialized=False
+            self.cookies=cookies
+            if session is not None:
+                await session.close()
         log.info("Client reset with new cookies")
 
     def sync_cookies_from_session(self) -> bool:
@@ -499,7 +593,7 @@ class PerplexityClient:
             sources=["web"]
         await self.init()
 
-        pplx_mode="concise" if mode == "auto" else "copilot"
+        pplx_mode="concise" if model_pref == "pplx_pro" or mode in {"auto", "concise"} else "copilot"
 
         json_data={
             "query_str": query,
@@ -538,7 +632,7 @@ class PerplexityClient:
         }
 
         log.info(f"Query: mode={mode}, pref={model_pref}, len={len(query)}")
-        log.info(f"PPLX REQUEST QUERY START\n{query}\nPPLX REQUEST QUERY END")
+        log.debug(f"PPLX REQUEST QUERY START\n{query}\nPPLX REQUEST QUERY END")
 
         try:
             resp=await self.session.post(PPLX_SSE_ASK, json=json_data, stream=True)
@@ -548,165 +642,188 @@ class PerplexityClient:
             return
 
         if resp.status_code != 200:
-            body=resp.text[:500] if hasattr(resp, 'text') else str(resp.status_code)
-            log.error(f"Perplexity {resp.status_code}: {body}")
-            yield {"error": f"HTTP {resp.status_code}", "detail": body}
-            if resp.status_code in (401, 403):
-                asyncio.create_task(notify_cookie_expired(f"Perplexity returned HTTP {resp.status_code}"))
+            status_code=resp.status_code
+            body=resp.text[:500]
+            await resp.aclose()
+            log.error("Perplexity HTTP %s", status_code)
+            if status_code in (401, 403):
+                asyncio.create_task(notify_cookie_expired(f"Perplexity returned HTTP {status_code}"))
+            yield {"error": f"HTTP {status_code}", "detail": body, "status_code": status_code}
             return
 
-        full_answer=""
-        backend_uuid=None
-        web_results=[]
-        seen_len=0
-        answer_usage=None
-        actual_model=None
-        substituted=False
-        _seen_thinking=set()  # dedup thinking content
+        try:
+            full_answer=""
+            backend_uuid=None
+            web_results=[]
+            seen_len=0
+            answer_usage=None
+            actual_model=None
+            substituted=False
+            _seen_thinking=set()  # dedup thinking content
 
-        async for line in resp.aiter_lines(delimiter=b"\r\n\r\n"):
-            content=line.decode("utf-8") if isinstance(line, bytes) else line
-            if not content.startswith("event: message\r\n"):
-                if content.startswith("event: end_of_stream"):
+            complete=False
+            async for event, data_str in _iter_sse_events(resp):
+                if event == "end_of_stream":
+                    complete=True
                     break
-                continue
+                if event == "error":
+                    raise UpstreamError(f"Perplexity stream error: {data_str[:500]}")
+                if event != "message":
+                    continue
+                try:
+                    chunk=json.loads(data_str)
+                except json.JSONDecodeError as exc:
+                    raise UpstreamError("Perplexity returned malformed SSE JSON") from exc
+                if not isinstance(chunk, dict):
+                    raise UpstreamError("Perplexity returned a non-object SSE message")
+                if chunk.get("error"):
+                    raise UpstreamError(f"Perplexity stream error: {str(chunk['error'])[:500]}")
 
-            data_str=content[len("event: message\r\ndata: "):]
-            try:
-                chunk=json.loads(data_str)
-            except json.JSONDecodeError:
-                continue
-
-            blocks=chunk.get("blocks", [])
-            display_model=chunk.get("display_model")
-            if isinstance(display_model, str) and display_model:
-                if _model_matches_preference(model_pref, display_model):
-                    if not substituted:
-                        actual_model=display_model
-                elif not substituted:
-                    switch_answer_blocks=[
-                        block for block in blocks
-                        if block.get("intended_usage", "").startswith("ask_text")
-                        and block.get("markdown_block")
-                    ]
-                    switch_answer_block=next(
-                        (block for block in switch_answer_blocks if block.get("intended_usage") == answer_usage),
-                        switch_answer_blocks[0] if switch_answer_blocks else None,
-                    )
-                    switch_chars=0
-                    if switch_answer_block:
-                        switch_mb=switch_answer_block["markdown_block"]
-                        switch_text="".join(switch_mb.get("chunks", []))
-                        if switch_mb.get("progress") == "DONE":
-                            switch_chars=max(0, len(switch_text) - seen_len)
+                blocks=chunk.get("blocks", [])
+                display_model=chunk.get("display_model")
+                if isinstance(display_model, str) and display_model:
+                    if _model_matches_preference(model_pref, display_model):
+                        if not substituted:
+                            actual_model=display_model
+                    elif not substituted:
+                        switch_answer_blocks=[
+                            block for block in blocks
+                            if block.get("intended_usage", "").startswith("ask_text")
+                            and block.get("markdown_block")
+                        ]
+                        switch_answer_block=next(
+                            (block for block in switch_answer_blocks if block.get("intended_usage") == answer_usage),
+                            switch_answer_blocks[0] if switch_answer_blocks else None,
+                        )
+                        switch_chars=0
+                        if switch_answer_block:
+                            switch_mb=switch_answer_block["markdown_block"]
+                            switch_text="".join(switch_mb.get("chunks", []))
+                            if switch_mb.get("progress") == "DONE":
+                                switch_chars=max(0, len(switch_text) - seen_len)
+                            else:
+                                switch_chars=len(switch_text)
+                        selected_model=chunk.get("user_selected_model", "")
+                        minor_auxiliary_tail=(
+                            _model_matches_preference(model_pref, selected_model)
+                            and seen_len > 0
+                            and (
+                                switch_chars == 0
+                                or (switch_chars <= 16 and switch_chars / seen_len <= 0.05)
+                            )
+                        )
+                        if minor_auxiliary_tail:
+                            log.info(
+                                f"Perplexity used auxiliary model '{display_model}' for a "
+                                f"{switch_chars}-character tail after '{actual_model}' produced {seen_len} characters"
+                            )
                         else:
-                            switch_chars=len(switch_text)
-                    selected_model=chunk.get("user_selected_model", "")
-                    minor_auxiliary_tail=(
-                        _model_matches_preference(model_pref, selected_model)
-                        and seen_len > 0
-                        and (
-                            switch_chars == 0
-                            or (switch_chars <= 16 and switch_chars / seen_len <= 0.05)
-                        )
+                            message=f"Perplexity substituted requested model '{model_pref}' with '{display_model}'"
+                            log.warning(message)
+                            substituted=True
+                            actual_model=display_model
+
+                if "backend_uuid" in chunk:
+                    backend_uuid=chunk["backend_uuid"]
+                if "web_results" in chunk:
+                    web_results=chunk["web_results"]
+
+                # Extract thinking content from search/plan blocks
+                for block in blocks:
+                    usage=block.get("intended_usage", "")
+
+                    # Thinking: search steps
+                    if usage == "pro_search_steps":
+                        pb=block.get("plan_block", {})
+                        for step in pb.get("steps", []):
+                            st=step.get("step_type", "")
+                            if st == "SEARCH_WEB":
+                                queries=[q.get("query","") for q in step.get("search_web_content",{}).get("queries",[])]
+                                for q in queries:
+                                    if q and q not in _seen_thinking:
+                                        _seen_thinking.add(q)
+                                        yield {"thinking": f"Searching: {q}", "done": False}
+                            elif st == "READ_RESULTS":
+                                urls=[u for u in step.get("read_results_content",{}).get("urls",[]) if u]
+                                for u in urls[:3]:
+                                    if u not in _seen_thinking:
+                                        _seen_thinking.add(u)
+                                        yield {"thinking": f"Reading: {u}", "done": False}
+
+                    # Thinking: plan goals
+                    if usage == "plan":
+                        pb=block.get("plan_block", {})
+                        for goal in pb.get("goals", []):
+                            desc=goal.get("description", "")
+                            if desc and desc not in _seen_thinking:
+                                _seen_thinking.add(desc)
+                                yield {"thinking": desc, "done": False}
+
+                    # Thinking: web results (capture as they arrive)
+                    if usage == "web_results":
+                        wb=block.get("web_result_block", {})
+                        results=wb.get("web_results", [])
+                        for r in results[:8]:
+                            url=r.get("url","")
+                            name=r.get("name","")
+                            if url and url not in _seen_thinking:
+                                _seen_thinking.add(url)
+                                yield {"thinking": f"Found: [{name}]({url})", "done": False}
+
+                # Perplexity can mirror the same answer through both ask_text and
+                # ask_text_0_markdown. Select one stream so chunks are not duplicated.
+                answer_blocks=[
+                    block for block in blocks
+                    if block.get("intended_usage", "").startswith("ask_text")
+                    and block.get("markdown_block")
+                ]
+                if not answer_blocks:
+                    continue
+                answer_block=None
+                if answer_usage:
+                    answer_block=next(
+                        (block for block in answer_blocks if block.get("intended_usage") == answer_usage),
+                        None,
                     )
-                    if minor_auxiliary_tail:
-                        log.info(
-                            f"Perplexity used auxiliary model '{display_model}' for a "
-                            f"{switch_chars}-character tail after '{actual_model}' produced {seen_len} characters"
-                        )
-                    else:
-                        message=f"Perplexity substituted requested model '{model_pref}' with '{display_model}'"
-                        log.warning(message)
-                        substituted=True
-                        actual_model=display_model
+                if answer_block is None:
+                    answer_block=next(
+                        (block for block in answer_blocks if block.get("intended_usage") == "ask_text"),
+                        answer_blocks[0],
+                    )
+                    answer_usage=answer_block.get("intended_usage")
 
-            if "backend_uuid" in chunk:
-                backend_uuid=chunk["backend_uuid"]
-            if "web_results" in chunk:
-                web_results=chunk["web_results"]
+                mb=answer_block["markdown_block"]
+                progress=mb.get("progress", "")
+                chunks=mb.get("chunks", [])
+                if not chunks:
+                    continue
+                if progress == "DONE":
+                    # Final snapshots can contain text never sent incrementally.
+                    final_answer="".join(chunks)
+                    if not final_answer.startswith(full_answer):
+                        raise UpstreamError("Perplexity rewrote text already sent in the stream")
+                    delta=final_answer[seen_len:]
+                    full_answer=final_answer
+                    seen_len=len(full_answer)
+                    if delta:
+                        yield {"delta": delta, "answer": full_answer, "backend_uuid": backend_uuid, "web_results": web_results, "done": False}
+                else:
+                    # Incremental: extract only new text
+                    chunk_text="".join(chunks)
+                    cumulative=full_answer + chunk_text
+                    if len(cumulative) > seen_len:
+                        delta=cumulative[seen_len:]
+                        full_answer=cumulative
+                        seen_len=len(cumulative)
+                        yield {"delta": delta, "answer": full_answer, "backend_uuid": backend_uuid, "web_results": web_results, "done": False}
 
-            # Extract thinking content from search/plan blocks
-            for block in blocks:
-                usage=block.get("intended_usage", "")
+            if not complete:
+                raise UpstreamError("Perplexity stream ended before end_of_stream")
+            if not full_answer.strip():
+                raise UpstreamError("Perplexity returned an empty answer")
 
-                # Thinking: search steps
-                if usage == "pro_search_steps":
-                    pb=block.get("plan_block", {})
-                    for step in pb.get("steps", []):
-                        st=step.get("step_type", "")
-                        if st == "SEARCH_WEB":
-                            queries=[q.get("query","") for q in step.get("search_web_content",{}).get("queries",[])]
-                            for q in queries:
-                                if q and q not in _seen_thinking:
-                                    _seen_thinking.add(q)
-                                    yield {"thinking": f"Searching: {q}", "done": False}
-                        elif st == "READ_RESULTS":
-                            urls=[u for u in step.get("read_results_content",{}).get("urls",[]) if u]
-                            for u in urls[:3]:
-                                if u not in _seen_thinking:
-                                    _seen_thinking.add(u)
-                                    yield {"thinking": f"Reading: {u}", "done": False}
-
-                # Thinking: plan goals
-                if usage == "plan":
-                    pb=block.get("plan_block", {})
-                    for goal in pb.get("goals", []):
-                        desc=goal.get("description", "")
-                        if desc and desc not in _seen_thinking:
-                            _seen_thinking.add(desc)
-                            yield {"thinking": desc, "done": False}
-
-                # Thinking: web results (capture as they arrive)
-                if usage == "web_results":
-                    wb=block.get("web_result_block", {})
-                    results=wb.get("web_results", [])
-                    for r in results[:8]:
-                        url=r.get("url","")
-                        name=r.get("name","")
-                        if url and url not in _seen_thinking:
-                            _seen_thinking.add(url)
-                            yield {"thinking": f"Found: [{name}]({url})", "done": False}
-
-            # Perplexity can mirror the same answer through both ask_text and
-            # ask_text_0_markdown. Select one stream so chunks are not duplicated.
-            answer_blocks=[
-                block for block in blocks
-                if block.get("intended_usage", "").startswith("ask_text")
-                and block.get("markdown_block")
-            ]
-            if not answer_blocks:
-                continue
-            answer_block=None
-            if answer_usage:
-                answer_block=next(
-                    (block for block in answer_blocks if block.get("intended_usage") == answer_usage),
-                    None,
-                )
-            if answer_block is None:
-                answer_block=next(
-                    (block for block in answer_blocks if block.get("intended_usage") == "ask_text"),
-                    answer_blocks[0],
-                )
-                answer_usage=answer_block.get("intended_usage")
-
-            mb=answer_block["markdown_block"]
-            progress=mb.get("progress", "")
-            chunks=mb.get("chunks", [])
-            if not chunks:
-                continue
-            if progress == "DONE":
-                # Final: full cumulative text
-                full_answer="".join(chunks)
-            else:
-                # Incremental: extract only new text
-                chunk_text="".join(chunks)
-                cumulative=full_answer + chunk_text
-                if len(cumulative) > seen_len:
-                    delta=cumulative[seen_len:]
-                    full_answer=cumulative
-                    seen_len=len(cumulative)
-                    yield {"delta": delta, "answer": full_answer, "backend_uuid": backend_uuid, "web_results": web_results, "done": False}
+        finally:
+            await resp.aclose()
 
         yield {
             "delta": "",
@@ -771,9 +888,7 @@ def save_cookies(cookies: dict, last_keepalive: float=None):
     data={"cookies": _cookie_dict(cookies), "timestamp": now}
     if last_keepalive is not None:
         data["last_keepalive"]=last_keepalive
-    tmp_file=COOKIE_FILE.with_name(f".{COOKIE_FILE.name}.{os.getpid()}.tmp")
-    tmp_file.write_text(json.dumps(data, indent=2))
-    tmp_file.replace(COOKIE_FILE)
+    _write_json_atomic(COOKIE_FILE, data)
     log.info(f"Cookies saved to {COOKIE_FILE}")
 
 
@@ -786,7 +901,7 @@ def get_client() -> PerplexityClient:
     if _client is None:
         cookies=load_cookies()
         if not cookies:
-            raise RuntimeError("No cookies available. Set PPLX_COOKIE in .env or run cookie refresh.")
+            raise OpenAIAPIError(503, "No cookies available. Set PPLX_COOKIE in .env or run cookie refresh.", err_type="server_error")
         _client=PerplexityClient(cookies)
     return _client
 
@@ -849,9 +964,9 @@ async def reconcile_configured_session() -> bool:
         return False
 
     save_cookies(validated, last_keepalive=time.time())
+    _reset_rate_limit()
     if _client:
-        _client.reset(validated)
-    _model_preflight_cache.clear()
+        await _client.reset(validated)
     _configured_session_state.update({"status": "active", "source": "env", "message": None})
     log.info("Validated and activated the changed .env session")
     return True
@@ -885,17 +1000,20 @@ app=FastAPI(title="pplx-proxy", version="1.0.0")
 # Rate limit startup fetch is in _combined_lifespan below
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# Global error handler: unconfigured service → 503
-@app.exception_handler(RuntimeError)
-async def runtime_error_handler(request: Request, exc: RuntimeError):
-    return JSONResponse(status_code=503, content={"error": {"message": str(exc), "type": "service_unavailable"}})
-
 @app.exception_handler(OpenAIAPIError)
 async def openai_api_error_handler(request: Request, exc: OpenAIAPIError):
     return JSONResponse(
         status_code=exc.status_code,
         content={"error": {"message": exc.message, "type": exc.err_type, "param": exc.param, "code": exc.code}},
     )
+
+
+@app.exception_handler(UpstreamError)
+async def upstream_error_handler(request: Request, exc: UpstreamError):
+    log.error("Upstream request failed: %s", exc)
+    return JSONResponse(status_code=502, content={"error": {
+        "message": str(exc), "type": "upstream_error", "param": None, "code": "upstream_error",
+    }})
 
 
 from fastapi.responses import FileResponse as _FileResponse
@@ -922,20 +1040,12 @@ async def health():
         try:
             data=json.loads(COOKIE_FILE.read_text())
             cache_age=round((time.time() - data.get("timestamp", 0)) / 3600, 1)
-        except Exception:
-            pass
-    # Populate the first rate-limit result before returning; later stale refreshes are backgrounded.
-    if _rate_limit["remaining_pro"] is None:
-        for attempt in range(2):
-            await _refresh_rate_limit(block=True)
-            if _rate_limit["remaining_pro"] is not None:
-                break
-            if attempt == 0:
-                await asyncio.sleep(1)
-    elif (time.time() - _rate_limit["updated_at"]) > 300:
+        except (OSError, ValueError, TypeError, AttributeError):
+            log.exception("Cannot read cookie cache metadata")
+    if (time.time() - _rate_limit["updated_at"]) > 300:
         await _refresh_rate_limit(block=False)
     rl_age=int(time.time() - _rate_limit["updated_at"]) if _rate_limit["updated_at"] else None
-    flaresolverr_status="ok" if _rate_limit.get("updated_at") else "unavailable" if _rate_limit.get("last_error") else "unknown"
+    flaresolverr_status="unavailable" if _rate_limit.get("last_error") else "ok" if _rate_limit.get("updated_at") else "unknown"
     return {
         "status": "ok", "service": "pplx-proxy", "cookie_age_hours": cache_age,
         "configured_session": dict(_configured_session_state),
@@ -974,48 +1084,33 @@ def _strip_appended_notices(text: str) -> str:
     return text.strip()
 
 def _message_content_text(content) -> str:
-    if isinstance(content, list):
-        parts=[]
-        for item in content:
-            if isinstance(item, str):
-                if item:
-                    parts.append(item)
-                continue
-            if not isinstance(item, dict):
-                continue
-            typ=item.get("type")
-            if typ in ("input_text", "output_text", "text", "summary_text"):
-                text=item.get("text", "")
-                if isinstance(text, str) and text:
-                    parts.append(text)
-            elif typ == "refusal":
-                text=item.get("refusal") or item.get("text") or ""
-                if text:
-                    parts.append(str(text))
-            elif typ == "input_image":
-                url=item.get("image_url")
-                if isinstance(url, dict):
-                    url=url.get("url")
-                if isinstance(url, str) and url:
-                    parts.append(f"[image: {url}]")
-            elif typ == "input_file":
-                name=item.get("filename") or item.get("file_id") or "file"
-                parts.append(f"[file: {name}]")
-        return " ".join(parts)
-    if isinstance(content, dict):
-        if content.get("type"):
-            return _message_content_text([content])
-        return str(content)
-    if isinstance(content, str):
-        return content
     if content is None:
         return ""
-    return str(content)
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        raise OpenAIAPIError(400, "Message content must be text or an array of text parts", param="content")
+    parts=[]
+    for item in content:
+        if isinstance(item, str):
+            parts.append(item)
+            continue
+        if not isinstance(item, dict):
+            raise OpenAIAPIError(400, "Content parts must be objects", param="content")
+        typ=item.get("type")
+        if typ in ("input_text", "output_text", "text", "summary_text"):
+            text=item.get("text")
+        elif typ == "refusal":
+            text=item.get("refusal") or item.get("text") or ""
+        else:
+            raise OpenAIAPIError(400, f"Unsupported content type: {typ}. Only text is supported", param="content")
+        if not isinstance(text, str):
+            raise OpenAIAPIError(400, "Content text must be a string", param="content")
+        parts.append(text)
+    return " ".join(parts)
 
 _GROK_TAG_RE=_re.compile(r'<grok:[^>]*>.*?</grok:[^>]*>', _re.DOTALL)
 _GROK_SELF_RE=_re.compile(r'<grok:[^>]*/>')
-_MULTI_SPACE=_re.compile(r' {2,}')
-_MULTI_NL=_re.compile(r'\n{3,}')
 
 def _clean_response(text: str, strip: bool=True) -> str:
     """Strip Perplexity citations and internal tags."""
@@ -1027,10 +1122,51 @@ def _clean_response(text: str, strip: bool=True) -> str:
     text=_re.sub(r'<script[^>]*>.*?</script>', '', text, flags=_re.DOTALL)
     text=_re.sub(r'</?script[^>]*>', '', text)
     if strip:
-        text=_MULTI_SPACE.sub(' ', text)
-        text=_MULTI_NL.sub('\n\n', text)
         text=text.strip()
     return text
+
+
+class _ResponseStreamCleaner:
+    """Keep unfinished citations and internal tags out of emitted text."""
+    def __init__(self):
+        self.pending=""
+
+    def feed(self, delta: str, final: bool=False) -> str:
+        self.pending+=delta
+        boundary=len(self.pending)
+        if not final:
+            partial_citation=_re.search(r"\[\d*$", self.pending)
+            if partial_citation:
+                boundary=partial_citation.start()
+            prefixes=("<?xml", "<grok:", "</grok:", "<response", "</response", "<script", "</script")
+            skip_until=0
+            for match in _re.finditer("<", self.pending):
+                start=match.start()
+                if start < skip_until:
+                    continue
+                if start >= boundary:
+                    break
+                tail=self.pending[start:]
+                if any(prefix.startswith(tail) for prefix in prefixes):
+                    boundary=start
+                    break
+                prefix=next((prefix for prefix in prefixes if tail.startswith(prefix)), None)
+                if not prefix:
+                    continue
+                end=tail.find("?>" if prefix == "<?xml" else ">")
+                if end < 0:
+                    boundary=start
+                    break
+                if prefix in ("<grok:", "<script") and not tail[:end].endswith("/"):
+                    closing=r"</grok:[^>]*>" if prefix == "<grok:" else r"</script>"
+                    closed=_re.search(closing, tail[end+1:])
+                    if not closed:
+                        boundary=start
+                        break
+                    skip_until=start+end+1+closed.end()
+        ready=self.pending[:boundary]
+        self.pending=self.pending[boundary:]
+        return _clean_response(ready, strip=False)
 
 
 # ─── Responses API store and helpers ───────────────────────────────────────
@@ -1052,81 +1188,87 @@ def _responses_reset_memory():
     _responses_loaded=False
 
 def _responses_load():
-    global _responses_loaded, _responses_store, _conversations_index
+    global _responses_loaded
     if _responses_loaded:
         return
-    _responses_loaded=True
-    try:
-        if not RESPONSES_FILE.exists():
-            return
+    if RESPONSES_FILE.exists():
+        # Never turn an unreadable store into an empty store that overwrites it.
         data=json.loads(RESPONSES_FILE.read_text())
-        recs=data.get("responses") if isinstance(data, dict) else data
-        convs=data.get("conversations") if isinstance(data, dict) else {}
-        now=time.time()
+        if not isinstance(data, dict):
+            raise ValueError("Responses store must contain an object")
+        recs=data.get("responses", data)
+        convs=data.get("conversations", {})
+        if not isinstance(recs, dict) or not isinstance(convs, dict):
+            raise ValueError("Invalid responses store structure")
         restored={}
-        for rid, rec in (recs or {}).items():
-            if not isinstance(rec, dict):
-                continue
-            created=rec.get("created_at") or 0
-            if now - created > _RESPONSES_MAX_AGE:
+        for rid, rec in recs.items():
+            if not isinstance(rec, dict) or rec.get("id") != rid or not isinstance(rec.get("created_at"), (int, float)):
+                raise ValueError(f"Invalid response record: {rid}")
+            if not rec.get("store", True):
                 continue
             if rec.get("status") == "in_progress":
                 rec["status"]="failed"
                 rec["error"]={"code": "server_error", "message": "Response interrupted by server restart"}
             restored[rid]=rec
-        _responses_store=restored
-        _conversations_index={k: v for k, v in (convs or {}).items() if v in restored}
-    except Exception as e:
-        log.warning(f"Failed to load responses store: {e}")
+        if any(not isinstance(v, str) for v in convs.values()):
+            raise ValueError("Invalid response conversation index")
+        _responses_store.update(restored)
+        _conversations_index.update({k: v for k, v in convs.items() if v in restored})
+    _responses_evict()
+    _responses_loaded=True
+
 
 def _responses_persist():
-    try:
-        RESPONSES_FILE.parent.mkdir(parents=True, exist_ok=True)
-        durable={k: v for k, v in _responses_store.items() if v.get("store", True)}
-        payload={"responses": durable, "conversations": {k: v for k, v in _conversations_index.items() if v in durable}}
-        tmp=RESPONSES_FILE.with_name(f".{RESPONSES_FILE.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False))
-        tmp.replace(RESPONSES_FILE)
-    except Exception as e:
-        log.warning(f"Failed to persist responses store: {e}")
+    RESPONSES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    payload={"responses": _responses_store, "conversations": _conversations_index}
+    _write_json_atomic(RESPONSES_FILE, payload)
+
 
 def _responses_evict():
     now=time.time()
-    expired=[rid for rid, rec in _responses_store.items() if now - (rec.get("created_at") or 0) > _RESPONSES_MAX_AGE]
+    expired=[rid for rid, rec in _responses_store.items() if rec.get("status") != "in_progress" and now - rec["created_at"] > _RESPONSES_MAX_AGE]
     for rid in expired:
         _responses_store.pop(rid, None)
-    if len(_responses_store) <= _RESPONSES_MAX_ENTRIES:
-        return
-    extra=len(_responses_store) - _RESPONSES_MAX_ENTRIES
-    oldest=sorted(_responses_store.items(), key=lambda kv: kv[1].get("created_at") or 0)[:extra]
-    for rid, _rec in oldest:
-        _responses_store.pop(rid, None)
+    extra=max(0, len(_responses_store) - _RESPONSES_MAX_ENTRIES)
+    if extra:
+        oldest=sorted(((rid, rec) for rid, rec in _responses_store.items() if rec.get("status") != "in_progress"), key=lambda kv: kv[1]["created_at"])[:extra]
+        for rid, _rec in oldest:
+            _responses_store.pop(rid, None)
+    for conv_id, rid in list(_conversations_index.items()):
+        if rid not in _responses_store:
+            del _conversations_index[conv_id]
+
 
 def _responses_put(rec: dict, persist: bool=True):
+    if not rec.get("store", True) or rec.get("_deleted"):
+        return
     _responses_load()
+    if rec["id"] not in _responses_store and sum(r.get("status") == "in_progress" for r in _responses_store.values()) >= _RESPONSES_MAX_ENTRIES:
+        raise OpenAIAPIError(429, "Too many in-progress responses; retry after they finish", err_type="rate_limit_error")
     _responses_store[rec["id"]]=rec
     conv=rec.get("conversation")
     conv_id=conv.get("id") if isinstance(conv, dict) else conv
     if conv_id:
         _conversations_index[conv_id]=rec["id"]
     _responses_evict()
-    if persist and rec.get("store", True):
+    if persist:
         with _responses_file_lock:
             _responses_persist()
 
+
 def _responses_get(response_id: str):
     _responses_load()
+    _responses_evict()
     return _responses_store.get(response_id)
+
 
 def _responses_delete(response_id: str) -> bool:
     _responses_load()
     rec=_responses_store.pop(response_id, None)
     if not rec:
         return False
-    conv=rec.get("conversation")
-    conv_id=conv.get("id") if isinstance(conv, dict) else conv
-    if conv_id and _conversations_index.get(conv_id) == response_id:
-        _conversations_index.pop(conv_id, None)
+    rec["_deleted"]=True
+    _responses_evict()
     with _responses_file_lock:
         _responses_persist()
     return True
@@ -1236,6 +1378,8 @@ def _responses_parse_input(inp, instructions="") -> list:
         typ=item.get("type")
         if typ in (None, "message", "input_message"):
             role=item.get("role", "user")
+            if role not in ("system", "developer", "user", "assistant", "tool"):
+                raise OpenAIAPIError(400, f"Invalid message role at input[{i}]", param="input")
             if role == "developer":
                 role="system"
             content=_message_content_text(item.get("content", ""))
@@ -1245,15 +1389,10 @@ def _responses_parse_input(inp, instructions="") -> list:
             output=item.get("output", "")
             call_id=item.get("call_id", "")
             messages.append({"role": "user", "content": f"[tool output {call_id}]: {output}"})
-        elif typ in ("function_call", "reasoning", "item_reference", "web_search_call", "file_search_call", "computer_call", "mcp_call", "image_generation_call"):
+        elif typ in ("function_call", "reasoning", "web_search_call", "file_search_call", "computer_call", "mcp_call", "image_generation_call"):
             continue
         else:
-            role=item.get("role")
-            content=_message_content_text(item.get("content", item.get("text", item.get("output", ""))))
-            if role and content:
-                if role == "developer":
-                    role="system"
-                messages.append({"role": role, "content": content})
+            raise OpenAIAPIError(400, f"Unsupported input item type: {typ}", param="input")
     return messages
 
 def _responses_apply_previous(messages: list, previous_response_id, conversation):
@@ -1267,6 +1406,7 @@ def _responses_apply_previous(messages: list, previous_response_id, conversation
         conv_id=conversation
     if conv_id and not prev_id:
         _responses_load()
+        _responses_evict()
         prev_id=_conversations_index.get(conv_id)
         if not prev_id:
             return messages, None, conv_id
@@ -1275,76 +1415,59 @@ def _responses_apply_previous(messages: list, previous_response_id, conversation
     rec=_responses_get(prev_id)
     if not rec:
         raise OpenAIAPIError(404, f"No model response found with id '{prev_id}'.", param="previous_response_id")
+    if rec.get("status") != "completed":
+        raise OpenAIAPIError(400, "Only completed responses can be continued", param="previous_response_id")
     prior=[{"role": r, "content": c} for r, c in rec.get("_history_messages") or []]
     system_msgs=[m for m in messages if m.get("role") == "system"]
     other=[m for m in messages if m.get("role") != "system"]
     return system_msgs+prior+other, prev_id, conv_id
 
 def _prepare_pplx_from_messages(messages: list, log_source: str, extra_instructions: list=None):
-    system_msg=""
-    history=[]
-    for msg in messages:
-        role=msg.get("role", "user")
-        if role == "developer":
-            role="system"
-        content=_message_content_text(msg.get("content"))
-        if role == "user":
-            _ct=content[:200].lower()
-            if any(kw in _ct for kw in _SYSTEM_PROMPT_HINTS):
-                role="system"
-        content=_strip_appended_notices(content)
-        if not content or not content.strip():
-            continue
-        if role == "system":
-            system_msg+=content+"\n"
-        elif role == "tool":
-            history.append(("user", content))
-        elif role in ("user", "assistant"):
-            history.append((role, content))
-    deduped=[]
-    for role, content in history:
-        if deduped and role == "assistant" and deduped[-1][0] == "assistant":
-            deduped[-1]=(role, content)
-        else:
-            deduped.append((role, content))
-    history=deduped
-    current_msg=""
-    if history and history[-1][0] == "user":
-        current_msg=history[-1][1]
-        history=history[:-1]
+    system_msg="\n".join(_message_content_text(m.get("content")) for m in messages if m.get("role") in ("system", "developer"))
     request_source=_detect_request_source(system_msg, messages)
     is_lobehub=request_source == "lobehub"
-    is_first_user_turn=is_lobehub and not history
-    follow_up_uuid=_session_lookup(history)
-    extra_instructions=list(extra_instructions or [])
+    history=[]
+    for index, msg in enumerate(messages):
+        role=msg.get("role", "user")
+        content=_strip_appended_notices(_message_content_text(msg.get("content")))
+        if not content:
+            continue
+        if role in ("system", "developer"):
+            continue
+        # Only LobeHub's prompt blocks preceding a later user request are metadata.
+        if is_lobehub and role == "user" and any(kw in content[:200].lower() for kw in _SYSTEM_PROMPT_HINTS) and any(m.get("role") == "user" for m in messages[index+1:]):
+            continue
+        if role == "tool":
+            raise OpenAIAPIError(400, "Tool messages are not supported", param="messages")
+        if role in ("user", "assistant"):
+            if history and role == "assistant" and history[-1][0] == "assistant":
+                history[-1]=(role, content)
+            else:
+                history.append((role, content))
+    if not history or history[-1][0] != "user":
+        raise OpenAIAPIError(400, "A non-empty final user message is required", param="messages")
+    current_msg=history.pop()[1]
+    if is_lobehub:
+        custom_prompts=_load_custom_prompts()
+        final_instructions=[custom_prompts] if custom_prompts else []
+    else:
+        final_instructions=_filter_system_prompt(system_msg) if system_msg else []
+    final_instructions.extend(extra_instructions or [])
+    # Explicit instructions must apply on every turn, including changed prompts.
+    follow_up_uuid=None if is_lobehub or system_msg or final_instructions else _session_lookup(history)
     if follow_up_uuid:
         query=current_msg
-        final_instructions=extra_instructions
-        if extra_instructions:
-            query=("\n".join(extra_instructions)+"\n"+current_msg).strip()
-        log.info(f"SESSION CONTINUE [{log_source}] source={request_source} follow_up={follow_up_uuid[:12]}...")
     else:
-        custom_prompts=_load_custom_prompts() if is_lobehub else ""
-        final_instructions=[]
-        if is_lobehub:
-            if custom_prompts:
-                final_instructions.append(custom_prompts)
-        else:
-            final_instructions=_filter_system_prompt(system_msg) if system_msg else []
-        final_instructions.extend(extra_instructions)
-        query_obj={}
+        query_obj={"query": current_msg}
         if final_instructions:
             query_obj["instructions"]=final_instructions
         if history:
-            query_obj["history"]=[{"role": r, "content": ct} for r, ct in history]
-        if current_msg:
-            query_obj["query"]=current_msg
-        elif not history:
-            query_obj["query"]=""
+            query_obj["history"]=[{"role": role, "content": content} for role, content in history]
         query=json.dumps(query_obj, ensure_ascii=False)
-        if len(query) > 96000:
-            query=query[-96000:]
-    _log_prompt_payload(log_source, request_source, system_msg, final_instructions, history, current_msg, query, is_first_user_turn, not bool(follow_up_uuid) and bool(final_instructions))
+    if len(query) > 96000:
+        raise OpenAIAPIError(400, "Conversation exceeds the 96000-character limit; shorten the input", param="messages", code="context_length_exceeded")
+    is_first_user_turn=is_lobehub and not history
+    _log_prompt_payload(log_source, request_source, system_msg, final_instructions, history, current_msg, query, is_first_user_turn, is_lobehub and bool(final_instructions))
     return {
         "system_msg": system_msg,
         "history": history,
@@ -1364,7 +1487,7 @@ def _responses_resolve_model(model_name: str, use_thinking: bool):
     if model_name not in mm:
         raise OpenAIAPIError(400, f"Unknown model: {model_name}. Available: {list(mm.keys())}", param="model")
     if use_thinking and model_name in _THINKING_MAP:
-        mode, model_pref=_THINKING_MAP[model_name]
+        mode, model_pref=_thinking_model_entry(model_name, mm[model_name])
         log.info(f"thinking on → {model_name} using {model_pref}")
     else:
         try:
@@ -1372,10 +1495,8 @@ def _responses_resolve_model(model_name: str, use_thinking: bool):
         except (ValueError, TypeError):
             raise OpenAIAPIError(500, f"Corrupted model entry for {model_name}", err_type="server_error", param="model")
     if _rate_limit.get("remaining_pro") is not None and _rate_limit["remaining_pro"] <= 0 and model_name != "auto":
-        log.warning(f"Pro quota exhausted (remaining_pro={_rate_limit['remaining_pro']}), falling back {model_name}→auto")
-        mode, model_pref=mm.get("auto", ("pro", "pplx_pro"))
-        model_name="auto"
-    return model_name, mode, model_pref
+        raise OpenAIAPIError(429, "Perplexity Pro quota exhausted; explicitly request auto to use the automatic model", err_type="rate_limit_error", param="model")
+    return model_name, "auto" if model_name == "auto" else mode, model_pref
 
 def _responses_new_record(model_name, instructions, max_output_tokens, previous_response_id, reasoning, store_flag, temperature, text_cfg, tool_choice, tools_raw, top_p, truncation, metadata, user, background, conv_id, input_items, query, parallel_tool_calls):
     resp_id=f"resp_{uuid4().hex}"
@@ -1423,8 +1544,8 @@ def _responses_new_record(model_name, instructions, max_output_tokens, previous_
         "_rs_id": rs_id,
     }
 
-def _responses_finalize(rec, query, full, thinking_parts, backend_uuid, actual_model, history, current_msg, mode, model_pref):
-    full=_clean_response(full)
+def _responses_finalize(rec, query, full, thinking_parts, backend_uuid, actual_model, history, current_msg, mode, model_pref, strip: bool=True):
+    full=_clean_response(full, strip=strip)
     _session_store(history, current_msg, full, backend_uuid)
     if mode != "auto":
         _decrement_pro()
@@ -1452,21 +1573,28 @@ async def _responses_collect_answer(client, query, mode, model_pref, follow_up_u
     thinking_parts=[]
     backend_uuid=None
     actual_model=None
-    async for ch in client.search(query, mode, model_pref, ["web"], "en-US", follow_up_uuid):
-        if ch.get("backend_uuid"):
-            backend_uuid=ch["backend_uuid"]
-        if ch.get("actual_model"):
-            actual_model=ch["actual_model"]
-        if ch.get("error"):
-            return {"error": ch["error"], "full": full, "thinking_parts": thinking_parts, "backend_uuid": backend_uuid, "actual_model": actual_model}
-        if ch.get("thinking"):
-            thinking_parts.append(ch["thinking"])
-            continue
-        if ch.get("done"):
-            full=ch.get("answer", full)
-            actual_model=ch.get("actual_model", actual_model)
-            break
-        full=ch.get("answer", full)
+    completed=False
+    async with aclosing(client.search(query, mode, model_pref, ["web"], "en-US", follow_up_uuid)) as upstream:
+        async for ch in upstream:
+            if ch.get("backend_uuid"):
+                backend_uuid=ch["backend_uuid"]
+            if ch.get("actual_model"):
+                actual_model=ch["actual_model"]
+            if ch.get("error"):
+                return {"error": ch["error"], "full": full, "thinking_parts": thinking_parts, "backend_uuid": backend_uuid, "actual_model": actual_model}
+            if ch.get("thinking"):
+                thinking_parts.append(ch["thinking"])
+                continue
+            if ch.get("done"):
+                completed=True
+                full=ch.get("answer", full)
+                actual_model=ch.get("actual_model", actual_model)
+                break
+            full=ch.get("answer", full+ch.get("delta", ""))
+    if not completed:
+        raise RuntimeError("Perplexity stream ended without a completion event")
+    if not full.strip():
+        raise UpstreamError("Perplexity returned an empty answer")
     return {"error": None, "full": full, "thinking_parts": thinking_parts, "backend_uuid": backend_uuid, "actual_model": actual_model}
 
 async def _responses_background_job(resp_id, query, mode, model_pref, follow_up_uuid, history, current_msg):
@@ -1499,15 +1627,13 @@ async def _responses_background_job(resp_id, query, mode, model_pref, follow_up_
     finally:
         _responses_tasks.pop(resp_id, None)
 
-async def _stream_responses_api(client, rec, query, mode, model_pref, follow_up_uuid, history, current_msg):
+async def _stream_responses_events(client, rec, query, mode, model_pref, follow_up_uuid, history, current_msg):
     seq=0
     msg_id=rec["_msg_id"]
     rs_id=rec["_rs_id"]
     def _wrap(event, rec_obj):
         public=_responses_public(rec_obj)
-        payload=dict(public)
-        payload["response"]=public
-        return _sse_pack(event, payload, seq)
+        return _sse_pack(event, {"response": public}, seq)
     chunk, seq=_wrap("response.created", rec)
     yield chunk
     chunk, seq=_wrap("response.in_progress", rec)
@@ -1521,66 +1647,80 @@ async def _stream_responses_api(client, rec, query, mode, model_pref, follow_up_
     message_started=False
     actual_model=None
     msg_output_index=0
+    completed=False
+    streamed_text=""
+    cleaner=_ResponseStreamCleaner()
 
-    async for ch in client.search(query, mode, model_pref, ["web"], "en-US", follow_up_uuid):
-        if ch.get("backend_uuid"):
-            backend_uuid=ch["backend_uuid"]
-        if ch.get("actual_model"):
-            actual_model=ch["actual_model"]
-        if ch.get("error"):
-            rec["status"]="failed"
-            rec["error"]={"code": "server_error", "message": str(ch["error"])}
-            _responses_put(rec, persist=rec.get("store", True))
-            chunk, seq=_wrap("response.failed", rec)
-            yield chunk
-            chunk, seq=_sse_pack("error", {"error": ch["error"]}, seq)
-            yield chunk
-            return
-        if ch.get("thinking"):
-            t=ch["thinking"]
-            thinking_parts.append(t)
-            if not thinking_started:
-                thinking_started=True
-                item={"id": rs_id, "type": "reasoning", "summary": []}
-                chunk, seq=_sse_pack("response.output_item.added", {"output_index": 0, "item": item}, seq)
+    async with aclosing(client.search(query, mode, model_pref, ["web"], "en-US", follow_up_uuid)) as upstream:
+        async for ch in upstream:
+            if ch.get("backend_uuid"):
+                backend_uuid=ch["backend_uuid"]
+            if ch.get("actual_model"):
+                actual_model=ch["actual_model"]
+            if ch.get("error"):
+                rec["status"]="failed"
+                rec["error"]={"code": "server_error", "message": str(ch["error"])}
+                _responses_put(rec, persist=rec.get("store", True))
+                chunk, seq=_wrap("response.failed", rec)
                 yield chunk
-                chunk, seq=_sse_pack("response.reasoning_summary_part.added", {"item_id": rs_id, "output_index": 0, "summary_index": 0, "part": {"type": "summary_text", "text": ""}}, seq)
+                chunk, seq=_sse_pack("error", {"error": ch["error"]}, seq)
                 yield chunk
-            evt={"item_id": rs_id, "output_index": 0, "summary_index": 0, "delta": t+"\n"}
-            chunk, seq=_sse_pack("response.reasoning_summary_text.delta", evt, seq)
-            yield chunk
-            continue
-        if ch.get("done"):
-            full=ch.get("answer", full)
-            actual_model=ch.get("actual_model", actual_model)
-            break
-        delta=ch.get("delta", "")
-        if delta:
-            delta=_clean_response(delta, strip=False)
-        if not delta:
-            if ch.get("answer"):
+                return
+            if ch.get("thinking"):
+                if message_started:
+                    raise RuntimeError("Perplexity emitted reasoning after the answer started")
+                t=ch["thinking"]
+                thinking_parts.append(t)
+                if not thinking_started:
+                    thinking_started=True
+                    item={"id": rs_id, "type": "reasoning", "summary": []}
+                    chunk, seq=_sse_pack("response.output_item.added", {"output_index": 0, "item": item}, seq)
+                    yield chunk
+                    chunk, seq=_sse_pack("response.reasoning_summary_part.added", {"item_id": rs_id, "output_index": 0, "summary_index": 0, "part": {"type": "summary_text", "text": ""}}, seq)
+                    yield chunk
+                evt={"item_id": rs_id, "output_index": 0, "summary_index": 0, "delta": ("\n" if len(thinking_parts) > 1 else "")+t}
+                chunk, seq=_sse_pack("response.reasoning_summary_text.delta", evt, seq)
+                yield chunk
+                continue
+            if ch.get("done"):
+                completed=True
                 full=ch.get("answer", full)
-            continue
-        if thinking_started and not thinking_closed:
-            thinking_closed=True
-            think_full="\n".join(thinking_parts)
-            chunk, seq=_sse_pack("response.reasoning_summary_text.done", {"item_id": rs_id, "output_index": 0, "summary_index": 0, "text": think_full}, seq)
+                actual_model=ch.get("actual_model", actual_model)
+                break
+            full=ch.get("answer", full+ch.get("delta", ""))
+            delta=ch.get("delta", "")
+            if delta:
+                delta=cleaner.feed(delta)
+            if not delta:
+                if ch.get("answer"):
+                    full=ch.get("answer", full)
+                continue
+            if thinking_started and not thinking_closed:
+                thinking_closed=True
+                think_full="\n".join(thinking_parts)
+                chunk, seq=_sse_pack("response.reasoning_summary_text.done", {"item_id": rs_id, "output_index": 0, "summary_index": 0, "text": think_full}, seq)
+                yield chunk
+                chunk, seq=_sse_pack("response.reasoning_summary_part.done", {"item_id": rs_id, "output_index": 0, "summary_index": 0, "part": {"type": "summary_text", "text": think_full}}, seq)
+                yield chunk
+                chunk, seq=_sse_pack("response.output_item.done", {"output_index": 0, "item": {"id": rs_id, "type": "reasoning", "summary": [{"type": "summary_text", "text": think_full}]}}, seq)
+                yield chunk
+                msg_output_index=1
+            if not message_started:
+                message_started=True
+                item={"id": msg_id, "type": "message", "status": "in_progress", "role": "assistant", "content": []}
+                chunk, seq=_sse_pack("response.output_item.added", {"output_index": msg_output_index, "item": item, "id": msg_id, "role": "assistant"}, seq)
+                yield chunk
+                chunk, seq=_sse_pack("response.content_part.added", {"item_id": msg_id, "output_index": msg_output_index, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}}, seq)
+                yield chunk
+            streamed_text+=delta
+            evt={"item_id": msg_id, "output_index": msg_output_index, "content_index": 0, "delta": delta}
+            chunk, seq=_sse_pack("response.output_text.delta", evt, seq)
             yield chunk
-            chunk, seq=_sse_pack("response.reasoning_summary_part.done", {"item_id": rs_id, "output_index": 0, "summary_index": 0, "part": {"type": "summary_text", "text": think_full}}, seq)
-            yield chunk
-            chunk, seq=_sse_pack("response.output_item.done", {"output_index": 0, "item": {"id": rs_id, "type": "reasoning", "summary": [{"type": "summary_text", "text": think_full}]}}, seq)
-            yield chunk
-            msg_output_index=1
-        if not message_started:
-            message_started=True
-            item={"id": msg_id, "type": "message", "status": "in_progress", "role": "assistant", "content": []}
-            chunk, seq=_sse_pack("response.output_item.added", {"output_index": msg_output_index, "item": item, "id": msg_id, "role": "assistant"}, seq)
-            yield chunk
-            chunk, seq=_sse_pack("response.content_part.added", {"item_id": msg_id, "output_index": msg_output_index, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}}, seq)
-            yield chunk
-        evt={"item_id": msg_id, "output_index": msg_output_index, "content_index": 0, "delta": delta}
-        chunk, seq=_sse_pack("response.output_text.delta", evt, seq)
-        yield chunk
+
+    if not completed:
+        raise RuntimeError("Perplexity stream ended without a completion event")
+    if not full.strip():
+        raise UpstreamError("Perplexity returned an empty answer")
 
     if thinking_started and not thinking_closed:
         thinking_closed=True
@@ -1593,10 +1733,12 @@ async def _stream_responses_api(client, rec, query, mode, model_pref, follow_up_
         yield chunk
         msg_output_index=1
 
-    rec=_responses_finalize(rec, query, full, thinking_parts, backend_uuid, actual_model, history, current_msg, mode, model_pref)
+    raw_full=_clean_response(full, strip=False)
+    if not raw_full.startswith(streamed_text):
+        raise RuntimeError("Perplexity final answer does not match the streamed text")
+    rec=_responses_finalize(rec, query, full, thinking_parts, backend_uuid, actual_model, history, current_msg, mode, model_pref, strip=False)
     final_text=rec.get("output_text") or ""
-    raw_full=_clean_response(full)
-    streamed_notice=final_text[len(raw_full):] if final_text.startswith(raw_full) else ""
+    streamed_notice=final_text[len(streamed_text):]
     if not message_started:
         message_started=True
         item={"id": msg_id, "type": "message", "status": "in_progress", "role": "assistant", "content": []}
@@ -1604,9 +1746,6 @@ async def _stream_responses_api(client, rec, query, mode, model_pref, follow_up_
         yield chunk
         chunk, seq=_sse_pack("response.content_part.added", {"item_id": msg_id, "output_index": msg_output_index, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}}, seq)
         yield chunk
-        if raw_full:
-            chunk, seq=_sse_pack("response.output_text.delta", {"item_id": msg_id, "output_index": msg_output_index, "content_index": 0, "delta": raw_full}, seq)
-            yield chunk
     if streamed_notice:
         chunk, seq=_sse_pack("response.output_text.delta", {"item_id": msg_id, "output_index": msg_output_index, "content_index": 0, "delta": streamed_notice}, seq)
         yield chunk
@@ -1620,25 +1759,80 @@ async def _stream_responses_api(client, rec, query, mode, model_pref, follow_up_
     chunk, seq=_wrap("response.completed", rec)
     yield chunk
 
+async def _stream_responses_api(client, rec, query, mode, model_pref, follow_up_uuid, history, current_msg):
+    last_seq=-1
+    try:
+        async with aclosing(_stream_responses_events(client, rec, query, mode, model_pref, follow_up_uuid, history, current_msg)) as events:
+            async for chunk in events:
+                last_seq+=1
+                yield chunk
+    except (asyncio.CancelledError, GeneratorExit):
+        if rec.get("status") == "in_progress":
+            rec["status"]="cancelled"
+            _responses_put(rec)
+        raise
+    except Exception as e:
+        log.exception("Responses stream failed")
+        rec["status"]="failed"
+        rec["error"]={"code": "server_error", "message": str(e)}
+        _responses_put(rec)
+        chunk, _seq=_sse_pack("response.failed", {"response": _responses_public(rec)}, last_seq+1)
+        yield chunk
+
 @app.post("/v1/responses")
 async def responses_api(request: Request, _=Depends(verify_api_key)):
     """OpenAI Responses API compatibility: create, stream, store, and chain turns."""
-    try:
-        body=await request.json()
-    except Exception:
-        raise OpenAIAPIError(400, "Invalid or empty JSON body")
-    if not isinstance(body, dict):
-        raise OpenAIAPIError(400, "Request body must be an object")
+    body=await _read_json_object(request)
 
-    stream=body.get("stream", False)
-    if isinstance(stream, dict):
-        stream=True
-    stream=bool(stream)
+    for name in ("stream", "background", "store", "parallel_tool_calls"):
+        if name in body and body[name] is not None and not isinstance(body[name], bool):
+            raise OpenAIAPIError(400, f"{name} must be a boolean", param=name)
+    for name in ("model", "previous_response_id", "user"):
+        if name in body and body[name] is not None and not isinstance(body[name], str):
+            raise OpenAIAPIError(400, f"{name} must be a string", param=name)
+    for name in ("reasoning", "metadata", "text"):
+        if name in body and body[name] is not None and not isinstance(body[name], dict):
+            raise OpenAIAPIError(400, f"{name} must be an object", param=name)
+    conversation=body.get("conversation")
+    if conversation is not None and not (isinstance(conversation, str) and conversation or isinstance(conversation, dict) and isinstance(conversation.get("id"), str) and conversation["id"]):
+        raise OpenAIAPIError(400, "conversation must be an ID or an object with a string ID", param="conversation")
+    if body.get("instructions") is not None and not isinstance(body.get("instructions"), (str, list)):
+        raise OpenAIAPIError(400, "instructions must be a string or an array", param="instructions")
+    if body.get("tools") is not None and (not isinstance(body["tools"], list) or any(not isinstance(t, dict) for t in body["tools"])):
+        raise OpenAIAPIError(400, "tools must be an array of objects", param="tools")
+    for tool in body.get("tools") or []:
+        if tool.get("type") not in ("web_search", "web_search_preview", "web_search_preview_2025_03_11"):
+            raise OpenAIAPIError(400, "Only built-in web search is supported; function tools cannot be executed", param="tools")
+    if body.get("tool_choice", "auto") not in (None, "auto"):
+        raise OpenAIAPIError(400, "Only tool_choice=auto is supported; built-in web search cannot be forced or disabled", param="tool_choice")
+    for name in ("temperature", "top_p"):
+        value=body.get(name)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or value != 1):
+            raise OpenAIAPIError(400, f"Custom {name} is not supported by Perplexity", param=name)
+    if body.get("max_output_tokens") is not None:
+        raise OpenAIAPIError(400, "max_output_tokens is not supported by Perplexity", param="max_output_tokens")
+    if body.get("truncation") not in (None, "disabled"):
+        raise OpenAIAPIError(400, "Automatic truncation is not supported; shorten the input explicitly", param="truncation")
+    text_format=(body.get("text") or {}).get("format")
+    if text_format is not None and not isinstance(text_format, dict):
+        raise OpenAIAPIError(400, "text.format must be an object", param="text.format")
+    if isinstance(text_format, dict) and text_format.get("type") == "json_schema":
+        schema=text_format.get("schema") or (text_format.get("json_schema") or {})
+        if not isinstance(schema, dict):
+            raise OpenAIAPIError(400, "JSON schema must be an object", param="text.format")
+    if isinstance(text_format, dict):
+        if text_format.get("type") not in ("text", "json_object", "json_schema"):
+            raise OpenAIAPIError(400, "Unsupported text format", param="text.format")
+        if text_format.get("strict") or isinstance(text_format.get("json_schema"), dict) and text_format["json_schema"].get("strict"):
+            raise OpenAIAPIError(400, "Strict JSON schema enforcement is not supported", param="text.format")
+    stream=bool(body.get("stream", False))
     background=bool(body.get("background", False))
     if background and stream:
         raise OpenAIAPIError(400, "background=true cannot be combined with stream=true", param="background")
+    if background and body.get("store") is False:
+        raise OpenAIAPIError(400, "background=true requires store=true", param="store")
 
-    model_name=body.get("model", DEFAULT_MODEL)
+    model_name=body.get("model") or DEFAULT_MODEL
     inp=body.get("input", "")
     instructions=body.get("instructions", "")
     tools_raw=body.get("tools", [])
@@ -1681,6 +1875,7 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
     if not (query or "").strip():
         raise OpenAIAPIError(400, "Empty query after processing", param="input")
 
+    client=None if background else get_client()
     rec=_responses_new_record(
         model_name, instructions, max_output_tokens, prev_id, reasoning, store_flag,
         temperature, text_cfg, tool_choice, tools_raw, top_p, truncation, metadata, user,
@@ -1697,7 +1892,6 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
         _responses_tasks[rec["id"]]=task
         return _responses_public(rec)
 
-    client=get_client()
     if stream:
         return StreamingResponse(
             _stream_responses_api(client, rec, query, mode, model_pref, prepared["follow_up_uuid"], prepared["history"], prepared["current_msg"]),
@@ -1705,7 +1899,18 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    result=await _responses_collect_answer(client, query, mode, model_pref, prepared["follow_up_uuid"])
+    try:
+        result=await _responses_collect_answer(client, query, mode, model_pref, prepared["follow_up_uuid"])
+    except asyncio.CancelledError:
+        rec["status"]="cancelled"
+        _responses_put(rec)
+        raise
+    except Exception as e:
+        log.exception("Responses request failed")
+        rec["status"]="failed"
+        rec["error"]={"code": "server_error", "message": str(e)}
+        _responses_put(rec)
+        raise OpenAIAPIError(502, str(e), err_type="server_error") from e
     if result["error"]:
         rec["status"]="failed"
         rec["error"]={"code": "server_error", "message": str(result["error"])}
@@ -1738,8 +1943,8 @@ async def cancel_response(response_id: str, _=Depends(verify_api_key)):
     rec=_responses_get(response_id)
     if not rec:
         raise OpenAIAPIError(404, f"No model response found with id '{response_id}'.", param="response_id")
-    if rec.get("status") != "in_progress":
-        raise OpenAIAPIError(400, "Only in-progress responses can be cancelled.", param="response_id")
+    if rec.get("status") != "in_progress" or not rec.get("background"):
+        raise OpenAIAPIError(400, "Only in-progress background responses can be cancelled.", param="response_id")
     task=_responses_tasks.get(response_id)
     if task:
         task.cancel()
@@ -1765,11 +1970,10 @@ async def list_response_input_items(response_id: str, limit: int=20, after: str=
         ids=[x.get("id") for x in items]
         if before in ids:
             items=items[:ids.index(before)]
-    try:
-        limit=int(limit)
-    except Exception:
-        limit=20
-    limit=min(max(limit, 1), 100)
+    if not isinstance(limit, int) or not 1 <= limit <= 100:
+        raise OpenAIAPIError(400, "limit must be between 1 and 100", param="limit")
+    if order not in ("asc", "desc"):
+        raise OpenAIAPIError(400, "order must be asc or desc", param="order")
     has_more=len(items) > limit
     items=items[:limit]
     return {
@@ -1781,12 +1985,19 @@ async def list_response_input_items(response_id: str, limit: int=20, after: str=
     }
 
 
-@app.post("/v1/chat/completions")
-async def chat_completions(request: Request, _=Depends(verify_api_key)):
+async def _read_json_object(request):
     try:
         body=await request.json()
-    except Exception:
-        raise HTTPException(400, "Invalid or empty JSON body")
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise OpenAIAPIError(400, "Invalid or empty JSON body") from exc
+    if not isinstance(body, dict):
+        raise OpenAIAPIError(400, "Request body must be an object")
+    return body
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request, _=Depends(verify_api_key)):
+    body=await _read_json_object(request)
     model_name=body.get("model", DEFAULT_MODEL)
     messages=body.get("messages", None)
     stream=body.get("stream", False)
@@ -1794,6 +2005,36 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
     sources=body.get("sources", ["web"])
     thinking=body.get("thinking", False)
     reasoning_effort=body.get("reasoning_effort", None)  # "none" = no thinking, anything else = thinking
+
+    if not isinstance(model_name, str) or not model_name:
+        raise OpenAIAPIError(400, "model must be a non-empty string", param="model")
+    for name in ("stream", "thinking"):
+        if name in body and not isinstance(body[name], bool):
+            raise OpenAIAPIError(400, f"{name} must be a boolean", param=name)
+    if reasoning_effort is not None and reasoning_effort not in ("none", "minimal", "low", "medium", "high", "xhigh"):
+        raise OpenAIAPIError(400, "Invalid reasoning_effort", param="reasoning_effort")
+    if not isinstance(sources, list) or not sources or any(not isinstance(x, str) or x not in ("web", "scholar", "social") for x in sources):
+        raise OpenAIAPIError(400, "sources must be a non-empty array of web, scholar, or social", param="sources")
+    if not isinstance(language, str) or not language.strip():
+        raise OpenAIAPIError(400, "language must be a non-empty string", param="language")
+    if body.get("tools") or body.get("functions") or body.get("tool_choice") not in (None, "none", "auto"):
+        raise OpenAIAPIError(400, "Function calling is not supported", param="tools")
+
+    for name, default in (("temperature", 1), ("top_p", 1), ("n", 1), ("presence_penalty", 0), ("frequency_penalty", 0)):
+        value=body.get(name)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or value != default):
+            raise OpenAIAPIError(400, f"Custom {name} is not supported by Perplexity", param=name)
+    for name in ("max_tokens", "max_completion_tokens", "stop", "seed", "logit_bias", "top_logprobs"):
+        if body.get(name) is not None:
+            raise OpenAIAPIError(400, f"{name} is not supported by Perplexity", param=name)
+    if body.get("logprobs") not in (None, False):
+        raise OpenAIAPIError(400, "logprobs is not supported", param="logprobs")
+    response_format=body.get("response_format")
+    if response_format is not None and response_format != {"type": "text"}:
+        raise OpenAIAPIError(400, "Only text response_format is supported; use /v1/responses for best-effort JSON prompting", param="response_format")
+    stream_options=body.get("stream_options")
+    if stream_options is not None and (not isinstance(stream_options, dict) or stream_options.get("include_usage") not in (None, False)):
+        raise OpenAIAPIError(400, "Streaming usage reporting is not supported", param="stream_options")
 
     # Validate messages
     if messages is None:
@@ -1809,8 +2050,10 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
         role=msg.get("role")
         if role is None:
             raise HTTPException(400, f"messages[{i}] missing required field: role")
-        if role not in VALID_ROLES:
+        if not isinstance(role, str) or role not in VALID_ROLES:
             raise HTTPException(400, f"messages[{i}] invalid role: '{role}'. Must be one of: {sorted(VALID_ROLES)}")
+        if role == "tool" or msg.get("tool_calls") or msg.get("function_call"):
+            raise OpenAIAPIError(400, "Function calling is not supported", param="messages")
         if "content" not in msg and role not in ("assistant", "tool"):
             raise HTTPException(400, f"messages[{i}] missing required field: content")
 
@@ -1824,7 +2067,7 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
     # Thinking mode: thinking=true OR reasoning_effort != "none"
     use_thinking=thinking or (reasoning_effort is not None and reasoning_effort != "none")
     if use_thinking and model_name in _THINKING_MAP:
-        mode, model_pref=_THINKING_MAP[model_name]
+        mode, model_pref=_thinking_model_entry(model_name, mm[model_name])
         log.info(f"thinking on → {model_name} using {model_pref}")
     else:
         try:
@@ -1832,92 +2075,17 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
         except (ValueError, TypeError):
             raise HTTPException(500, f"Corrupted model entry for {model_name}. Fix via /admin/update-models")
 
-    # Quota fallback: auto-downgrade when Pro quota exhausted
     if _rate_limit.get("remaining_pro") is not None and _rate_limit["remaining_pro"] <= 0 and model_name != "auto":
-        log.warning(f"Pro quota exhausted (remaining_pro={_rate_limit['remaining_pro']}), falling back {model_name}→auto")
-        mode, model_pref=mm.get("auto", ("pro", "pplx_pro"))
-        model_name="auto"
+        raise OpenAIAPIError(429, "Pro Search quota exhausted; explicitly select auto to use the free model", err_type="rate_limit_error", code="insufficient_quota")
 
-    # Build query — extract system, history, and current user message separately
-    system_msg=""
-    history=[]
-    for msg in messages:
-        role=msg.get("role", "user")
-        if role=="developer": role="system"
-        content=_message_content_text(msg.get("content"))
-        # Detect user messages that are actually system prompts (LobeHub sends
-        # Jamie's custom system prompt as role:user after the developer message)
-        if role=="user":
-            _ct=content[:200].lower()
-            if any(kw in _ct for kw in ["you are ", "you must ", "your role", "ccsearch", "加載", "技能", "available_skills", "<skill", "<user_memory", "<available_tools", "<tool_selection", "<credentials", "<best_practices", "<memory_effort", "<session_context"]):
-                role="system"
-        # Strip rate limit notices from previous responses
-        content=_strip_appended_notices(content)
-        if not content or not content.strip():
-            continue
-        if role == "system":
-            system_msg+=content+"\n"
-        elif role == "user":
-            history.append(("user", content))
-        elif role == "assistant":
-            # Keep enough context per assistant message
-            history.append(("assistant", content))
+    if model_name == "auto":
+        mode="auto"
 
-    # Deduplicate consecutive assistant messages (LibreChat branch artifacts)
-    deduped=[]
-    for role, content in history:
-        if deduped and role == "assistant" and deduped[-1][0] == "assistant":
-            deduped[-1]=(role, content)  # replace with latest
-        else:
-            deduped.append((role, content))
-    history=deduped
-
-    # Keep only last 16 items (~8 turns) to prevent context overflow
-
-    # Separate current user message from history
-    current_msg=""
-    if history and history[-1][0] == "user":
-        current_msg=history[-1][1]
-        history=history[:-1]
-
-    request_source=_detect_request_source(system_msg, messages)
-    is_lobehub=request_source == "lobehub"
-    is_first_user_turn=is_lobehub and not history
-
-    # Session continuity: check if we can skip history/instructions
-    follow_up_uuid=_session_lookup(history)
-    if follow_up_uuid:
-        query=current_msg
-        final_instructions=[]
-        log.info(f"SESSION CONTINUE [chat_completions] source={request_source} follow_up={follow_up_uuid[:12]}...")
-    else:
-        custom_prompts=_load_custom_prompts() if is_lobehub else ""
-        final_instructions=[]
-        if is_lobehub:
-            if custom_prompts:
-                final_instructions.append(custom_prompts)
-        else:
-            final_instructions=_filter_system_prompt(system_msg) if system_msg else []
-
-        # Build query as JSON for clear block separation
-        query_obj={}
-        if final_instructions:
-            query_obj["instructions"]=final_instructions
-        if history:
-            query_obj["history"]=[{"role": r, "content": ct} for r, ct in history]
-        if current_msg:
-            query_obj["query"]=current_msg
-        elif not history:
-            query_obj["query"]=""
-
-        query=json.dumps(query_obj, ensure_ascii=False)
-        if len(query) > 96000:
-            query=query[-96000:]
-
-    _log_prompt_payload("chat_completions", request_source, system_msg, final_instructions, history, current_msg, query, is_first_user_turn, not bool(follow_up_uuid) and bool(final_instructions))
-
-    if not query.strip():
-        raise HTTPException(400, "No valid message content after processing. Ensure at least one user message has non-empty content.")
+    prepared=_prepare_pplx_from_messages(messages, "chat_completions")
+    query=prepared["query"]
+    history=prepared["history"]
+    current_msg=prepared["current_msg"]
+    follow_up_uuid=prepared["follow_up_uuid"]
 
     client=get_client()
     cid=f"chatcmpl-{uuid4().hex[:12]}"
@@ -1934,21 +2102,26 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
     resp_backend_uuid=None
     thinking_parts=[]
     actual_model=None
-    async for chunk in client.search(query, mode, model_pref, sources, language, follow_up_uuid):
-        if chunk.get("backend_uuid"):
-            resp_backend_uuid=chunk["backend_uuid"]
-        if chunk.get("actual_model"):
-            actual_model=chunk["actual_model"]
-        if chunk.get("error"):
-            raise HTTPException(502, chunk)
-        if chunk.get("thinking"):
-            thinking_parts.append(chunk["thinking"])
-            continue
-        if chunk.get("done"):
+    completed=False
+    async with aclosing(client.search(query, mode, model_pref, sources, language, follow_up_uuid)) as upstream:
+        async for chunk in upstream:
+            if chunk.get("backend_uuid"):
+                resp_backend_uuid=chunk["backend_uuid"]
+            if chunk.get("actual_model"):
+                actual_model=chunk["actual_model"]
+            if chunk.get("error"):
+                raise HTTPException(502, chunk)
+            if chunk.get("thinking"):
+                thinking_parts.append(chunk["thinking"])
+                continue
+            if chunk.get("done"):
+                completed=True
+                full=chunk.get("answer", full)
+                actual_model=chunk.get("actual_model", actual_model)
+                break
             full=chunk.get("answer", full)
-            actual_model=chunk.get("actual_model", actual_model)
-            break
-        full=chunk.get("answer", full)
+    if not completed or not full.strip():
+        raise OpenAIAPIError(502, "Upstream ended without a complete answer", err_type="upstream_error")
     reasoning_content="\n".join(thinking_parts) if thinking_parts else None
     full=_clean_response(full)
 
@@ -1974,6 +2147,16 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
 
 
 async def _stream_openai(client, query, mode, model_pref, model_name, cid, created, sources, language, follow_up_uuid=None, history=None, current_msg=None):
+    try:
+        async with aclosing(_stream_openai_chunks(client, query, mode, model_pref, model_name, cid, created, sources, language, follow_up_uuid, history, current_msg)) as chunks:
+            async for chunk in chunks:
+                yield chunk
+    except Exception:
+        log.exception("Chat stream failed")
+        yield "data: "+json.dumps({"error": {"message": "Chat stream failed; check server logs", "type": "upstream_error"}})+"\n\n"
+
+
+async def _stream_openai_chunks(client, query, mode, model_pref, model_name, cid, created, sources, language, follow_up_uuid=None, history=None, current_msg=None):
     init={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
           "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None, "logprobs": None}]}
     yield f"data: {json.dumps(init)}\n\n"
@@ -1981,59 +2164,72 @@ async def _stream_openai(client, query, mode, model_pref, model_name, cid, creat
     _resp_backend_uuid=None
     _full_answer=""
     _actual_model=None
-    async for chunk in client.search(query, mode, model_pref, sources, language, follow_up_uuid):
-        if chunk.get("backend_uuid"):
-            _resp_backend_uuid=chunk["backend_uuid"]
-        if chunk.get("actual_model"):
-            _actual_model=chunk["actual_model"]
-        if chunk.get("answer"):
-            _full_answer=chunk["answer"]
-        # Stream thinking content as reasoning_content deltas
-        if chunk.get("thinking"):
-            t={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
-               "choices": [{"index": 0, "delta": {"reasoning_content": chunk["thinking"]+"\n"}, "finish_reason": None, "logprobs": None}]}
-            yield f"data: {json.dumps(t)}\n\n"
-            continue
+    completed=False
+    cleaner=_ResponseStreamCleaner()
+    streamed_text=""
+    async with aclosing(client.search(query, mode, model_pref, sources, language, follow_up_uuid)) as upstream:
+        async for chunk in upstream:
+            if chunk.get("backend_uuid"):
+                _resp_backend_uuid=chunk["backend_uuid"]
+            if chunk.get("actual_model"):
+                _actual_model=chunk["actual_model"]
+            if "answer" in chunk:
+                _full_answer=chunk["answer"]
+            else:
+                _full_answer+=chunk.get("delta", "")
+            # Stream thinking content as reasoning_content deltas
+            if chunk.get("thinking"):
+                t={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
+                   "choices": [{"index": 0, "delta": {"reasoning_content": chunk["thinking"]+"\n"}, "finish_reason": None, "logprobs": None}]}
+                yield f"data: {json.dumps(t)}\n\n"
+                continue
 
-        if chunk.get("error"):
-            e={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
-               "choices": [{"index": 0, "delta": {"content": f"[Error: {chunk['error']}]"}, "finish_reason": None, "logprobs": None}]}
-            yield f"data: {json.dumps(e)}\n\n"
-            stop={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
-                  "choices": [{"index": 0, "delta": {}, "finish_reason": "stop", "logprobs": None}]}
-            yield f"data: {json.dumps(stop)}\n\n"
-            break
+            if chunk.get("error"):
+                yield "data: "+json.dumps({"error": {"message": str(chunk["error"]), "type": "upstream_error", "code": "upstream_error"}})+"\n\n"
+                return
 
-        dt=chunk.get("delta", "")
-        if dt:
-            dt=_clean_response(dt, strip=False)
+            dt=cleaner.feed(chunk.get("delta", ""), final=bool(chunk.get("done")))
             if dt:
+                streamed_text+=dt
                 d={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
-                   "choices": [{"index": 0, "delta": {"content": dt}, "finish_reason": None, "logprobs": None}]}
+                       "choices": [{"index": 0, "delta": {"content": dt}, "finish_reason": None, "logprobs": None}]}
                 yield f"data: {json.dumps(d)}\n\n"
 
-        if chunk.get("done"):
-            wr=chunk.get("web_results", [])
-            if wr:
-                cites="\n\n---\nSources:\n"
-                for i, w in enumerate(wr[:10]):
-                    url=w.get("url", w) if isinstance(w, dict) else str(w)
-                    cites+=f"[{i+1}] {url}\n"
-                c={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
-                   "choices": [{"index": 0, "delta": {"content": cites}, "finish_reason": None, "logprobs": None}]}
-                yield f"data: {json.dumps(c)}\n\n"
+            if chunk.get("done"):
+                final_text=_clean_response(_full_answer, strip=False)
+                if not final_text.strip() or not final_text.startswith(streamed_text):
+                    raise UpstreamError("Final answer does not match the streamed text")
+                tail=final_text[len(streamed_text):]
+                if tail:
+                    chunk_data={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
+                        "choices": [{"index": 0, "delta": {"content": tail}, "finish_reason": None, "logprobs": None}]}
+                    yield f"data: {json.dumps(chunk_data)}\n\n"
+                completed=True
+                wr=chunk.get("web_results", [])
+                if wr:
+                    cites="\n\n---\nSources:\n"
+                    for i, w in enumerate(wr[:10]):
+                        url=w.get("url", w) if isinstance(w, dict) else str(w)
+                        cites+=f"[{i+1}] {url}\n"
+                    c={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
+                       "choices": [{"index": 0, "delta": {"content": cites}, "finish_reason": None, "logprobs": None}]}
+                    yield f"data: {json.dumps(c)}\n\n"
 
-            # Rate limit decrement + notices
-            _decrement_pro()
-            notice=_response_suffix(model_pref, chunk.get("actual_model", _actual_model))
-            if notice:
-                nd={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
-                    "choices": [{"index": 0, "delta": {"content": notice}, "finish_reason": None, "logprobs": None}]}
-                yield f"data: {json.dumps(nd)}\n\n"
-            stop={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
-                  "choices": [{"index": 0, "delta": {}, "finish_reason": "stop", "logprobs": None}]}
-            yield f"data: {json.dumps(stop)}\n\n"
-            break
+                # Rate limit decrement + notices
+                if mode != "auto":
+                    _decrement_pro()
+                notice=_response_suffix(model_pref, chunk.get("actual_model", _actual_model))
+                if notice:
+                    nd={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
+                        "choices": [{"index": 0, "delta": {"content": notice}, "finish_reason": None, "logprobs": None}]}
+                    yield f"data: {json.dumps(nd)}\n\n"
+                stop={"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name, "system_fingerprint": None,
+                      "choices": [{"index": 0, "delta": {}, "finish_reason": "stop", "logprobs": None}]}
+                yield f"data: {json.dumps(stop)}\n\n"
+                break
+    if not completed:
+        yield "data: "+json.dumps({"error": {"message": "Upstream ended without a complete answer", "type": "upstream_error"}})+"\n\n"
+        return
 
     # Store session for next turn
     if history is not None and current_msg:
@@ -2112,7 +2308,9 @@ async def probe_model_status(client, pref) -> str:
         query="Explain one concrete tradeoff between optimistic and pessimistic database locking in 80 to 120 words."
         async for chunk in client.search(query, "pro", pref, ["web"], "en-US"):
             if chunk.get("error"):
-                return PROBE_DEAD
+                if chunk.get("status_code") in {400, 404, 422}:
+                    return PROBE_DEAD
+                raise UpstreamError(f"Model probe failed for {pref}: {chunk['error']}")
             if chunk.get("done"):
                 if not chunk.get("answer", "").strip():
                     return PROBE_DEAD
@@ -2121,7 +2319,8 @@ async def probe_model_status(client, pref) -> str:
                 return PROBE_SUBSTITUTED
         return PROBE_DEAD
     except Exception:
-        return PROBE_DEAD
+        log.exception("Model probe failed for %s", pref)
+        raise
 
 async def probe_model(client, pref) -> bool:
     """Test if a model_preference is valid."""
@@ -2169,17 +2368,6 @@ async def _try_upgrade_model(client, model_id, mode, pref, report=None, sleep_se
     return found
 
 
-async def ensure_model_available(client, pref) -> bool:
-    """Use a short-lived verified result before accepting an explicit model."""
-    now=time.monotonic()
-    cached=_model_preflight_cache.get(pref)
-    if cached and now-cached[0] < MODEL_PREFLIGHT_TTL_SECS:
-        return cached[1]
-    available=await probe_model(client, pref)
-    _model_preflight_cache[pref]=(now, available)
-    return available
-
-
 async def _discover_known_missing_models(client, report: dict, sleep_seconds: float=2.0) -> bool:
     """Probe known model names that are absent from a persisted .models.json."""
     global MODEL_MAP
@@ -2189,7 +2377,7 @@ async def _discover_known_missing_models(client, report: dict, sleep_seconds: fl
     report.setdefault("unavailable", [])
     for model_id, (mode, pref) in _ALL_MODELS.items():
         tier=_MODEL_REGISTRY.get(model_id, {}).get("tier", "pro")
-        if model_id in MODEL_MAP or tier not in allowed_tiers:
+        if model_id not in _ENABLED_MODEL_IDS or model_id in MODEL_MAP or tier not in allowed_tiers:
             continue
         report["probed"]+=1
         log.info(f"Discovery: probing new model name {model_id} ({pref})...")
@@ -2259,220 +2447,205 @@ async def discover_models(request: Request, _=Depends(verify_api_key)):
         "dead": len(report["dead"]),
         "unavailable": len(report["unavailable"]),
         "probed": report["probed"],
-        
+
         "details": report,
     }
 
 
 # ─── MCP Server ────────────────────────────────────────────────────────────
 
-try:
-    from mcp.server.fastmcp import FastMCP
-    HAS_MCP=True
-except ImportError:
-    HAS_MCP=False
-    log.warning("mcp package not installed, MCP endpoints disabled.")
+from mcp.server.fastmcp import FastMCP
 
-if HAS_MCP:
-    # Configure MCP transport security — allow external domain
-    from urllib.parse import urlparse as _urlparse
-    _pub_host=_urlparse(PUBLIC_URL).hostname or ""
-    _mcp_security=None
-    if _pub_host and _pub_host not in ("localhost", "127.0.0.1"):
-        from mcp.server.transport_security import TransportSecuritySettings
-        _mcp_security=TransportSecuritySettings(
-            enable_dns_rebinding_protection=True,
-            allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*", f"{_pub_host}:*", _pub_host],
-            allowed_origins=["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*", f"https://{_pub_host}:*", f"https://{_pub_host}"],
-        )
-        log.info(f"MCP allowed hosts: localhost + {_pub_host}")
-    mcp=FastMCP("pplx-proxy", instructions="Perplexity Pro Search reverse proxy.", transport_security=_mcp_security)
+# Configure MCP transport security — allow external domain
+from urllib.parse import urlparse as _urlparse
+_pub_host=_urlparse(PUBLIC_URL).hostname or ""
+_mcp_security=None
+if _pub_host and _pub_host not in ("localhost", "127.0.0.1"):
+    from mcp.server.transport_security import TransportSecuritySettings
+    _mcp_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*", f"{_pub_host}:*", _pub_host],
+        allowed_origins=["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*", f"https://{_pub_host}:*", f"https://{_pub_host}"],
+    )
+    log.info(f"MCP allowed hosts: localhost + {_pub_host}")
+mcp=FastMCP("pplx-proxy", instructions="Perplexity Pro Search reverse proxy.", transport_security=_mcp_security)
 
-    @mcp.tool()
-    async def perplexity_search(query: str, model: str="default", sources: str="web", language: str="en-US") -> str:
-        """Pro Search: Enhanced web search with Perplexity Pro.
-        Model: default (uses DEFAULT_MODEL from config), or any model ID from perplexity_models().
-        Sources: web, scholar, social (comma-separated)."""
-        if not query or not query.strip():
-            return "Error: query cannot be empty"
-        mm=get_model_map()
-        model_id=DEFAULT_MODEL if model == "default" else model
-        tier_err=check_tier(model_id)
-        if tier_err:
-            return f"Error: {tier_err}"
-        if model_id not in mm:
-            avail=", ".join(sorted(mm.keys()))
-            return f"Error: Unknown model '{model_id}'. Available models: {avail}"
-        mode, pref=mm[model_id]
-        VALID_SOURCES={"web", "scholar", "social"}
-        src=[s.strip() for s in sources.split(",")]
-        invalid_src=[s for s in src if s not in VALID_SOURCES]
-        if invalid_src:
-            return f"Error: Invalid sources: {invalid_src}. Valid: {sorted(VALID_SOURCES)}"
-        client=get_client()
-        r=""
-        actual_model=None
-        async for ch in client.search(query, mode, pref, src, language):
-            if ch.get("error"): return f"Error: {ch['error']}"
-            if ch.get("actual_model"): actual_model=ch["actual_model"]
-            if ch.get("done"):
-                r=ch.get("answer", r)
-                actual_model=ch.get("actual_model", actual_model)
-                break
+@mcp.tool()
+async def perplexity_search(query: str, model: str="default", sources: str="web", language: str="en-US") -> str:
+    """Pro Search: Enhanced web search with Perplexity Pro.
+    Model: default (uses DEFAULT_MODEL from config), or any model ID from perplexity_models().
+    Sources: web, scholar, social (comma-separated)."""
+    if not query or not query.strip():
+        raise ValueError("query cannot be empty")
+    mm=get_model_map()
+    model_id=DEFAULT_MODEL if model == "default" else model
+    tier_err=check_tier(model_id)
+    if tier_err:
+        raise ValueError(tier_err)
+    if model_id not in mm:
+        avail=", ".join(sorted(mm.keys()))
+        raise ValueError(f"Unknown model '{model_id}'. Available models: {avail}")
+    mode, pref=mm[model_id]
+    VALID_SOURCES={"web", "scholar", "social"}
+    src=[s.strip() for s in sources.split(",")]
+    invalid_src=[s for s in src if s not in VALID_SOURCES]
+    if invalid_src:
+        raise ValueError(f"Invalid sources: {invalid_src}. Valid: {sorted(VALID_SOURCES)}")
+    client=get_client()
+    r=""
+    actual_model=None
+    async for ch in client.search(query, mode, pref, src, language):
+        if ch.get("error"): raise RuntimeError(ch["error"])
+        if ch.get("actual_model"): actual_model=ch["actual_model"]
+        if ch.get("done"):
             r=ch.get("answer", r)
-        return r+_substitution_notice(pref, actual_model)
+            actual_model=ch.get("actual_model", actual_model)
+            break
+        r=ch.get("answer", r)
+    if pref != "pplx_pro":
+        _decrement_pro()
+    return r+_response_suffix(pref, actual_model)
 
-    @mcp.tool()
-    async def perplexity_ask(query: str, language: str="en-US") -> str:
-        """Auto Search: Quick general-purpose Q&A."""
-        if not query or not query.strip():
-            return "Error: query cannot be empty"
-        client=get_client()
-        r=""
-        async for c in client.search(query, "concise", "pplx_pro", ["web"], language):
-            if c.get("error"): return f"Error: {c['error']}"
-            if c.get("done"): r=c.get("answer", r); break
-            r=c.get("answer", r)
-        return r
+@mcp.tool()
+async def perplexity_ask(query: str, language: str="en-US") -> str:
+    """Auto Search: Quick general-purpose Q&A."""
+    if not query or not query.strip():
+        raise ValueError("query cannot be empty")
+    client=get_client()
+    r=""
+    async for c in client.search(query, "concise", "pplx_pro", ["web"], language):
+        if c.get("error"): raise RuntimeError(c["error"])
+        if c.get("done"): r=c.get("answer", r); break
+        r=c.get("answer", r)
+    return r
 
-    @mcp.tool()
-    async def perplexity_reason(query: str, model: str="default", language: str="en-US") -> str:
-        """Reasoning: Step-by-step reasoning through complex problems.
-        Model: default (gpt thinking), gpt, sonnet, opus, gemini, nemotron, claude (alias for sonnet)."""
-        if not query or not query.strip():
-            return "Error: query cannot be empty"
-        mm=get_model_map()
-        # Map shorthand to base model, then look up thinking variant
-        shorthand={"claude": "sonnet", "default": "gpt"}
-        base=shorthand.get(model, model)
-        tier_err=check_tier(base)
-        if tier_err:
-            return f"Error: {tier_err}"
-        if base not in mm:
-            avail=["default","gpt","sonnet","opus","gemini","nemotron","claude"]
-            return f"Error: Unknown reasoning model '{model}'. Available: {avail}"
-        # Prefer thinking variant if available
-        if base in _THINKING_MAP:
-            mode, pref=_THINKING_MAP[base]
-        else:
-            mode, pref=mm[base]
-        client=get_client()
-        r=""
-        actual_model=None
-        async for ch in client.search(query, mode, pref, ["web"], language):
-            if ch.get("error"): return f"Error: {ch['error']}"
-            if ch.get("actual_model"): actual_model=ch["actual_model"]
-            if ch.get("done"):
-                r=ch.get("answer", r)
-                actual_model=ch.get("actual_model", actual_model)
-                break
+@mcp.tool()
+async def perplexity_reason(query: str, model: str="default", language: str="en-US") -> str:
+    """Reasoning: Step-by-step reasoning through complex problems.
+    Model: default (gpt thinking), gpt, sonnet, opus, gemini, nemotron, claude (alias for sonnet)."""
+    if not query or not query.strip():
+        raise ValueError("query cannot be empty")
+    mm=get_model_map()
+    # Map shorthand to base model, then look up thinking variant
+    shorthand={"claude": "sonnet", "default": "gpt"}
+    base=shorthand.get(model, model)
+    tier_err=check_tier(base)
+    if tier_err:
+        raise ValueError(tier_err)
+    if base not in mm:
+        avail=["default","gpt","sonnet","opus","gemini","nemotron","claude"]
+        raise ValueError(f"Unknown reasoning model '{model}'. Available: {avail}")
+    mode, pref=_thinking_model_entry(base, mm[base])
+    client=get_client()
+    r=""
+    actual_model=None
+    async for ch in client.search(query, mode, pref, ["web"], language):
+        if ch.get("error"): raise RuntimeError(ch["error"])
+        if ch.get("actual_model"): actual_model=ch["actual_model"]
+        if ch.get("done"):
             r=ch.get("answer", r)
-        return r+_substitution_notice(pref, actual_model)
+            actual_model=ch.get("actual_model", actual_model)
+            break
+        r=ch.get("answer", r)
+    if pref != "pplx_pro":
+        _decrement_pro()
+    return r+_response_suffix(pref, actual_model)
 
-    @mcp.tool()
-    async def perplexity_research(query: str, language: str="en-US") -> str:
-        """Deep Research: Comprehensive in-depth research. Takes longer (30s+)."""
-        if not query or not query.strip():
-            return "Error: query cannot be empty"
-        client=get_client()
-        r=""
-        async for c in client.search(query, "deep research", "pplx_alpha", ["web"], language):
-            if c.get("error"): return f"Error: {c['error']}"
-            if c.get("done"): r=c.get("answer", r); break
-            r=c.get("answer", r)
-        return r
+@mcp.tool()
+async def perplexity_research(query: str, language: str="en-US") -> str:
+    """Deep Research: Comprehensive in-depth research. Takes longer (30s+)."""
+    if not query or not query.strip():
+        raise ValueError("query cannot be empty")
+    client=get_client()
+    r=""
+    async for c in client.search(query, "deep research", "pplx_alpha", ["web"], language):
+        if c.get("error"): raise RuntimeError(c["error"])
+        if c.get("done"): r=c.get("answer", r); break
+        r=c.get("answer", r)
+    return r
 
-    @mcp.tool()
-    async def perplexity_models() -> str:
-        """List all available Perplexity models with their modes and IDs.
-        Use these IDs as the 'model' parameter in other tools."""
-        mm=get_model_map()
-        lines=[f"Default model: {DEFAULT_MODEL}", f"Account type: {ACCOUNT_TYPE}", "", "Available models:"]
-        by_mode={}
-        for mid, (mode, pref) in mm.items():
-            by_mode.setdefault(mode, []).append(mid)
-        for mode in ["auto", "pro", "reasoning", "deep research"]:
-            if mode in by_mode:
-                lines.append(f"\n[{mode}]")
-                for mid in by_mode[mode]:
-                    marker=" (default)" if mid == DEFAULT_MODEL else ""
-                    lines.append(f"  - {mid}{marker}")
-        return "\n".join(lines)
+@mcp.tool()
+async def perplexity_models() -> str:
+    """List all available Perplexity models with their modes and IDs.
+    Use these IDs as the 'model' parameter in other tools."""
+    mm=get_model_map()
+    lines=[f"Default model: {DEFAULT_MODEL}", f"Account type: {ACCOUNT_TYPE}", "", "Available models:"]
+    by_mode={}
+    for mid, (mode, pref) in mm.items():
+        by_mode.setdefault(mode, []).append(mid)
+    for mode in ["auto", "pro", "reasoning", "deep research"]:
+        if mode in by_mode:
+            lines.append(f"\n[{mode}]")
+            for mid in by_mode[mode]:
+                marker=" (default)" if mid == DEFAULT_MODEL else ""
+                lines.append(f"  - {mid}{marker}")
+    return "\n".join(lines)
 
-    from contextlib import asynccontextmanager as _acm
+from contextlib import asynccontextmanager as _acm
 
-    mcp_http_app=mcp.streamable_http_app()
-    mcp_sse_app=mcp.sse_app()
+mcp_http_app=mcp.streamable_http_app()
+mcp_sse_app=mcp.sse_app()
 
-    # Wrap FastAPI lifespan to include MCP streamable HTTP session manager init
-    _orig_lifespan=app.router.lifespan_context
+# Wrap FastAPI lifespan to include MCP streamable HTTP session manager init
+_orig_lifespan=app.router.lifespan_context
 
-    @_acm
-    async def _combined_lifespan(a):
-        async with mcp_http_app.router.lifespan_context(mcp_http_app):
-            log.info("MCP streamable HTTP lifespan started")
-            await reconcile_configured_session()
-            asyncio.create_task(session_keepalive_loop())
-            asyncio.create_task(auto_discover_loop())
-            asyncio.create_task(_rate_limit_poll_loop())
-            # Fetch rate limits on startup (delayed 3s, non-blocking)
-            async def _rl_startup():
-                await asyncio.sleep(3)
-                await asyncio.get_event_loop().run_in_executor(None, _fetch_rate_limit_sync)
-            asyncio.create_task(_rl_startup())
-            log.info(f"pplx-proxy started on port {PORT}")
+@_acm
+async def _combined_lifespan(a):
+    async with mcp_http_app.router.lifespan_context(mcp_http_app):
+        log.info("MCP streamable HTTP lifespan started")
+        async with _orig_lifespan(a):
             yield
-        log.info("MCP streamable HTTP lifespan stopped")
+    log.info("MCP streamable HTTP lifespan stopped")
 
-    app.router.lifespan_context=_combined_lifespan
-    # MCP Auth: API key in URL path
-    # With key: /{API_KEY}/mcp and /{API_KEY}/sse
-    # Without:  /mcp/mcp and /sse/sse (backward compat)
-    if API_KEY:
-        _mcp_prefix=f"/{API_KEY}"
-        _mcp_pfx_len=len(_mcp_prefix)
+app.router.lifespan_context=_combined_lifespan
+# MCP Auth: API key in URL path
+# With key: /{API_KEY}/mcp and /{API_KEY}/sse
+# Without:  /mcp/mcp and /sse/sse (backward compat)
+if API_KEY:
+    _mcp_prefix=f"/{API_KEY}"
+    _mcp_pfx_len=len(_mcp_prefix)
 
-        class _MCPAuthMiddleware:
-            """Intercepts /{KEY}/mcp|sse, validates key, calls MCP apps directly."""
-            def __init__(self, asgi_app):
-                self.app=asgi_app
-            async def __call__(self, scope, receive, send):
-                if scope["type"] in ("http", "websocket"):
-                    path=scope.get("path", "")
-                    # Authenticated MCP paths — route directly to MCP apps
-                    if path.startswith(_mcp_prefix + "/mcp"):
-                        s=dict(scope)
-                        s["path"]=path[_mcp_pfx_len:]
-                        if s.get("raw_path"):
-                            s["raw_path"]=s["raw_path"][_mcp_pfx_len:] if isinstance(s["raw_path"], bytes) else s["raw_path"]
-                        await mcp_http_app(s, receive, send)
-                        return
-                    if path.startswith(_mcp_prefix + "/sse") or path.startswith(_mcp_prefix + "/messages"):
-                        s=dict(scope)
-                        s["path"]=path[_mcp_pfx_len:]
-                        if s.get("raw_path"):
-                            s["raw_path"]=s["raw_path"][_mcp_pfx_len:] if isinstance(s["raw_path"], bytes) else s["raw_path"]
-                        await mcp_sse_app(s, receive, send)
-                        return
-                    # Allow /messages for SSE transport (session_id is the auth)
-                    if path.startswith("/messages"):
-                        s=dict(scope)
-                        await mcp_sse_app(s, receive, send)
-                        return
-                    # Block bare /mcp and /sse without key
-                    if path.startswith("/mcp") or path.startswith("/sse"):
-                        from starlette.responses import JSONResponse as _JR
-                        await _JR({"error": {"message": "MCP requires authentication. Use /<api-key>/mcp or /<api-key>/sse", "type": "auth_error"}}, status_code=401)(scope, receive, send)
-                        return
-                await self.app(scope, receive, send)
+    class _MCPAuthMiddleware:
+        """Intercepts /{KEY}/mcp|sse, validates key, calls MCP apps directly."""
+        def __init__(self, asgi_app):
+            self.app=asgi_app
+        async def __call__(self, scope, receive, send):
+            if scope["type"] in ("http", "websocket"):
+                path=scope.get("path", "")
+                # Authenticated MCP paths — route directly to MCP apps
+                if path.startswith(_mcp_prefix + "/mcp"):
+                    s=dict(scope)
+                    s["path"]=path[_mcp_pfx_len:]
+                    if s.get("raw_path"):
+                        s["raw_path"]=s["raw_path"][_mcp_pfx_len:] if isinstance(s["raw_path"], bytes) else s["raw_path"]
+                    await mcp_http_app(s, receive, send)
+                    return
+                if path.startswith(_mcp_prefix + "/sse") or path.startswith(_mcp_prefix + "/messages"):
+                    s=dict(scope)
+                    s["path"]=path[_mcp_pfx_len:]
+                    if s.get("raw_path"):
+                        s["raw_path"]=s["raw_path"][_mcp_pfx_len:] if isinstance(s["raw_path"], bytes) else s["raw_path"]
+                    await mcp_sse_app(s, receive, send)
+                    return
+                # Allow /messages for SSE transport (session_id is the auth)
+                if path.startswith("/messages"):
+                    s=dict(scope)
+                    await mcp_sse_app(s, receive, send)
+                    return
+                # Block bare /mcp and /sse without key
+                if path.startswith("/mcp") or path.startswith("/sse"):
+                    from starlette.responses import JSONResponse as _JR
+                    await _JR({"error": {"message": "MCP requires authentication. Use /<api-key>/mcp or /<api-key>/sse", "type": "auth_error"}}, status_code=401)(scope, receive, send)
+                    return
+            await self.app(scope, receive, send)
 
-        app.add_middleware(_MCPAuthMiddleware)
-        log.info(f"MCP mounted with key auth: /{API_KEY[:8]}***/mcp + /{API_KEY[:8]}***/sse")
-    else:
-        app.mount("/mcp", mcp_http_app)
-        app.mount("/sse", mcp_sse_app)
-        log.info("MCP mounted at /mcp/mcp + /sse/sse [NO AUTH]")
-        log.warning("MCP has NO authentication! Set PPLX_PROXY_API_KEY to secure it.")
+    app.add_middleware(_MCPAuthMiddleware)
+    log.info("MCP mounted with key authentication")
+else:
+    app.mount("/mcp", mcp_http_app)
+    app.mount("/sse", mcp_sse_app)
+    log.info("MCP mounted at /mcp/mcp + /sse/sse [NO AUTH]")
+    log.warning("MCP has NO authentication! Set PPLX_PROXY_API_KEY to secure it.")
 
 
 # ─── Model Management ──────────────────────────────────────────────────
@@ -2483,10 +2656,7 @@ async def update_models_endpoint(request: Request, _=Depends(verify_api_key)):
     Format: {"models": {"model-id": ["mode", "internal_pref"], ...}, "merge": true/false}
     merge=true (default): add/update entries. merge=false: replace entire map.
     """
-    try:
-        body=await request.json()
-    except Exception:
-        raise HTTPException(400, "Invalid or empty JSON body")
+    body=await _read_json_object(request)
     new_models=body.get("models", {})
     if not isinstance(new_models, dict):
         raise HTTPException(400, "models must be a dict: {model_id: [mode, internal_pref]}")
@@ -2497,13 +2667,17 @@ async def update_models_endpoint(request: Request, _=Depends(verify_api_key)):
             raise HTTPException(400, f"Model '{k}' values must be strings, got: {v}")
     merge=body.get("merge", True)
 
+    if not isinstance(merge, bool):
+        raise OpenAIAPIError(400, "merge must be a boolean", param="merge")
+    if any(not k.strip() or not all(x.strip() for x in v) or v[0] not in ("auto", "pro", "reasoning", "deep research") for k, v in new_models.items()):
+        raise OpenAIAPIError(400, "Model entries require non-empty names/preferences and a supported mode", param="models")
     global MODEL_MAP
-    if merge:
-        MODEL_MAP.update({k: tuple(v) for k, v in new_models.items()})
-    else:
-        MODEL_MAP={k: tuple(v) for k, v in new_models.items()}
-
-    save_model_map(MODEL_MAP)
+    updated=dict(MODEL_MAP) if merge else {}
+    updated.update({k: tuple(v) for k, v in new_models.items()})
+    if not updated:
+        raise OpenAIAPIError(400, "Model map cannot be empty", param="models")
+    save_model_map(updated)
+    MODEL_MAP=updated
     return {"status": "ok", "model_count": len(MODEL_MAP), "models": list(MODEL_MAP.keys())}
 
 
@@ -2543,13 +2717,12 @@ async def notify_cookie_expired(reason: str):
     now=time.time()
     if now - _last_ntfy_ts < NTFY_COOLDOWN_SECS:
         return
-    _last_ntfy_ts=now
     if not NTFY_TOPIC:
         return
     try:
         import httpx
         async with httpx.AsyncClient() as hc:
-            await hc.post(
+            response=await hc.post(
                 f"{NTFY_URL}/{NTFY_TOPIC}",
                 headers={
                     "Title": "pplx-proxy: Cookie Expired",
@@ -2559,6 +2732,8 @@ async def notify_cookie_expired(reason: str):
                 },
                 content=f"Perplexity session cookie 失效，需要手動更新。\n\n原因: {reason}\n\ncurl -X POST {PUBLIC_URL}/admin/refresh-cookie -H \"Authorization: Bearer YOUR_KEY\" -H \"Content-Type: application/json\" -d '{{\"session_token\": \"NEW_TOKEN\"}}\'",
             )
+            response.raise_for_status()
+        _last_ntfy_ts=now
         log.warning(f"ntfy notification sent: {reason}")
     except Exception as e:
         log.error(f"ntfy send failed: {e}")
@@ -2600,19 +2775,17 @@ async def session_keepalive_loop():
 async def refresh_cookie_endpoint(request: Request, _=Depends(verify_api_key)):
     """Inject new cookie. Accepts JSON {"session_token": "..."} or plain text body."""
     ct=request.headers.get("content-type", "")
-    token=""
     if "json" in ct:
+        body=await _read_json_object(request)
+        token=body.get("session_token")
+    else:
         try:
-            body=await request.json()
-            token=body.get("session_token", "")
-        except Exception:
-            pass
-    if not token:
-        # Try reading body as plain text
-        raw=await request.body()
-        token=raw.decode("utf-8", errors="ignore").strip()
-    if not token:
-        return {"status": "error", "message": "Send session token as plain text body or JSON {\"session_token\": \"...\"}"}
+            token=(await request.body()).decode("utf-8").strip()
+        except UnicodeDecodeError as exc:
+            raise OpenAIAPIError(400, "Session token must be UTF-8 text") from exc
+    if not isinstance(token, str) or not token.strip():
+        raise OpenAIAPIError(400, "Provide a non-empty session_token string", param="session_token")
+    token=token.strip()
     cookies={"__Secure-next-auth.session-token": token}
     validated_cookies=await _validate_session_cookies(cookies)
     if not validated_cookies:
@@ -2626,19 +2799,15 @@ async def refresh_cookie_endpoint(request: Request, _=Depends(verify_api_key)):
             detail="Unable to validate the submitted Perplexity session token",
         )
     save_cookies(validated_cookies, last_keepalive=time.time())
-    global _client, _rate_limit_refresh_task, _model_preflight_cache
+    global _client, _rate_limit_refresh_task
     if _client:
-        _client.reset(validated_cookies)
+        await _client.reset(validated_cookies)
     else:
         _client=PerplexityClient(validated_cookies)
     if _rate_limit_refresh_task and not _rate_limit_refresh_task.done():
         _rate_limit_refresh_task.cancel()
     _rate_limit_refresh_task=None
-    _rate_limit["remaining_pro"]=None
-    _rate_limit["remaining_research"]=None
-    _rate_limit["updated_at"]=0
-    _rate_limit["last_error"]=None
-    _model_preflight_cache.clear()
+    _reset_rate_limit()
     # Reload model map from file if it exists
     global MODEL_MAP
     MODEL_MAP=load_model_map()
@@ -2683,7 +2852,39 @@ async def auto_discover_loop():
             log.error(f"Auto-discovery error: {e}")
 
 
-# startup tasks moved into _combined_lifespan above
+_transport_lifespan=app.router.lifespan_context
+
+@asynccontextmanager
+async def _service_lifespan(a):
+    """Own service tasks and resources regardless of MCP availability."""
+    global _rate_limit_refresh_task
+    async with _transport_lifespan(a):
+        await reconcile_configured_session()
+        _responses_load()
+
+        async def startup_quota():
+            await asyncio.sleep(3)
+            await _refresh_rate_limit(block=True)
+
+        tasks=[asyncio.create_task(job()) for job in (
+            session_keepalive_loop, auto_discover_loop, _rate_limit_poll_loop, startup_quota,
+        )]
+        log.info("pplx-proxy started on port %s", PORT)
+        try:
+            yield
+        finally:
+            tasks.extend(list(_responses_tasks.values()))
+            if _rate_limit_refresh_task is not None:
+                tasks.append(_rate_limit_refresh_task)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            _rate_limit_refresh_task=None
+            if _client is not None:
+                await _client.close()
+
+app.router.lifespan_context=_service_lifespan
+
 
 
 # ─── Entrypoint ────────────────────────────────────────────────────────────

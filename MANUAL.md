@@ -154,7 +154,7 @@ The Compose stack starts:
 
 - `pplx-proxy` on `http://localhost:8892`
 - `flaresolverr` inside the Compose network at `http://flaresolverr:8191`
-- `pplx-data` volume for `.cookie_cache.json` and `.models.json`
+- `pplx-data` volume for `.cookie_cache.json`, `.models.json`, and `.responses_store.json`
 
 **Quick smoke test:**
 
@@ -204,7 +204,7 @@ curl -X POST http://localhost:8892/v1/chat/completions \
 | `opus-4.7` | Claude Opus 4.7 | max | Previous Opus version |
 | `opus-4.6` | Claude Opus 4.6 | max | Previous Opus flagship |
 
-Tracked candidates such as Claude Haiku 4.5, Gemini 3.1 Flash Lite, and Grok 4.20 Multi-Agent are not exposed by default until a working Perplexity web preference is verified by discovery.
+Tracked candidates such as Claude Haiku 4.5, Gemini 3.1 Flash Lite, and Grok 4.20 Multi-Agent remain disabled and are skipped by discovery. Custom model IDs added through `/admin/update-models` are available on Pro and Max accounts; Free accounts only expose `auto`.
 
 ### Endpoint Summary
 
@@ -266,13 +266,12 @@ The main endpoint follows the [OpenAI Chat Completions spec](https://platform.op
 | Field | Type | Description |
 |-------|------|-------------|
 | `model` | string | One of the model IDs above |
-| `messages` | array | Conversation history (system, user, assistant, tool roles) |
+| `messages` | array | Conversation history (system, developer, user, assistant roles) |
 | `stream` | boolean | Enable SSE streaming (default: false) |
-| `tools` | array | OpenAI-format tool definitions |
-| `tool_choice` | string | `auto`, `none`, or `required` |
+| `tools` | array | Function tools are unsupported and rejected |
+| `tool_choice` | string | `auto` or `none`; function calling is unsupported |
 | `thinking` | boolean | Enable reasoning output |
 | `reasoning_effort` | string | `none`, `low`, `medium`, `high` |
-| `temperature` | number | 0.0-1.0 (passed to Perplexity) |
 
 ### Response (non-streaming)
 
@@ -347,7 +346,7 @@ Key guarantees:
 - The `id` is consistent across all chunks.
 - The first chunk contains `delta.role`.
 - The final chunk has an empty `delta` and `finish_reason: "stop"`.
-- The stream always terminates with `[DONE]`.
+- Successful streams terminate with `[DONE]`. Failed streams report an explicit error and do not send a successful completion marker.
 
 ---
 
@@ -415,7 +414,7 @@ pplx-proxy tracks your Perplexity Pro Search quota (`remaining_pro`) and provide
 ```
 This notice is automatically stripped from message history in subsequent API calls so it doesn't pollute Perplexity search results.
 
-**Auto-fallback:** When `remaining_pro` reaches 0, all non-auto model requests automatically fall back to `auto` (pplx_pro, free tier). The `auto` model itself is never downgraded.
+**Quota exhaustion:** When `remaining_pro` reaches 0, non-auto model requests return HTTP 429. Select `auto` (pplx_pro, free tier) explicitly to continue with the free model.
 
 **Requirements:** FlareSolverr must be running at `FLARESOLVERR_URL` (default `http://localhost:8191`) for rate limit syncing. It is optional for chat, streaming, MCP, and Responses API. Without it, `/health` shows `flaresolverr.status: "unavailable"` and quota fields stay `null`.
 
@@ -433,9 +432,11 @@ Supported:
 
 Multi-turn: pass `previous_response_id` from the previous response. Previous `instructions` are not reused; send new ones if needed. `conversation` can also continue the last stored turn for that conversation id.
 
-Stored responses live in `.responses_store.json` (max 300, 7-day TTL). `store: false` keeps them in memory only.
+Stored responses live in `.responses_store.json` (max 300, 7-day TTL). `store: false` does not retain the response, so retrieval and continuation by that response ID are unavailable.
 
-When streaming is enabled, the endpoint emits these SSE events in order:
+Background requests require `store: true`; only active background responses can be cancelled. `tool_choice` accepts only `auto`. Custom `temperature`/`top_p` values other than 1, `max_output_tokens`, `truncation: "auto"`, and strict JSON schemas are rejected. JSON-object mode and non-strict schemas use prompt instructions only; output conformance is not guaranteed. Store read/write failures are reported instead of treating failed persistence as success.
+
+When streaming succeeds, the endpoint emits these SSE events in order:
 
 1. `response.created` — response object with status `in_progress`
 2. `response.in_progress` — same object, still running
@@ -452,9 +453,9 @@ When streaming is enabled, the endpoint emits these SSE events in order:
 13. `response.content_part.done` / `response.output_item.done` — message complete
 14. `response.completed` — final response with output and usage
 
-The `developer` role is accepted and mapped to `system` internally. Web search tools (`web_search_preview`) are silently ignored since `search_focus: "internet"` is always active.
+The `developer` role is accepted and mapped to `system` internally. Built-in web search tools (`web_search` and `web_search_preview`) are accepted since `search_focus: "internet"` is always active.
 
-Not supported as real OpenAI tools: function calling, file search, code interpreter, computer use, image generation, and encrypted reasoning items. Those fields are accepted and echoed, but Perplexity cannot execute them.
+Not supported as real OpenAI tools: function calling, file search, code interpreter, computer use, image generation, and encrypted reasoning items. Requests using these features or image/file inputs receive an explicit error instead of silently ignoring unsupported content.
 
 ---
 
@@ -511,7 +512,7 @@ Visit `/chat` in your browser for an interactive test interface.
 
 - **Model selection** — dropdown for all available models
 - **Stream toggle** — switch between streaming and non-streaming
-- **Tools toggle** — enable/disable a set of demo tools (get_weather, calculator, search_web, get_user, send_email)
+- **Test unsupported tools toggle** — attach demo function tools to verify that unsupported requests return a visible error
 - **Thinking toggle** — enable reasoning output
 - **Raw tab** — shows the full request JSON and raw response data
 - **Format tab** — runs 20+ OpenAI spec compliance checks with pass/fail badges
@@ -604,20 +605,11 @@ The proxy tracks Perplexity's `backend_uuid` (returned in every SSE response) an
 
 Session cache entries expire after **1 hour** (`_SESSION_MAX_AGE`), capped at **200 entries** (`_SESSION_MAX_ENTRIES`). This dramatically reduces payload size for multi-turn conversations and avoids re-sending `CUSTOM_PROMPTS` and history on every turn.
 
-### Assistant Messages with Tool Calls
-
-
-```
-Assistant: [Called tools: get_user({"user_id": 42})]
-```
-
-This gives the model clear context about what tools were invoked.
-
 ### Input Limits and Dedup
 
 To prevent Perplexity's input from growing too large:
 
-- Total serialized query capped at **96K characters** (~32K tokens).
+- Total serialized query is limited to **96K characters** (~32K tokens); larger queries are rejected without truncation.
 - Consecutive same-role messages are deduplicated (keeps the last one) — this handles LibreChat-style branching artifacts.
 - Rate-limit notices are stripped from prior assistant messages before they enter `history`.
 - Empty assistant messages become `[done]` before reaching Perplexity.
@@ -691,7 +683,7 @@ Set `PPLX_COOKIE` in `.env`.
 Cookie expired. Extract a fresh one and use `POST /admin/refresh-cookie` or update `.env` + restart.
 
 ### Tool calls not firing
-Tool calling relies on keyword matching. Make your request explicit: "Use the calculator to compute 2+2" works better than just "2+2".
+Function calling is unsupported and returns an explicit error. Use built-in web search or a provider with native function calling.
 
 ### Model says "I can't access real-time data"
 
@@ -708,7 +700,7 @@ This is the most critical issue in pplx-proxy. There are three independent cause
 **How to diagnose:** Check server logs for `PROMPT DEBUG` and `PPLX REQUEST QUERY`. Generic clients should show whitelist-filtered `instructions`. LobeHub should show `instructions=[CUSTOM_PROMPTS]` on every turn, plus `history` and `query` as applicable.
 
 ### Model says "I don't have access to tools"
-Perplexity's model sometimes prefers its built-in web search over provided tools. This is expected behavior.
+Function tools are not supported. Remove function-tool definitions and use Perplexity's built-in web search, or select a different provider that supports function calls.
 
 ### Streaming hangs
 Ensure your client handles SSE properly. Use `stream=True` in Python requests and iterate over lines.
@@ -723,8 +715,7 @@ Hard-refresh the `/chat` page (Ctrl+Shift+R). The page has no-cache headers but 
 
 ## 19. Known Limitations
 
-- **Tool calling is best-effort** (~95% for relevant queries) via prompt injection, not native API.
-- **No tool execution in debug UI** — `/chat` tools are for format testing only.
+- **No function calling** — function-tool requests are rejected; the debug UI can exercise this error path.
 - **Citation stripping** removes `[N]` patterns, which may affect content like `array[0]`.
 - **Context window**: 96K char total query limit (~32K tokens).
 - **Perplexity API changes** may break the proxy without notice. Auto-discovery catches model changes.
@@ -735,3 +726,13 @@ Hard-refresh the `/chat` page (Ctrl+Shift+R). The page has no-cache headers but 
 ## License
 
 MIT
+
+### Explicit failure behavior and support checks
+
+The assembled query limit is 96,000 characters. Oversized input is rejected rather than silently truncated. `/health` returns cached quota immediately and schedules a refresh when stale; it does not wait for FlareSolverr to complete.
+
+`./test.sh [base-url]` verifies complete non-streaming chat, streaming chat, and Responses output, in addition to health and models. It exits nonzero on HTTP errors, invalid output, or incomplete streams. `node --test test_chat.js` runs the debug-page protocol checks.
+
+`./inject_cookie.sh` reads the new token using a hidden prompt (or standard input when piped). It reads `.env` beside the script and updates the running local service through `/admin/refresh-cookie`, which validates the token before persisting it. No service restart is needed. The service must already be running; use `.env` for initial setup. Avoid passing the token as a command argument, where shell history or process listings could expose it.
+
+Chat Completions rejects unsupported generation controls with HTTP 400, including custom sampling, output-token limits, structured response formats, multiple choices, stop sequences, nondefault penalties, seeds, logprobs, and streaming usage requests. These options are not silently ignored.

@@ -6,7 +6,7 @@
 
 ## Architecture
 
-Single FastAPI app (`server.py`, ~1750 lines) that:
+Single FastAPI app (`server.py`) that:
 
 1. Receives OpenAI-format chat/completions or MCP requests
 2. Translates to Perplexity's internal SSE (`POST /rest/sse/perplexity_ask`)
@@ -29,9 +29,9 @@ Single FastAPI app (`server.py`, ~1750 lines) that:
 **Thinking Variants**: activated via `thinking: true` or `reasoning_effort != "none"`. Maps from `_THINKING_MAP` (e.g., `gpt → gpt56_terra_thinking`, `sonnet → claude50sonnetthinking`). Perplexity does NOT expose internal thinking blocks — `reasoning_content` is populated from search steps (queries, URLs, plan goals).
 
 
-**Context Management**: request payloads are assembled as JSON with `instructions` / `history` / `query`. Total query capped at 96K chars (~32K tokens). Consecutive same-role messages deduped (keeps last — fixes LibreChat branch artifacts). Generic clients still use whitelist-filtered system prompts from `.prompt_whitelist.txt`, but LobeHub requests now discard upstream system/developer prompt content entirely and prepend local `CUSTOM_PROMPTS` on every turn.
+**Context Management**: request payloads are assembled as JSON with `instructions` / `history` / `query`. Queries exceeding 96K characters are rejected before contacting Perplexity. Consecutive assistant messages deduped (keeps last — fixes LibreChat branch artifacts). Generic clients still use whitelist-filtered system prompts from `.prompt_whitelist.txt`, but LobeHub requests now discard upstream system/developer prompt content entirely and prepend local `CUSTOM_PROMPTS` on every turn.
 
-**Session Continuity**: the proxy tracks Perplexity's `backend_uuid` per conversation turn. On follow-up turns (detected by hashing conversation history), only the raw user query is sent with `last_backend_uuid` — no instructions, no history. Perplexity's server-side session memory handles context. Sessions expire after 1 hour. Falls back to full payload on cache miss.
+**Session Continuity**: the proxy tracks Perplexity's `backend_uuid` per conversation turn. On generic follow-up turns without explicit instructions (detected by hashing conversation history), only the raw user query is sent with `last_backend_uuid`. LobeHub and requests with instructions always rebuild the complete payload. Perplexity's server-side session memory handles context. Sessions expire after 1 hour. Falls back to full payload on cache miss.
 
 **Response Cleaning** (`_clean_response`): strips `[1]` `[2]` citations, `<grok:*>` tags, `<?xml?>` declarations, `<response>` wrappers, `<script>` tags.
 
@@ -64,7 +64,7 @@ CUSTOM_PROMPTS       # Local prompt block prepended to every LobeHub request
 - Manual Python runs only pplx-proxy with `uvicorn server:app --host 0.0.0.0 --port 8892`.
 - Docker Compose is the complete self-hosted stack: pplx-proxy, FlareSolverr, and the `pplx-data` runtime volume.
 - In Compose, `DATA_DIR=/data` and `FLARESOLVERR_URL=http://flaresolverr:8191`.
-- FlareSolverr is optional for chat, but required for `/health` quota fields and quota fallback.
+- FlareSolverr is optional for chat, but required for `/health` quota fields and quota exhaustion checks.
 
 ## Endpoints
 
@@ -73,7 +73,7 @@ CUSTOM_PROMPTS       # Local prompt block prepended to every LobeHub request
 
 **Auth required** (Bearer token):
 - `GET /v1/models` — tier-filtered model list (OpenAI-compatible format)
-- `POST /v1/chat/completions` — chat (streaming + non-streaming, thinking). `tools` parameter silently ignored.
+- `POST /v1/chat/completions` — chat (streaming + non-streaming, thinking). Unsupported function tools and generation controls are rejected with HTTP 400.
 - `POST /v1/responses` — OpenAI Responses API compatibility (direct Perplexity call, used by LobeHub web search and official SDKs)
 - `GET /v1/responses/{id}` — retrieve stored response
 - `DELETE /v1/responses/{id}` — delete stored response
@@ -96,7 +96,7 @@ All responses strictly follow the OpenAI Chat Completions spec:
 
 **Non-streaming**: `id` (chatcmpl-*), `object` (chat.completion), `created`, `model`, `system_fingerprint` (null), `choices[].index`, `choices[].logprobs` (null), `choices[].finish_reason`, `choices[].message.role`, `choices[].message.content`, `usage.prompt_tokens`, `usage.completion_tokens`, `usage.total_tokens` (always = prompt + completion)
 
-**Streaming**: `object` (chat.completion.chunk), consistent `id` across all chunks, `system_fingerprint` in every chunk, `logprobs` in every choice, first chunk has `delta.role=assistant`, last chunk has `finish_reason` + empty `delta`, ends with `data: [DONE]`
+**Streaming**: `object` (chat.completion.chunk), consistent `id` across all chunks, `system_fingerprint` in every chunk, `logprobs` in every choice, first chunk has `delta.role=assistant`, successful last chunk has `finish_reason` + empty `delta`, ends with `data: [DONE]`. Failed streams emit an error and never a successful finish
 
 **Debug page**: `GET /chat` has a "Format ✓" tab that validates every response against the OpenAI spec in real-time with PASS/FAIL badges per field.
 
@@ -183,8 +183,8 @@ If Perplexity answers with a different model than requested, the answer is still
 
 Both notices are stripped from message history via `_strip_appended_notices` before sending to Perplexity. Tiny auxiliary tails from `gpt5_nano` after the selected model already wrote the answer are not treated as substitution.
 
-### Quota Fallback
-When `remaining_pro <= 0`: all non-auto models auto-downgrade to `auto` (pplx_pro).
+### Quota Exhaustion
+When `remaining_pro <= 0`, non-auto requests fail with HTTP 429; callers may explicitly select `auto`.
 Applied in both `/v1/chat/completions` and `/v1/responses` handlers.
 
 ### FlareSolverr Dependency
@@ -336,14 +336,14 @@ Client Response
 2. Input array parsed: each item's `role` and `content` extracted
 3. `developer` → `system`, system-prompt-like user messages → `system`
 4. Request source detected as `lobehub`
-5. `web_search_preview` tool silently ignored (we always have `search_focus: "internet"`)
+5. `web_search_preview` maps to the built-in search behavior (`search_focus: "internet"`); unsupported tools are rejected
 6. Upstream prompt blocks discarded; local `CUSTOM_PROMPTS` becomes `instructions`
 7. Query built directly as JSON (no httpx self-call), sent to Perplexity client
 8. Response streamed as Responses API SSE events
 
 **Key special handling:**
 - Responses API format translation (input→messages, output→response object)
-- `web_search_preview` tool silently dropped
+- Built-in web search compatibility; unsupported tools are rejected
 - LobeHub source detection + local prompt replacement
 - Reasoning summary events for thinking block display
 - Calls Perplexity client directly (not through internal HTTP)
@@ -429,218 +429,13 @@ Perplexity returns SSE events containing `blocks[]` with these types:
 | `finance_widget` | Structured stock data (JSON) | Currently ignored (model writes price in text) |
 | `sources_answer_mode` | Citation sources | Currently ignored |
 
-# currentDate
-Today's date is 2026-04-05.
 
-      IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.
+## Review and Validation (2026-09-09)
 
-### How to Verify
-
-If models start saying "I can't access real-time data" again:
-
-0. Check cookie name is `__Secure-next-auth.session-token` (NOT `next-auth.session-token`). Wrong name = free-tier turbo for ALL models.
-1. Check `search_focus: "internet"` is in the request params (line ~194 in `search()` method)
-2. Check server logs for the query text — if it contains system prompt content (role-play, tool refs, AI agent descriptions), the filter is broken
-3. Check if system prompt content is arriving as `role: user` and bypassing the filter
-
-## Request Processing Pipeline — How Content Flows Through the Proxy
-
-### Overview
-
-All requests arrive at one of two endpoints, get processed through a shared pipeline, and are sent to Perplexity's internal SSE API. The key challenge: Perplexity does NOT accept OpenAI-format message arrays — it takes a single `query_str` text blob. The proxy must flatten conversations into text while filtering content that pollutes search results.
-
-```
-Client Request
-  ↓
-Endpoint Router (/v1/chat/completions OR /v1/responses)
-  ↓
-Message Extraction & Role Normalization
-  ↓
-System Prompt Detection & Reclassification
-  ↓
-System Prompt Filter (strip everything except language preference)
-  ↓
-History Processing (truncation, dedup, topic separation)
-  ↓
-Query Assembly (system instruction + history + current request)
-  ↓
-  ↓
-Perplexity SSE Request (search_focus=internet, model_preference, etc.)
-  ↓
-Response Parsing (blocks: markdown, web_results, thinking, finance_widget)
-  ↓
-Response Cleaning (strip citations [1][2], XML wrappers, script tags)
-  ↓
-Format Conversion (OpenAI chat.completion OR Responses API format)
-  ↓
-Client Response
-```
-
----
-
-### Scenario 1: curl / Generic OpenAI Client → `/v1/chat/completions`
-
-**Input format:**
-```json
-{"model":"sonnet", "messages":[
-  {"role":"system", "content":"Reply in Chinese"},
-  {"role":"user", "content":"NVDA stock price"}
-], "stream":false}
-```
-
-**Processing:**
-1. Auth: Bearer token checked against `PPLX_PROXY_API_KEY`
-2. Messages parsed: `system` → `system_msg`, `user` → `history[]`
-3. System prompt filter: only language preference kept
-4. Query assembled: `[Reply language: ...]\n[You have built-in web search...]\n\nNVDA stock price`
-5. Sent to Perplexity with `search_focus: "internet"`, `model_preference: "claude46sonnet"`
-6. Response parsed from SSE blocks, cleaned, returned as `chat.completion` JSON
-
-**Simplest path — no special handling needed.**
-
----
-
-### Scenario 2: LobeHub (Web Search OFF) → `/v1/chat/completions`
-
-**Input format (3 messages with developer role):**
-```json
-{"model":"sonnet", "stream":true, "messages":[
-  {"role":"developer", "content":"You are Lobe, an AI Agent...<available_skills>...(21KB)"},
-  {"role":"user", "content":"- You are Jarvis...- You must use ccsearch tool...(2.6KB)"},
-  {"role":"user", "content":"NVDA stock price (22B)"}
-]}
-```
-
-**Processing:**
-1. Auth: Bearer token checked
-2. Role normalization: `developer` → `system`
-3. **System prompt detection on user messages**: second message starts with `"you are "` and contains `"ccsearch"` → reclassified as `system`
-4. Now we have: `system`(21KB) + `system`(2.6KB) + `user`(22B)
-5. Multiple system messages concatenated into one `system_msg`
-6. **System prompt filter**: 23.6KB of system prompt → scanned line by line → only language preference line kept (e.g., "Always reply in Traditional Chinese") → everything else stripped
-7. Query assembled: `[Reply language: Always reply in Traditional Chinese...]\n[You have built-in web search...]\n\nNVDA stock price`
-8. **Consecutive assistant dedup** applies if regeneration branches exist
-9. Sent to Perplexity, response streamed as SSE `chat.completion.chunk` events
-
-**Key special handling:**
-- `developer` role mapping
-- System-prompt-like user message detection
-- Aggressive system prompt stripping (23.6KB → ~100 chars)
-- Consecutive assistant branch dedup
-
----
-
-### Scenario 3: LobeHub (Web Search ON) → `/v1/responses`
-
-**Input format (Responses API with web_search tool):**
-```json
-{"stream":true, "model":"sonnet", "reasoning":{"effort":"low"},
- "input":[
-   {"role":"developer", "content":"You are Lobe...(21KB)"},
-   {"role":"user", "content":"- You are Jarvis...(2.6KB)"},
-   {"role":"user", "content":"NVDA stock price"}
- ],
- "tools":[{"type":"web_search_preview_2025_03_11"}]
-}
-```
-
-**Processing:**
-1. Auth: Bearer token checked
-2. Input array parsed: each item's `role` and `content` extracted
-3. `developer` → `system`, system-prompt-like user messages → `system`
-4. `web_search_preview` tool silently ignored (we always have `search_focus: "internet"`)
-5. System prompt filter: same aggressive stripping as Scenario 2
-6. Query built directly (no httpx self-call), sent to Perplexity client
-7. Response streamed as Responses API SSE events:
-   - `response.created`
-   - `response.reasoning_summary_text.delta` (search steps: Found URLs, Searching queries)
-   - `response.reasoning_summary_text.done`
-   - `response.output_text.delta` (answer chunks)
-   - `response.output_text.done`
-   - `response.completed`
-
-**Key special handling:**
-- Responses API format translation (input→messages, output→response object)
-- `web_search_preview` tool silently dropped
-- Reasoning summary events for thinking block display
-- Calls Perplexity client directly (not through internal HTTP)
-
----
-
-### Scenario 4: LibreChat → `/v1/chat/completions`
-
-**Input format (with conversation branches):**
-```json
-{"model":"sonnet", "stream":true, "messages":[
-  {"role":"system", "content":"- You are Jarvis...- You must use ccsearch..."},
-  {"role":"user", "content":"TSMC stock price"},
-  {"role":"assistant", "content":"I can't access real-time data..."},
-  {"role":"assistant", "content":"Sorry, I don't have..."},
-  {"role":"assistant", "content":"I need to use tools..."},
-  {"role":"user", "content":"just give me the price"}
-]}
-```
-
-**Processing:**
-1. Auth checked
-2. System prompt filter: strips tool/skill refs, keeps language pref
-3. **Consecutive assistant dedup**: 3 assistant messages → keep only last one
-4. History built: `[user: "TSMC stock price", assistant: "I need to use tools...(last branch)"]`
-5. **Topic separation**: current message `"just give me the price"` prefixed with `User's current request:` to prevent topic bleeding from history
-6. Query assembled and sent to Perplexity
-7. Response streamed as `chat.completion.chunk` SSE events
-
-**Key special handling:**
-- Consecutive assistant dedup (branch artifacts)
-- Topic separation prefix
-
----
-
-### Scenario 6: MCP Client → `/{API_KEY}/mcp` or `/{API_KEY}/sse`
-
-**Processing:**
-1. Auth via API key in URL path (not Bearer header)
-2. MCP protocol: initialize → tools/list → tools/call
-3. Each tool (`perplexity_search`, `perplexity_ask`, etc.) calls `client.search()` directly
-4. No message array processing — query string goes directly to Perplexity
-5. Response returned as MCP tool result (plain text)
-
-**No system prompt filter, no history processing, no dedup — just direct search.**
-
----
-
-### The Perplexity SSE Request (shared by all scenarios)
-
-Regardless of which endpoint or client, all queries are sent via:
-
-```
-POST https://www.perplexity.ai/rest/sse/perplexity_ask
-
-{
-  "query_str": "<flattened query text>",
-  "params": {
-    "search_focus": "internet",          ← CRITICAL: enables search results in answer
-    "mode": "copilot",                   ← "concise" for auto model only
-    "model_preference": "claude46sonnet", ← internal Perplexity model ID
-    "sources": ["web"],
-    "use_schematized_api": true,
-    "supported_block_use_cases": ["answer_modes", "finance_widgets", ...],
-    "timezone": "Asia/Taipei",
-    "version": "2.18",
-    ... (13 other params)
-  }
-}
-```
-
-### The Perplexity SSE Response (shared parsing)
-
-Perplexity returns SSE events containing `blocks[]` with these types:
-
-| Block `intended_usage` | Contains | How We Use It |
-|---|---|---|
-| `ask_text_0_markdown` | Answer text chunks | → `content` in response |
-| `web_results` | Search result URLs + snippets | → `reasoning_content` (Found: URLs) |
-| `pro_search_steps` | Search queries executed | → `reasoning_content` (Searching: query) |
-| `plan` | Reasoning plan goals | → `reasoning_content` |
-| `finance_widget` | Structured stock data (JSON) | Currently ignored (model writes price in text) |
-| `sources_answer_mode` | Citation sources | Currently ignored |
+- `store=false` Responses are not retained. Corrupt runtime stores and write failures surface as errors.
+- Health checks return cached quota immediately and schedule stale refreshes without waiting for a browser. Check `flaresolverr.status` and `last_error` for quota-fetch failures.
+- Only text input is supported; images/files and function tools return HTTP 400. Custom sampling/output limits and strict schema enforcement are not implemented and are rejected. JSON prompting via Responses is best effort.
+- Upstream streams must terminate correctly; interrupted or malformed streams fail. Resources and background tasks close on shutdown. MCP is a required dependency; incompatible installations fail at startup.
+- Prompt bodies are logged only at DEBUG. Docker excludes cookies, response history, and browser state.
+- Verify with `venv/bin/python -m unittest discover`, `node --test test_chat.js`, `venv/bin/python -m compileall -q server.py smoke_test.py`, Docker build, and `./test.sh URL` against an isolated service connected to Perplexity.
+- Production remains managed by `pplx-proxy.service` on port 8892. Review integration checks use temporary runtime data on localhost port 18892; do not confuse them with a production rollout.

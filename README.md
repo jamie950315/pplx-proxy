@@ -3,7 +3,7 @@
 Reverse proxy for [Perplexity.ai](https://www.perplexity.ai) — use your existing **Pro/Max subscription cookie** to access all models via standard APIs.
 
 Exposes three interfaces:
-- **OpenAI-compatible REST API** (`/v1/chat/completions`) — streaming, tool calling, thinking
+- **OpenAI-compatible REST API** (`/v1/chat/completions`) — streaming, thinking
 - **MCP server** (Streamable HTTP + SSE) — 5 built-in tools
 - **Debug chat UI** (`/chat`) — test everything with real-time OpenAI format validation
 
@@ -18,12 +18,11 @@ All queries use `search_focus: "internet"` — Perplexity's built-in web search 
 ## Features
 
 - **Full OpenAI format compliance** — `system_fingerprint`, `logprobs`, proper `usage` arithmetic, all fields per spec
-- **Tool calling** — OpenAI-style function calling via prompt injection with 3-layer false-positive defense
 - **Thinking/reasoning** — `thinking: true` or `reasoning_effort` param, reasoning streamed as `reasoning_content`
 - **Account tier support** — free/pro/max — only exposes models your tier can access
 - **Auto-discovery** — background task checks model health every 24h, auto-upgrades when versions change
 - **Response cleaning** — strips Perplexity citations `[1][2]`, `<grok:*>` tags, `<?xml?>` declarations, `<script>` tags
-- **Rate limit tracking** — tracks Pro Search quota, auto-fallback to free model when exhausted, notices at every 5th decrement
+- **Rate limit tracking** — tracks Pro Search quota, explicit error when the requested paid model has no remaining quota, notices at every 5th decrement
 - **Substitution notice** — if Perplexity swaps the requested model, the answer still returns with `[Substituted by Perplexity with ...]` at the end
 - **Session continuity** — tracks Perplexity `backend_uuid` so follow-up turns skip history/instructions entirely, sending only the new query
 - **Session keep-alive** — validates at startup and every 6 hours, then persists any rotated cookie returned by Perplexity
@@ -72,9 +71,9 @@ docker compose up -d --build
 This starts:
 - `pplx-proxy` on `http://localhost:8892`
 - `flaresolverr` inside the Compose network at `http://flaresolverr:8191`
-- `pplx-data` volume for `.cookie_cache.json` and `.models.json`
+- `pplx-data` volume for `.cookie_cache.json`, `.models.json`, and `.responses_store.json`
 
-FlareSolverr is optional for chat, streaming, MCP, and Responses API. Without it, `/health` still reports service and cookie age, but `remaining_pro` and `remaining_research` stay `null` and quota-based auto-fallback cannot run.
+FlareSolverr is optional for chat, streaming, MCP, and Responses API. Without it, `/health` still reports service and cookie age, but `remaining_pro` and `remaining_research` stay `null` and quota exhaustion cannot be checked locally.
 
 ## Getting Your Cookie
 
@@ -114,7 +113,7 @@ FlareSolverr is optional for chat, streaming, MCP, and Responses API. Without it
 
 Thinking variants are activated via `thinking: true` or `reasoning_effort` parameter — no separate model names needed.
 
-Tracked candidates such as Claude Haiku 4.5, Gemini 3.1 Flash Lite, and Grok 4.20 Multi-Agent are not exposed by default until a working Perplexity web preference is verified by discovery.
+Tracked candidates such as Claude Haiku 4.5, Gemini 3.1 Flash Lite, and Grok 4.20 Multi-Agent remain disabled and are skipped by discovery. Custom model IDs added through `/admin/update-models` are available on Pro and Max accounts; Free accounts only expose `auto`.
 
 ## API Endpoints
 
@@ -123,7 +122,7 @@ Tracked candidates such as Claude Haiku 4.5, Gemini 3.1 Flash Lite, and Grok 4.2
 | `GET` | `/health` | No | Health check |
 | `GET` | `/chat` | No | **Debug chat UI with OpenAI format validator** |
 | `GET` | `/v1/models` | Yes | List tier-available models |
-| `POST` | `/v1/chat/completions` | Yes | Chat (streaming + non-streaming + tools + thinking) |
+| `POST` | `/v1/chat/completions` | Yes | Chat (streaming + non-streaming + thinking) |
 | `POST` | `/v1/responses` | Yes | OpenAI Responses API (stream, store, previous_response_id) |
 | `GET` | `/v1/responses/{id}` | Yes | Retrieve a stored response |
 | `DELETE` | `/v1/responses/{id}` | Yes | Delete a stored response |
@@ -140,9 +139,9 @@ Tracked candidates such as Claude Haiku 4.5, Gemini 3.1 Flash Lite, and Grok 4.2
 
 ### Responses API
 
-`POST /v1/responses` accepts OpenAI Responses API requests (`input`, `instructions`, `previous_response_id`, `stream`, `store`, `reasoning`, `text.format`). Responses are stored so you can `GET` / `DELETE` them and continue a thread with `previous_response_id`.
+`POST /v1/responses` accepts OpenAI Responses API requests (`input`, `instructions`, `previous_response_id`, `stream`, `store`, `reasoning`, `text.format`). Responses are stored by default so you can `GET` / `DELETE` them and continue a thread with `previous_response_id`. With `store: false`, they are not retained or retrievable.
 
-Built-in web search is always on. Function calling, file search, code interpreter, computer use, and image generation are accepted in the request body but not executed.
+Built-in web search is always on. Function calling, file search, code interpreter, computer use, image generation, and image/file inputs are rejected with an explicit error. Responses web-search tools are accepted because built-in search is always enabled. Background requests require `store: true`; only active background requests can be cancelled. Custom sampling values, output-token limits, automatic truncation, and strict JSON schemas are rejected. JSON-object and non-strict schema modes are prompt-based requests, not guaranteed structured output.
 
 ### OpenAI API
 
@@ -160,22 +159,13 @@ curl -X POST http://localhost:8892/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "gpt", "messages": [{"role": "user", "content": "Analyze X"}], "thinking": true}'
 
-# With tool calling
-curl -X POST http://localhost:8892/v1/chat/completions \
-  -H "Authorization: Bearer YOUR_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "sonnet",
-    "messages": [{"role": "user", "content": "Weather in Tokyo"}],
-    "tools": [{"type": "function", "function": {"name": "get_weather", "description": "Get weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
-  }'
 ```
 
 ### Debug Chat UI
 
 Open **http://localhost:8892/chat** (or `https://your-domain/chat`) in a browser:
 
-- Toggle **Tools ON/OFF** to test tool calling
+- Toggle **Test unsupported tools** to verify that function-tool requests produce a visible error
 - Toggle **thinking** to test reasoning mode
 - Toggle **stream** for streaming vs non-streaming
 - **Raw tab**: shows full request/response JSON
@@ -213,8 +203,7 @@ All responses strictly match the [OpenAI Chat Completions API spec](https://plat
 - `id` (chatcmpl-*), `object`, `created`, `model`, `system_fingerprint` (null)
 - `choices[].index`, `choices[].logprobs` (null), `choices[].finish_reason`
 - `usage.total_tokens` = `prompt_tokens` + `completion_tokens`
-- Streaming: consistent `id`, `system_fingerprint` in every chunk, proper `[DONE]` termination
-- Tool calls: `id` (call_*), `type` (function), `function.name`, `function.arguments` (valid JSON string)
+- Successful streaming: consistent `id`, `system_fingerprint` in every chunk, proper `[DONE]` termination
 
 **Use `/chat` to visually verify** — the Format ✓ tab runs 20+ checks per response.
 
@@ -233,7 +222,7 @@ Manual trigger: `POST /admin/discover-models`
 | `ACCOUNT_TYPE` | `pro` | `free`, `pro`, or `max` |
 | `DEFAULT_MODEL` | `gpt` | Default when not specified |
 | `PPLX_PROXY_PORT` | `8892` | Listen port |
-| `DATA_DIR` | `.` | Runtime file directory for `.cookie_cache.json` and `.models.json` |
+| `DATA_DIR` | `.` | Runtime file directory for `.cookie_cache.json`, `.models.json`, and `.responses_store.json` |
 | `CUSTOM_PROMPTS` | file | Local prompt block prepended to every LobeHub request |
 | `KEEPALIVE_HOURS` | `6` | Session ping interval |
 | `PROBE_INTERVAL_HOURS` | `24` | Auto-discovery interval |
@@ -289,7 +278,7 @@ curl -X POST https://your-domain/admin/refresh-cookie \
 
 3. **LobeHub requests always prepend local `CUSTOM_PROMPTS`.** The proxy still detects `role: developer` and system-prompt-like user messages so it can classify the request source, but those upstream prompt blocks are never forwarded. Each LobeHub turn sends `instructions=[CUSTOM_PROMPTS]` plus preserved `history` and current `query`.
 
-4. **Rate limit tracking** uses FlareSolverr (`FLARESOLVERR_URL`, default `http://localhost:8191`) to poll Perplexity's `/rest/rate-limit/all` endpoint with the session cookie. Requires FlareSolverr for quota fields in `/health`. When `remaining_pro` reaches 0, all non-auto models fall back to `auto` (free tier).
+4. **Rate limit tracking** uses FlareSolverr (`FLARESOLVERR_URL`, default `http://localhost:8191`) to poll Perplexity's `/rest/rate-limit/all` endpoint with the session cookie. Requires FlareSolverr for quota fields in `/health`. When `remaining_pro` reaches 0, non-auto requests receive HTTP 429; select `auto` explicitly to use the free model.
 
 See AGENTS.md for the full technical breakdown and MANUAL.md troubleshooting section for diagnosis steps.
 
@@ -300,3 +289,15 @@ Unofficial reverse proxy for personal use. Relies on Perplexity's internal web A
 ## License
 
 MIT
+
+### Verification and session updates
+
+Run `./test.sh [base-url]` with the project's Python environment installed. It validates health, models, complete chat responses, streaming completion, and Responses output. HTTP errors, malformed output, and interrupted streams cause a nonzero exit status.
+
+Run `node --test test_chat.js` for debug-page protocol checks.
+
+Run `./inject_cookie.sh` for a hidden token prompt, or pipe a token on standard input. The helper reads the project `.env`, calls the running local service, and only replaces the session after validation. It does not restart the service. Avoid placing tokens in shell command arguments or history.
+
+Requests exceeding the 96,000-character query limit receive an explicit error; the proxy does not silently truncate conversation content. `/health` reports cached quota immediately and schedules a refresh when needed. A successful chat stream ends with `[DONE]`; a failed stream emits an error instead of reporting success.
+
+Chat Completions rejects unsupported generation controls with HTTP 400, including custom sampling, output-token limits, structured response formats, multiple choices, stop sequences, nondefault penalties, seeds, logprobs, and streaming usage requests. These options are not silently ignored.

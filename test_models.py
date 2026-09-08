@@ -14,14 +14,16 @@ class MessageContentTests(unittest.TestCase):
             server._message_content_text([
                 {"type": "input_text", "text": "hello"},
                 {"type": "text", "text": "world"},
-                {"type": "image_url", "image_url": "ignored"},
             ]),
             "hello world",
         )
 
     def test_non_text_content_does_not_break_prompt_detection(self):
         self.assertEqual(server._message_content_text(None), "")
-        self.assertEqual(server._message_content_text({"value": 1}), "{'value': 1}")
+        with self.assertRaises(server.OpenAIAPIError):
+            server._message_content_text({"value": 1})
+        with self.assertRaises(server.OpenAIAPIError):
+            server._message_content_text([{"type": "image_url", "image_url": "ignored"}])
 
 
 class ModelRegistryTests(unittest.TestCase):
@@ -123,11 +125,11 @@ class DiscoveryTests(unittest.TestCase):
                 self.assertEqual(server.MODEL_MAP["sonnet"], ("pro", "claude50sonnet"))
                 self.assertEqual(server.MODEL_MAP["grok"], ("pro", "grok46low"))
                 self.assertEqual(server.MODEL_MAP["kimi-k3"], ("pro", "kimik3"))
-                self.assertEqual(server.MODEL_MAP["haiku"], ("pro", "claude45haiku"))
+                self.assertNotIn("haiku", server.MODEL_MAP)
                 self.assertIn("sonnet", report["added"])
                 self.assertIn("grok", report["added"])
                 self.assertIn("kimi-k3", report["added"])
-                self.assertIn("haiku", report["added"])
+                self.assertNotIn("haiku", report["added"])
                 self.assertNotIn("opus", server.MODEL_MAP)
 
         asyncio.run(run())
@@ -138,12 +140,17 @@ class ResponseParsingTests(unittest.TestCase):
         class FakeResponse:
             status_code=200
 
+            async def aclose(self):
+                pass
+
             async def aiter_lines(self, delimiter):
                 for payload in [
                     {"blocks": [{"intended_usage": "ask_text", "markdown_block": {"progress": "IN_PROGRESS", "chunks": ["Four"]}}]},
                     {"blocks": [{"intended_usage": "ask_text", "markdown_block": {"progress": "DONE", "chunks": ["Four"]}}]},
                 ]:
-                    yield f"event: message\r\ndata: {json.dumps(payload)}"
+                    yield "event: message"
+                    yield f"data: {json.dumps(payload)}"
+                    yield ""
                 yield "event: end_of_stream"
 
         class FakeSession:
@@ -165,6 +172,9 @@ class ResponseParsingTests(unittest.TestCase):
         class FakeResponse:
             status_code=200
 
+            async def aclose(self):
+                pass
+
             async def aiter_lines(self, delimiter):
                 payloads=[
                     {"blocks": [
@@ -181,7 +191,9 @@ class ResponseParsingTests(unittest.TestCase):
                     ]},
                 ]
                 for payload in payloads:
-                    yield f"event: message\r\ndata: {json.dumps(payload)}"
+                    yield "event: message"
+                    yield f"data: {json.dumps(payload)}"
+                    yield ""
                 yield "event: end_of_stream"
 
         class FakeSession:
@@ -204,12 +216,17 @@ class ResponseParsingTests(unittest.TestCase):
         class FakeResponse:
             status_code=200
 
+            async def aclose(self):
+                pass
+
             async def aiter_lines(self, delimiter):
                 for payload in [
                     {"blocks": [{"intended_usage": "ask_text_0_markdown", "markdown_block": {"progress": "IN_PROGRESS", "chunks": ["Legacy"]}}]},
                     {"blocks": [{"intended_usage": "ask_text_0_markdown", "markdown_block": {"progress": "DONE", "chunks": ["Legacy"]}}]},
                 ]:
-                    yield f"event: message\r\ndata: {json.dumps(payload)}"
+                    yield "event: message"
+                    yield f"data: {json.dumps(payload)}"
+                    yield ""
                 yield "event: end_of_stream"
 
         class FakeSession:
@@ -231,6 +248,9 @@ class ResponseParsingTests(unittest.TestCase):
         class FakeResponse:
             status_code=200
 
+            async def aclose(self):
+                pass
+
             async def aiter_lines(self, delimiter):
                 for payload in [
                     {
@@ -242,7 +262,9 @@ class ResponseParsingTests(unittest.TestCase):
                         "blocks": [{"intended_usage": "ask_text", "markdown_block": {"progress": "IN_PROGRESS", "chunks": [" answer"]}}],
                     },
                 ]:
-                    yield f"event: message\r\ndata: {json.dumps(payload)}"
+                    yield "event: message"
+                    yield f"data: {json.dumps(payload)}"
+                    yield ""
                 yield "event: end_of_stream"
 
         class FakeSession:
@@ -268,6 +290,9 @@ class ResponseParsingTests(unittest.TestCase):
         class FakeResponse:
             status_code=200
 
+            async def aclose(self):
+                pass
+
             async def aiter_lines(self, delimiter):
                 for payload in [
                     {
@@ -286,7 +311,9 @@ class ResponseParsingTests(unittest.TestCase):
                         "blocks": [{"intended_usage": "ask_text", "markdown_block": {"progress": "DONE", "chunks": [selected_answer + "."]}}],
                     },
                 ]:
-                    yield f"event: message\r\ndata: {json.dumps(payload)}"
+                    yield "event: message"
+                    yield f"data: {json.dumps(payload)}"
+                    yield ""
                 yield "event: end_of_stream"
 
         class FakeSession:
@@ -369,10 +396,8 @@ class ModelProbeTests(unittest.TestCase):
             asyncio.run(server.probe_model_status(FallbackClient(), "claude50sonnet")),
             server.PROBE_SUBSTITUTED,
         )
-        self.assertEqual(
-            asyncio.run(server.probe_model_status(DeadClient(), "claude50sonnet")),
-            server.PROBE_DEAD,
-        )
+        with self.assertRaisesRegex(RuntimeError, "Model probe failed"):
+            asyncio.run(server.probe_model_status(DeadClient(), "claude50sonnet"))
 
 
 class VersionUpgradeSkipTests(unittest.TestCase):
@@ -448,24 +473,6 @@ class VersionUpgradeSkipTests(unittest.TestCase):
         asyncio.run(run())
 
 
-class ModelPreflightTests(unittest.TestCase):
-    def test_model_preflight_reuses_a_fresh_verification(self):
-        calls=[]
-
-        async def verified(_client, pref):
-            calls.append(pref)
-            return True
-
-        async def run():
-            with patch.object(server, "_model_preflight_cache", {}, create=True), \
-                 patch.object(server, "probe_model", new=verified):
-                self.assertTrue(await server.ensure_model_available(object(), "claude50sonnet"))
-                self.assertTrue(await server.ensure_model_available(object(), "claude50sonnet"))
-                self.assertEqual(calls, ["claude50sonnet"])
-
-        asyncio.run(run())
-
-
 class ExplicitModelAvailabilityTests(unittest.TestCase):
     class ChatRequest:
         async def json(self):
@@ -486,13 +493,9 @@ class ExplicitModelAvailabilityTests(unittest.TestCase):
                     "done": True,
                 }
 
-        async def unavailable(_client, _pref):
-            return False
-
         async def run():
             with patch.object(server, "get_model_map", return_value={"sonnet": ("pro", "claude50sonnet")}), \
                  patch.object(server, "get_client", return_value=FakeClient()), \
-                 patch.object(server, "ensure_model_available", new=unavailable), \
                  patch.object(server, "_remaining_notice", return_value=""), \
                  patch.object(server, "_session_store"):
                 result=await server.chat_completions(self.ChatRequest())
@@ -642,21 +645,6 @@ class RefreshCookieEndpointTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             asyncio.run(run(Path(temp_dir) / ".cookie_cache.json"))
 
-    def test_refresh_cookie_clears_model_preflight_cache(self):
-        async def accepted(cookies):
-            return cookies
-
-        async def run(cache_file):
-            preflight_cache={"claude50sonnet": (0.0, False)}
-            with patch.object(server, "COOKIE_FILE", cache_file), \
-                 patch.object(server, "_client", None), \
-                 patch.object(server, "_model_preflight_cache", preflight_cache), \
-                 patch.object(server, "_validate_session_cookies", new=accepted):
-                await server.refresh_cookie_endpoint(self.JsonRequest())
-                self.assertEqual(preflight_cache, {})
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            asyncio.run(run(Path(temp_dir) / ".cookie_cache.json"))
 
 
 class ConfiguredCookieTests(unittest.TestCase):

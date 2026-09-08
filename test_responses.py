@@ -66,14 +66,10 @@ class ResponsesApiTests(unittest.TestCase):
         server._responses_reset_memory()
         self.temp.cleanup()
 
-    def test_content_parts_include_output_text_and_images(self):
-        self.assertEqual(
-            server._message_content_text([
-                {"type": "output_text", "text": "hello"},
-                {"type": "input_image", "image_url": "https://example.com/a.png"},
-            ]),
-            "hello [image: https://example.com/a.png]",
-        )
+    def test_content_parts_accept_text_and_reject_images(self):
+        self.assertEqual(server._message_content_text([{"type": "output_text", "text": "hello"}]), "hello")
+        with self.assertRaises(server.OpenAIAPIError):
+            server._message_content_text([{"type": "input_image", "image_url": "https://example.com/a.png"}])
 
     def test_parse_string_and_developer_message(self):
         messages=server._responses_parse_input(
@@ -246,6 +242,200 @@ class ResponsesApiTests(unittest.TestCase):
                 await server.responses_api(FakeRequest({"model": "not-a-model", "input": "Hi"}))
             self.assertEqual(ctx.exception.status_code, 400)
             self.assertEqual(ctx.exception.param, "model")
+        asyncio.run(run())
+
+    def test_store_false_is_not_retained(self):
+        async def run():
+            created=await server.responses_api(FakeRequest({"model": "auto", "input": "Hi", "store": False}))
+            self.assertEqual(created["status"], "completed")
+            self.assertFalse(server._responses_store)
+            self.assertFalse(self.responses_file.exists())
+            with self.assertRaises(server.OpenAIAPIError) as ctx:
+                await server.retrieve_response(created["id"])
+            self.assertEqual(ctx.exception.status_code, 404)
+        asyncio.run(run())
+
+    def test_invalid_request_shapes_are_rejected_before_upstream(self):
+        async def run():
+            invalid=[{"stream": "false"}, {"background": "false"}, {"model": []},
+                {"previous_response_id": {}}, {"conversation": {"id": []}},
+                {"text": {"format": []}}, {"reasoning": "high"}, {"tools": {}},
+                {"tools": [{"type": "function", "name": "test"}]}, {"tool_choice": "required"},
+                {"temperature": 0.2}, {"top_p": 0.5}, {"max_output_tokens": 100},
+                {"text": {"format": {"type": "json_schema", "strict": True, "schema": {}}}},
+                {"background": True, "store": False}, {"input": [{"type": "item_reference", "id": "missing"}]}]
+            for fields in invalid:
+                with self.subTest(fields=fields), self.assertRaises(server.OpenAIAPIError) as ctx:
+                    await server.responses_api(FakeRequest({"model": "auto", "input": "Hi", **fields}))
+                self.assertEqual(ctx.exception.status_code, 400)
+            self.assertFalse(self.client.calls)
+        asyncio.run(run())
+
+    def test_corrupt_store_is_not_overwritten(self):
+        self.responses_file.write_text("{broken")
+        with self.assertRaises(json.JSONDecodeError):
+            server._responses_load()
+        self.assertFalse(server._responses_loaded)
+        self.assertEqual(self.responses_file.read_text(), "{broken")
+        with self.assertRaises(json.JSONDecodeError):
+            server._responses_put({"id": "resp_new", "created_at": 0})
+        self.assertEqual(self.responses_file.read_text(), "{broken")
+
+    def test_persistence_failure_is_reported(self):
+        with patch("server.json.dump", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                server._responses_persist()
+
+    def test_expired_records_and_conversation_indexes_are_removed_on_read(self):
+        async def run():
+            created=await server.responses_api(FakeRequest({"model": "auto", "input": "Hi", "conversation": "conv_expired"}))
+            with patch.object(server.time, "time", return_value=created["created_at"]+server._RESPONSES_MAX_AGE+1):
+                with self.assertRaises(server.OpenAIAPIError):
+                    await server.retrieve_response(created["id"])
+                self.assertNotIn("conv_expired", server._conversations_index)
+        asyncio.run(run())
+
+    def test_eviction_does_not_discard_running_jobs(self):
+        now=server.time.time()
+        with patch.object(server, "_RESPONSES_MAX_ENTRIES", 1):
+            server._responses_put({"id": "resp_running", "status": "in_progress", "created_at": now})
+            with self.assertRaises(server.OpenAIAPIError) as ctx:
+                server._responses_put({"id": "resp_new", "status": "in_progress", "created_at": now})
+            self.assertEqual(ctx.exception.status_code, 429)
+            self.assertIsNotNone(server._responses_get("resp_running"))
+
+    def test_incomplete_upstream_never_reports_success(self):
+        async def run():
+            for chunks in ([], [{"delta": "partial"}], [{"done": True, "answer": ""}]):
+                self.client.chunks=chunks
+                with self.subTest(chunks=chunks), self.assertRaises(server.OpenAIAPIError) as ctx:
+                    await server.responses_api(FakeRequest({"model": "auto", "input": "Hi"}))
+                self.assertEqual(ctx.exception.status_code, 502)
+            self.assertTrue(all(rec["status"] == "failed" for rec in server._responses_store.values()))
+        asyncio.run(run())
+
+    def test_stream_transport_failure_is_terminal(self):
+        class BrokenClient:
+            async def search(self, *args):
+                yield {"delta": "partial"}
+                raise OSError("connection dropped")
+        async def run():
+            with patch.object(server, "get_client", lambda: BrokenClient()):
+                response=await server.responses_api(FakeRequest({"model": "auto", "input": "Hi", "stream": True}))
+                events=_parse_sse("".join([chunk async for chunk in response.body_iterator]))
+            self.assertEqual(events[-1][0], "response.failed")
+            self.assertNotIn("response.completed", [name for name, data in events])
+            self.assertEqual([data["sequence_number"] for name, data in events], list(range(len(events))))
+            rid=events[0][1]["response"]["id"]
+            self.assertEqual((await server.retrieve_response(rid))["status"], "failed")
+        asyncio.run(run())
+
+    def test_stream_sends_final_text_missing_from_deltas(self):
+        async def run():
+            self.client.chunks=[{"delta": "hel"}, {"done": True, "answer": "hello"}]
+            response=await server.responses_api(FakeRequest({"model": "auto", "input": "Hi", "stream": True}))
+            events=_parse_sse("".join([chunk async for chunk in response.body_iterator]))
+            text="".join(data["delta"] for name, data in events if name == "response.output_text.delta")
+            self.assertEqual(text, "hello")
+            self.assertEqual(events[-1][1]["response"]["output_text"], text)
+        asyncio.run(run())
+
+    def test_stream_reasoning_delta_matches_done_text(self):
+        async def run():
+            self.client.chunks=[{"thinking": "one"}, {"thinking": "two"}, {"done": True, "answer": "ok"}]
+            response=await server.responses_api(FakeRequest({"model": "auto", "input": "Hi", "stream": True}))
+            events=_parse_sse("".join([chunk async for chunk in response.body_iterator]))
+            text="".join(data["delta"] for name, data in events if name == "response.reasoning_summary_text.delta")
+            done=next(data["text"] for name, data in events if name == "response.reasoning_summary_text.done")
+            self.assertEqual(text, done)
+        asyncio.run(run())
+
+    def test_non_background_response_cannot_be_cancelled(self):
+        async def run():
+            response=await server.responses_api(FakeRequest({"model": "auto", "input": "Hi", "stream": True}))
+            rid=next(iter(server._responses_store))
+            with self.assertRaises(server.OpenAIAPIError) as ctx:
+                await server.cancel_response(rid)
+            self.assertEqual(ctx.exception.status_code, 400)
+            async for chunk in response.body_iterator:
+                pass
+        asyncio.run(run())
+
+    def test_deleted_stream_does_not_resurrect_record(self):
+        async def run():
+            response=await server.responses_api(FakeRequest({"model": "auto", "input": "Hi", "stream": True}))
+            rid=next(iter(server._responses_store))
+            await server.delete_response(rid)
+            async for chunk in response.body_iterator:
+                pass
+            self.assertIsNone(server._responses_get(rid))
+        asyncio.run(run())
+
+    def test_previous_response_must_be_completed(self):
+        server._responses_put({"id": "resp_failed", "status": "failed", "created_at": server.time.time()})
+        with self.assertRaises(server.OpenAIAPIError) as ctx:
+            server._responses_apply_previous([{"role": "user", "content": "Hi"}], "resp_failed", None)
+        self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_quota_exhaustion_does_not_silently_change_model(self):
+        with patch.object(server, "_rate_limit", {"remaining_pro": 0}):
+            with self.assertRaises(server.OpenAIAPIError) as ctx:
+                server._responses_resolve_model("gpt", False)
+            self.assertEqual(ctx.exception.status_code, 429)
+            self.assertEqual(server._responses_resolve_model("auto", False)[1], "auto")
+
+    def test_stream_cleaner_handles_all_marker_split_boundaries(self):
+        samples=[
+            "  answer[123] done \n",
+            "a<grok:render>hidden</grok:render>b",
+            "a<grok:render id='x'/>b",
+            "a<script>hidden<grok:</script>b",
+            "<?xml version='1.0'?><response>visible</response>",
+            "literal <table> and [unfinished",
+        ]
+        for text in samples:
+            for split in range(len(text)+1):
+                with self.subTest(text=text, split=split):
+                    cleaner=server._ResponseStreamCleaner()
+                    actual=cleaner.feed(text[:split])+cleaner.feed(text[split:])+cleaner.feed("", final=True)
+                    self.assertEqual(actual, server._clean_response(text, strip=False))
+            cleaner=server._ResponseStreamCleaner()
+            actual="".join(cleaner.feed(char) for char in text)+cleaner.feed("", final=True)
+            self.assertEqual(actual, server._clean_response(text, strip=False))
+
+    def test_stream_split_markers_and_whitespace_match_completed_output(self):
+        async def run():
+            for text in ("  answer[12] done \n", "before<script>secret</script>after", "a<grok:x>hide</grok:x>b", "<?xml version='1.0'?><response>Hi</response>"):
+                with self.subTest(text=text):
+                    self.client.chunks=[{"delta": char} for char in text]+[{"done": True, "answer": text}]
+                    response=await server.responses_api(FakeRequest({"model": "auto", "input": "Hi", "stream": True}))
+                    events=_parse_sse("".join([chunk async for chunk in response.body_iterator]))
+                    self.assertEqual(events[-1][0], "response.completed")
+                    actual="".join(data["delta"] for name, data in events if name == "response.output_text.delta")
+                    self.assertEqual(actual, server._clean_response(text, strip=False))
+                    self.assertEqual(actual, events[-1][1]["response"]["output_text"])
+        asyncio.run(run())
+
+    def test_stream_disconnect_closes_upstream_and_marks_cancelled(self):
+        closed=[]
+        class ResourceClient:
+            async def search(self, *args):
+                try:
+                    yield {"delta": "partial"}
+                    yield {"done": True, "answer": "partial"}
+                finally:
+                    closed.append(True)
+        async def run():
+            with patch.object(server, "get_client", lambda: ResourceClient()):
+                response=await server.responses_api(FakeRequest({"model": "auto", "input": "Hi", "stream": True}))
+                iterator=response.body_iterator
+                async for chunk in iterator:
+                    if "event: response.output_text.delta" in chunk:
+                        break
+                await iterator.aclose()
+            self.assertEqual(closed, [True])
+            rec=next(iter(server._responses_store.values()))
+            self.assertEqual(rec["status"], "cancelled")
         asyncio.run(run())
 
 
