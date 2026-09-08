@@ -58,8 +58,8 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);height:100vh
 <select id="mdl"><option value="gpt">gpt</option><option value="gpt-5.6-terra">gpt-5.6-terra</option><option value="gpt-5.6-sol">gpt-5.6-sol</option><option value="gpt-5.5">gpt-5.5</option><option value="gpt-mini">gpt-mini</option><option value="gpt-nano">gpt-nano</option><option value="sonnet" selected>sonnet</option><option value="sonnet-5">sonnet-5</option><option value="sonnet-4.6">sonnet-4.6</option><option value="gemini">gemini</option><option value="gemini-flash">gemini-flash</option><option value="grok">grok</option><option value="grok-4.6">grok-4.6</option><option value="grok-4.5">grok-4.5</option><option value="grok-4">grok-4</option><option value="grok-reasoning">grok-reasoning</option><option value="grok-non-reasoning">grok-non-reasoning</option><option value="nemotron">nemotron</option><option value="nemotron-3-super">nemotron-3-super</option><option value="glm-5.2">glm-5.2</option><option value="kimi-k2.6">kimi-k2.6</option><option value="kimi-k3">kimi-k3</option><option value="sonar">sonar</option><option value="auto">auto</option><option value="opus">opus</option><option value="opus-4.8">opus-4.8</option><option value="opus-4.7">opus-4.7</option><option value="opus-4.6">opus-4.6</option></select>
 <label><input type="checkbox" id="thk">thinking</label>
 <label><input type="checkbox" id="str" checked>stream</label>
-<button id="tlb" onclick="tglTools()" style="background:var(--border)">Tools OFF</button>
-<input id="key" placeholder="API key" style="width:90px">
+<button id="tlb" onclick="tglTools()" style="background:var(--border)">Test unsupported tools OFF</button>
+<input id="key" type="password" autocomplete="off" placeholder="API key" style="width:90px">
 <span style="font-size:9px;color:var(--dim)" id="st">ready</span>
 <span style="font-size:9px;color:var(--dim)" id="dm"></span>
 </div>
@@ -96,8 +96,8 @@ const $=id=>document.getElementById(id);
 $('inp').onkeydown=e=>{if(e.key==='Enter')go()};
 function L(t){$('db').textContent+=t+'\n';$('db').scrollTop=9e9}
 function E(s){return(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
-function tglTools(){tl=!tl;$('tlb').style.background=tl?'var(--green)':'var(--border)';$('tlb').textContent=tl?'Tools ON':'Tools OFF'}
-function clr(){H=[];$('msgs').innerHTML='';$('db').textContent='';showFmt(null)}
+function tglTools(){tl=!tl;$('tlb').style.background=tl?'var(--green)':'var(--border)';$('tlb').textContent=tl?'Test unsupported tools ON':'Test unsupported tools OFF'}
+function clr(){if($('btn').disabled)return;H=[];$('msgs').innerHTML='';$('db').textContent='';showFmt(null)}
 function switchTab(i){document.querySelectorAll('.tabs button').forEach((b,j)=>{b.classList.toggle('act',j===i)});document.querySelectorAll('.tab-body').forEach((b,j)=>{b.classList.toggle('act',j===i)})}
 function addM(r,c,x={}){
 let d=document.createElement('div');d.className='m '+(r==='user'?'u':r==='error'?'e':'a');
@@ -107,7 +107,7 @@ if(x.tc)h+=`<div class="tc">🔧 tool_calls\n${x.tc.map(t=>'  '+E(t.function?.na
 h+=`<div>${E(c)}</div>`;
 let ci=(c||'').match(/\[\d+\]/g);
 if(ci)h+=`<div class="w">⚠️ citations: ${ci.join(' ')}</div>`;
-if(x.fr)h+=`<div class="mt">${x.fr} | ${x.md||'?'} | ${x.ms||'?'}ms</div>`;
+if(x.fr)h+=`<div class="mt">${E(x.fr)} | ${E(x.md||'?')} | ${x.ms||'?'}ms</div>`;
 d.innerHTML=h;$('msgs').appendChild(d);$('msgs').scrollTop=9e9;return d}
 
 // ── OpenAI Format Validator ──
@@ -120,7 +120,10 @@ function validateOpenAI(data, isStream) {
     // Validate accumulated stream chunks
     const chunks = data;
     if (!chunks.length) { chk('has chunks', false, '0 chunks'); return checks; }
-    const c0 = chunks[0], cL = chunks[chunks.length-1];
+    const c0 = chunks[0], cL = [...chunks].reverse().find(c=>c.choices?.length)||{};
+    chk('all chunk objects', chunks.every(c=>c.object==='chat.completion.chunk'), 'chat.completion.chunk');
+    chk('all choices arrays', chunks.every(c=>Array.isArray(c.choices)), 'choices');
+    chk('first choice exists', !!c0.choices?.[0], c0.choices?.length);
     chk('chunk[0].id', typeof c0.id==='string'&&c0.id.startsWith('chatcmpl-'), c0.id);
     chk('chunk[0].object', c0.object==='chat.completion.chunk', c0.object);
     chk('chunk[0].created', typeof c0.created==='number', c0.created);
@@ -195,6 +198,7 @@ function validateOpenAI(data, isStream) {
       chk('usage.prompt_tokens', typeof data.usage.prompt_tokens==='number', data.usage.prompt_tokens);
       chk('usage.completion_tokens', typeof data.usage.completion_tokens==='number', data.usage.completion_tokens);
       chk('usage.total_tokens', typeof data.usage.total_tokens==='number', data.usage.total_tokens);
+      chk('usage arithmetic', data.usage.total_tokens===data.usage.prompt_tokens+data.usage.completion_tokens, data.usage.total_tokens);
     } else { chk('usage', false, 'missing', false); }
   }
   return checks;
@@ -231,7 +235,28 @@ function showFmt(checks) {
   switchTab(1);
 }
 
+// SSE records may span network reads or contain multiple data lines.
+async function* streamEvents(body){
+const reader=body.getReader(),decoder=new TextDecoder();
+let buffer='',data=[];
+try{
+while(true){
+const {done,value}=await reader.read();
+buffer+=done?decoder.decode():decoder.decode(value,{stream:true});
+if(done&&buffer)buffer+='\n';
+let pos;
+while((pos=buffer.indexOf('\n'))>=0){
+let line=buffer.slice(0,pos).replace(/\r$/,'');buffer=buffer.slice(pos+1);
+if(line===''){if(data.length){yield data.join('\n');data=[]}}
+else if(line.startsWith('data:'))data.push(line.slice(5).replace(/^ /,''));
+}
+if(done){if(data.length)yield data.join('\n');break}
+}
+}finally{try{await reader.cancel()}finally{reader.releaseLock()}}
+}
+
 async function go(){
+if($('btn').disabled)return;
 let t=$('inp').value.trim();if(!t)return;$('inp').value='';
 let md=$('mdl').value,th=$('thk').checked,sr=$('str').checked,k=$('key').value;
 H.push({role:'user',content:t});addM('user',t);
@@ -252,31 +277,43 @@ addM('a',m.content,{rc:m.reasoning_content,tc:m.tool_calls,fr,md:d.model,ms});
 showFmt(validateOpenAI(d, false));
 $('dm').textContent=fr+' | '+d.model+' | '+ms+'ms';
 }else{
-let rd=r.body.getReader(),dc=new TextDecoder(),buf='',fc='',fr_='',tc=null,fn=null,rm=md;
+let fc='',fr_='',tc=null,fn=null,rm=md;
 let allChunks=[],gotDone=false;
 let dv=addM('a','');L('\n=== STREAM ===');
-while(true){let{done,value}=await rd.read();if(done)break;
-buf+=dc.decode(value,{stream:true});let ls=buf.split('\n');buf=ls.pop();
-for(let l of ls){if(!l.startsWith('data: '))continue;let s=l.slice(6).trim();
-if(s==='[DONE]'){L('[DONE]');gotDone=true;continue}
-try{let c=JSON.parse(s);allChunks.push(c);
+for await(let s of streamEvents(r.body)){
+if(s==='[DONE]'){L('[DONE]');gotDone=true;break}
+let c=JSON.parse(s);
+if(c.error)throw new Error(c.error.message||JSON.stringify(c.error));
+allChunks.push(c);
 let dl=c.choices?.[0]?.delta||{},f=c.choices?.[0]?.finish_reason;rm=c.model||rm;
 if(dl.reasoning_content){fr_+=dl.reasoning_content;L('δ think: '+dl.reasoning_content.slice(0,50))}
 if(dl.content){fc+=dl.content;if(fc.length<100||fc.length%200<dl.content.length)L('δ text: '+dl.content.slice(0,60))}
-if(dl.tool_calls){tc=dl.tool_calls;L('δ tools: '+JSON.stringify(dl.tool_calls))}
+if(dl.tool_calls){
+if(!tc)tc=[];
+for(const delta of dl.tool_calls){
+if(!Number.isInteger(delta.index)||delta.index<0)throw new Error('Invalid tool-call index');
+let tool=tc[delta.index];
+if(!tool)tool=tc[delta.index]={type:'function',function:{name:'',arguments:''}};
+if(delta.id)tool.id=delta.id;
+if(delta.type)tool.type=delta.type;
+if(delta.function?.name)tool.function.name+=delta.function.name;
+if(delta.function?.arguments)tool.function.arguments+=delta.function.arguments;
+}
+L('δ tools: '+JSON.stringify(dl.tool_calls))}
 if(f){fn=f;L('finish: '+f)}
-}catch(e){L('err: '+e.message)}}
+
 let h='';if(fr_)h+=`<div class="th"><b>🧠 reasoning</b><br>${E(fr_)}</div>`;
 if(tc)h+=`<div class="tc">🔧 tool_calls\n${tc.map(t=>'  '+E(t.function?.name)+'('+E(t.function?.arguments)+')').join('\n')}</div>`;
 h+=`<div>${E(fc)}</div>`;
-if(fn)h+=`<div class="mt">${fn} | ${rm} | ${((Date.now()-t0)/1000).toFixed(1)}s</div>`;
+if(fn)h+=`<div class="mt">${E(fn)} | ${E(rm)} | ${((Date.now()-t0)/1000).toFixed(1)}s</div>`;
 dv.innerHTML=h;$('msgs').scrollTop=9e9}
+if(!gotDone||!fn)throw new Error('Incomplete stream: missing finish reason or [DONE]');
 let _hs={role:'assistant',content:fc||''};if(tc){_hs.tool_calls=tc;} H.push(_hs);
 allChunks._gotDone=gotDone;
 showFmt(validateOpenAI(allChunks, true));
 $('dm').textContent=(fn||'?')+' | '+rm+' | '+fc.length+'ch';
 }
-}catch(e){L('\n=== ERR ===\n'+e.message);addM('error',e.message);showFmt(null)}
+}catch(e){L('\n=== ERR ===\n'+e.message);addM('error',e.message);showFmt([{name:'response completed',ok:false,val:e.message,required:true}])}
 $('st').textContent='ready';$('btn').disabled=false;$('inp').focus()}
 </script>
 </body>
