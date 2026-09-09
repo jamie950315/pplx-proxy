@@ -6,9 +6,9 @@
 
 ## Current Work and Deployment (2026-09-09)
 
-- Release: image input, local file storage, and the experimental Responses function bridge are included in `main`. Production deployment target: Pi5, `pplx-proxy.service`, port **8892**.
+- Release: image input, local file storage, and the experimental Responses function bridge are included in `main`. Deployed application commit: `5c89981` on Pi5, `pplx-proxy.service`, port **8892**.
 - The user authorized merging `codex/attachments-function-tools` into `main` and deploying this release. Use isolated runtime data and a separate localhost port for further testing; verify the running service before claiming a successful rollout.
-- Real PNG image input passed an official OpenAI SDK test.
+- Post-deployment public checks passed at `https://pplx.0ruka.dev`: ordinary Chat, streaming Chat, Responses, official SDK Chat/Responses PNG input, and Files create/retrieve/delete. Perplexity substituted `gpt56_terra` with `gpt5_nano` during the image checks; image recognition still passed. Existing credentials were preserved.
 - `/v1/files` local upload/read/delete passed; limits are 20 MiB per file and 200 MiB total. Local storage success is not proof of upstream document reading.
 - Documents remain **incomplete**: upstream upload must be followed by `/rest/sse/attachment_processing/subscribe` and confirmed completion. Cloudflare currently returns 403; document requests explicitly fail with 502. Do not report document support as complete.
 - Responses function bridge is **experimental and unreliable**. One official SDK auto-selection/client-execution/stream-continuation loop passed; a repeat returned non-JSON output and correctly failed with `response.failed` / `tool_protocol_error`, so SDK `get_final_response()` had no completed response. It is **prompt-mediated**, not native Perplexity function calling. Do not claim stable or completed support; do not add fallback or automatic retry to hide failures.
