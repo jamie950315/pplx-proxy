@@ -12,3 +12,5 @@ venv/
 .responses_store.json
 .browser_data/
 .venv/
+
+uploads/

@@ -19,6 +19,13 @@ from uuid import uuid4
 from typing import Optional, AsyncGenerator
 from pathlib import Path
 
+import mimetypes
+from attachments import Attachment, AttachmentError, MAX_ATTACHMENT_BYTES, resolve_attachment, upload_attachment
+from file_store import FileStore
+from starlette.datastructures import UploadFile
+from starlette.responses import Response
+from function_tools import prepare_tools, build_tool_instruction, parse_tool_response, function_call_events, ToolConfigError, ToolProtocolError
+
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -588,6 +595,7 @@ class PerplexityClient:
         sources: list=None,
         language: str="en-US",
         follow_up_uuid: str=None,
+        attachments: list=None,
     ) -> AsyncGenerator[dict, None]:
         if sources is None:
             sources=["web"]
@@ -598,7 +606,7 @@ class PerplexityClient:
         json_data={
             "query_str": query,
             "params": {
-                "attachments": [],
+                "attachments": list(attachments or []),
                 "frontend_context_uuid": str(uuid4()),
                 "frontend_uuid": str(uuid4()),
                 "is_incognito": False,
@@ -1600,6 +1608,9 @@ async def _responses_collect_answer(client, query, mode, model_pref, follow_up_u
 async def _responses_background_job(resp_id, query, mode, model_pref, follow_up_uuid, history, current_msg):
     try:
         client=get_client()
+        initial=_responses_get(resp_id)
+        if initial and initial.get("_attachments"):
+            client=_AttachmentClient(client, initial["_attachments"])
         result=await _responses_collect_answer(client, query, mode, model_pref, follow_up_uuid)
         rec=_responses_get(resp_id)
         if not rec or rec.get("status") == "cancelled":
@@ -1779,6 +1790,173 @@ async def _stream_responses_api(client, rec, query, mode, model_pref, follow_up_
         chunk, _seq=_sse_pack("response.failed", {"response": _responses_public(rec)}, last_seq+1)
         yield chunk
 
+def _tool_history(inp, previous):
+    history=copy.deepcopy(previous.get("_tool_history") or []) if previous else []
+    if previous and not history:
+        history=[{"role": role, "content": text} for role, text in previous.get("_history_messages", [])]
+    incoming=[{"role": "user", "content": inp}] if isinstance(inp, str) else inp
+    if not isinstance(incoming, list) or not incoming:
+        raise OpenAIAPIError(400, "input must contain a user message or function result", param="input")
+    history.extend(copy.deepcopy(incoming))
+    pending={}
+    seen=set()
+    normalized=[]
+    for item in history:
+        if not isinstance(item, dict):
+            raise OpenAIAPIError(400, "Tool conversation items must be objects", param="input")
+        typ=item.get("type", "message")
+        if typ in ("message", "input_message"):
+            role=item.get("role", "user")
+            if role not in ("system", "developer", "user", "assistant"):
+                raise OpenAIAPIError(400, "Invalid tool conversation role", param="input")
+            content=_message_content_text(item.get("content", ""))
+            if content:
+                normalized.append({"role": role, "content": content})
+        elif typ == "function_call":
+            call_id=item.get("call_id")
+            if not isinstance(call_id, str) or not call_id or call_id in seen or not isinstance(item.get("name"), str):
+                raise OpenAIAPIError(400, "Function calls require unique call_id and name", param="input")
+            try:
+                arguments=json.loads(item.get("arguments", ""))
+            except (ValueError, TypeError) as exc:
+                raise OpenAIAPIError(400, "Function call arguments must be JSON", param="input") from exc
+            if not isinstance(arguments, dict):
+                raise OpenAIAPIError(400, "Function call arguments must be a JSON object", param="input")
+            seen.add(call_id)
+            pending[call_id]=item["name"]
+            normalized.append({"type": "function_call", "call_id": call_id, "name": item["name"], "arguments": item["arguments"]})
+        elif typ == "function_call_output":
+            call_id=item.get("call_id")
+            if not isinstance(call_id, str) or call_id not in pending:
+                raise OpenAIAPIError(400, "Function output has no matching outstanding call_id", param="input")
+            output=item.get("output")
+            if not isinstance(output, (str, list)):
+                raise OpenAIAPIError(400, "Function output must be text or content parts", param="input")
+            normalized.append({"type": typ, "call_id": call_id, "output": _message_content_text(output)})
+            del pending[call_id]
+        elif typ == "reasoning":
+            continue
+        else:
+            raise OpenAIAPIError(400, f"Unsupported tool conversation item: {typ}", param="input")
+    if pending:
+        raise OpenAIAPIError(400, "Provide outputs for all outstanding function calls", param="input")
+    if not normalized or not (normalized[-1].get("role") == "user" or normalized[-1].get("type") == "function_call_output"):
+        raise OpenAIAPIError(400, "The last input must be a user message or function result", param="input")
+    return normalized
+
+
+async def _run_tool_response(rec, client, policy, query, mode, pref):
+    try:
+        result=await _responses_collect_answer(client, query, mode, pref, None)
+        if result["error"]:
+            raise UpstreamError(str(result["error"]))
+        if mode != "auto":
+            _decrement_pro()
+        output=parse_tool_response(result["full"], policy)
+        rec["output"]=output
+        rec["output_text"]="".join(part["text"] for item in output if item["type"] == "message" for part in item["content"])
+        rec["_tool_history"].extend(copy.deepcopy(output))
+        rec["_backend_uuid"]=result["backend_uuid"]
+        rec["usage"]=_responses_usage(query, result["full"], "\n".join(result["thinking_parts"]))
+        rec["status"]="completed"
+        _responses_put(rec)
+        return rec
+    except asyncio.CancelledError:
+        rec["status"]="cancelled"
+        _responses_put(rec)
+        raise
+    except Exception as exc:
+        log.exception("Function response failed")
+        rec["status"]="failed"
+        rec["error"]={"code": "tool_protocol_error" if isinstance(exc, ToolProtocolError) else "upstream_error", "message": str(exc)}
+        _responses_put(rec)
+        raise OpenAIAPIError(502, str(exc), err_type="upstream_error", code=rec["error"]["code"]) from exc
+
+
+async def _stream_tool_response(rec, client, policy, query, mode, pref):
+    try:
+        async with aclosing(_stream_tool_response_events(rec, client, policy, query, mode, pref)) as events:
+            async for event in events:
+                yield event
+    finally:
+        if rec["status"] == "in_progress":
+            rec["status"]="cancelled"
+            _responses_put(rec)
+
+
+async def _stream_tool_response_events(rec, client, policy, query, mode, pref):
+    seq=0
+    for event in ("response.created", "response.in_progress"):
+        chunk, seq=_sse_pack(event, {"response": _responses_public(rec)}, seq)
+        yield chunk
+    try:
+        await _run_tool_response(rec, client, policy, query, mode, pref)
+    except OpenAIAPIError:
+        chunk, seq=_sse_pack("response.failed", {"response": _responses_public(rec)}, seq)
+        yield chunk
+        return
+    for index, item in enumerate(rec["output"]):
+        if item["type"] == "function_call":
+            for event, data in function_call_events(item, index):
+                chunk, seq=_sse_pack(event, data, seq)
+                yield chunk
+        else:
+            part=item["content"][0]
+            common={"item_id": item["id"], "output_index": index, "content_index": 0}
+            events=[
+                ("response.output_item.added", {"output_index": index, "item": {**item, "status": "in_progress", "content": []}}),
+                ("response.content_part.added", {**common, "part": {**part, "text": ""}}),
+                ("response.output_text.delta", {**common, "delta": part["text"]}),
+                ("response.output_text.done", {**common, "text": part["text"]}),
+                ("response.content_part.done", {**common, "part": part}),
+                ("response.output_item.done", {"output_index": index, "item": item}),
+            ]
+            for event, data in events:
+                chunk, seq=_sse_pack(event, data, seq)
+                yield chunk
+    chunk, seq=_sse_pack("response.completed", {"response": _responses_public(rec)}, seq)
+    yield chunk
+
+
+async def _responses_tools_api(body, model_name, mode, pref, policy):
+    _, prev_id, conv_id=_responses_apply_previous([], body.get("previous_response_id"), body.get("conversation"))
+    previous=_responses_get(prev_id) if prev_id else None
+    inp, attachment_refs=await _prepare_attachments(body.get("input"), previous.get("_attachments") if previous else None)
+    history=_tool_history(inp, previous)
+    instructions=body.get("instructions") or ""
+    if not isinstance(instructions, str):
+        raise OpenAIAPIError(400, "Function requests require string instructions", param="instructions")
+    query=json.dumps({"instructions": [build_tool_instruction(policy), instructions], "input": history}, ensure_ascii=False)
+    if len(query) > 96000:
+        raise OpenAIAPIError(400, "Tool conversation exceeds the 96000-character limit", param="input", code="context_length_exceeded")
+    store_flag=body.get("store") is not False
+    background=body.get("background") is True
+    rec=_responses_new_record(model_name, instructions, None, prev_id, body.get("reasoning"), store_flag,
+        body.get("temperature", 1), body.get("text") or {}, policy.choice, list(policy.tools.values()),
+        body.get("top_p", 1), "disabled", body.get("metadata") or {}, body.get("user"), background, conv_id,
+        _responses_normalize_input_items(inp), query, body.get("parallel_tool_calls") is not False)
+    rec["_tool_history"]=history
+    client=get_client()
+    rec["_attachments"]=attachment_refs
+    if attachment_refs:
+        client=_AttachmentClient(client, attachment_refs)
+    _responses_put(rec)
+    if background:
+        async def run():
+            try:
+                await _run_tool_response(rec, client, policy, query, mode, pref)
+            except OpenAIAPIError:
+                return  # Failure is persisted and logged by _run_tool_response.
+        task=asyncio.create_task(run())
+        _responses_tasks[rec["id"]]=task
+        task.add_done_callback(lambda _: _responses_tasks.pop(rec["id"], None))
+        return _responses_public(rec)
+    if body.get("stream"):
+        return StreamingResponse(_stream_tool_response(rec, client, policy, query, mode, pref), media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    return _responses_public(await _run_tool_response(rec, client, policy, query, mode, pref))
+
+
 @app.post("/v1/responses")
 async def responses_api(request: Request, _=Depends(verify_api_key)):
     """OpenAI Responses API compatibility: create, stream, store, and chain turns."""
@@ -1800,11 +1978,23 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
         raise OpenAIAPIError(400, "instructions must be a string or an array", param="instructions")
     if body.get("tools") is not None and (not isinstance(body["tools"], list) or any(not isinstance(t, dict) for t in body["tools"])):
         raise OpenAIAPIError(400, "tools must be an array of objects", param="tools")
-    for tool in body.get("tools") or []:
-        if tool.get("type") not in ("web_search", "web_search_preview", "web_search_preview_2025_03_11"):
-            raise OpenAIAPIError(400, "Only built-in web search is supported; function tools cannot be executed", param="tools")
-    if body.get("tool_choice", "auto") not in (None, "auto"):
-        raise OpenAIAPIError(400, "Only tool_choice=auto is supported; built-in web search cannot be forced or disabled", param="tool_choice")
+    effective_tools=body.get("tools")
+    effective_choice=body.get("tool_choice", "auto")
+    input_items=body.get("input")
+    has_function_items=isinstance(input_items, list) and any(isinstance(item, dict) and item.get("type") in ("function_call", "function_call_output") for item in input_items)
+    if not effective_tools and (has_function_items or body.get("previous_response_id") or body.get("conversation")):
+        _, previous_id, _=_responses_apply_previous([], body.get("previous_response_id"), body.get("conversation"))
+        previous=_responses_get(previous_id) if previous_id else None
+        effective_tools=previous.get("tools") if previous and previous.get("_tool_history") else None
+        effective_choice="none"
+        if has_function_items and not effective_tools:
+            raise OpenAIAPIError(400, "Function results require tool definitions or a stored previous function response", param="tools")
+    try:
+        tool_policy=prepare_tools(effective_tools, effective_choice, body.get("parallel_tool_calls") is not False)
+    except ToolConfigError as exc:
+        raise OpenAIAPIError(400, str(exc), param=exc.param) from exc
+    if tool_policy is None and body.get("tool_choice", "auto") not in (None, "auto"):
+        raise OpenAIAPIError(400, "Built-in web search cannot be forced or disabled", param="tool_choice")
     for name in ("temperature", "top_p"):
         value=body.get(name)
         if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or value != 1):
@@ -1857,6 +2047,11 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
     use_thinking=bool(effort) and str(effort).lower() not in ("none", "null")
 
     model_name, mode, model_pref=_responses_resolve_model(model_name, use_thinking)
+    if tool_policy is not None:
+        if (text_cfg.get("format") or {}).get("type", "text") != "text":
+            raise OpenAIAPIError(400, "Function requests cannot combine a structured text response format", param="text.format")
+        return await _responses_tools_api(body, model_name, mode, model_pref, tool_policy)
+    inp, attachment_refs=await _prepare_attachments(inp)
     messages=_responses_parse_input(inp, instructions)
     extra_instructions=[]
     fmt=text_cfg.get("format") if isinstance(text_cfg.get("format"), dict) else {}
@@ -1870,6 +2065,10 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
     if not messages or not any(m.get("role") == "user" for m in messages):
         raise OpenAIAPIError(400, "No user message found in input", param="input")
 
+    if prev_id:
+        attachment_refs=list(_responses_get(prev_id).get("_attachments", []))+attachment_refs
+    if len(attachment_refs) > 5:
+        raise OpenAIAPIError(400, "At most five attachments are supported per conversation request", param="input")
     prepared=_prepare_pplx_from_messages(messages, "responses_api", extra_instructions)
     query=prepared["query"]
     if not (query or "").strip():
@@ -1881,6 +2080,9 @@ async def responses_api(request: Request, _=Depends(verify_api_key)):
         temperature, text_cfg, tool_choice, tools_raw, top_p, truncation, metadata, user,
         background, conv_id, _responses_normalize_input_items(inp), query, parallel_tool_calls,
     )
+    rec["_attachments"]=attachment_refs
+    if attachment_refs and client is not None:
+        client=_AttachmentClient(client, attachment_refs)
     rec["_history_messages"]=list(prepared["history"])+[("user", prepared["current_msg"])] if prepared["current_msg"] else list(prepared["history"])
     _responses_put(rec, persist=store_flag)
 
@@ -1985,6 +2187,125 @@ async def list_response_input_items(response_id: str, limit: int=20, after: str=
     }
 
 
+_file_store=None
+
+def _get_file_store():
+    global _file_store
+    if _file_store is None:
+        _file_store=FileStore(DATA_DIR / "uploads")
+    return _file_store
+
+
+async def _file_operation(method, *args):
+    try:
+        return await asyncio.to_thread(getattr(_get_file_store(), method), *args)
+    except FileNotFoundError as exc:
+        raise OpenAIAPIError(404, "File not found", param="file_id") from exc
+    except OverflowError as exc:
+        raise OpenAIAPIError(413, str(exc), param="file") from exc
+    except ValueError as exc:
+        raise OpenAIAPIError(400, str(exc), param="file") from exc
+
+
+@app.post("/v1/files")
+async def upload_file(request: Request, _=Depends(verify_api_key)):
+    received=0
+    async def bounded_receive():
+        nonlocal received
+        message=await request.receive()
+        received+=len(message.get("body", b""))
+        if received > MAX_ATTACHMENT_BYTES+65536:
+            raise OpenAIAPIError(413, "File upload exceeds the 20 MiB limit", param="file")
+        return message
+    bounded=Request(request.scope, bounded_receive)
+    async with bounded.form(max_files=1, max_fields=1, max_part_size=65536) as form:
+        uploaded=form.get("file")
+        if not isinstance(uploaded, UploadFile):
+            raise OpenAIAPIError(400, "Provide a multipart file field", param="file")
+        data=await uploaded.read(MAX_ATTACHMENT_BYTES+1)
+        return await _file_operation("create", data, uploaded.filename, form.get("purpose", "user_data"))
+
+
+@app.get("/v1/files")
+async def list_files(_=Depends(verify_api_key)):
+    return {"object": "list", "data": await _file_operation("list"), "has_more": False}
+
+
+@app.get("/v1/files/{file_id}")
+async def retrieve_file(file_id: str, _=Depends(verify_api_key)):
+    metadata, _data=await _file_operation("get", file_id)
+    return metadata
+
+
+@app.get("/v1/files/{file_id}/content")
+async def retrieve_file_content(file_id: str, _=Depends(verify_api_key)):
+    metadata, data=await _file_operation("get", file_id)
+    return Response(data, media_type="application/octet-stream", headers={"Content-Disposition": "attachment", "X-Content-Type-Options": "nosniff"})
+
+
+@app.delete("/v1/files/{file_id}")
+async def delete_file(file_id: str, _=Depends(verify_api_key)):
+    if not await _file_operation("delete", file_id):
+        raise OpenAIAPIError(404, "File not found", param="file_id")
+    return {"id": file_id, "object": "file", "deleted": True}
+
+
+class _AttachmentClient:
+    """Bind uploaded attachments to one request, never to the shared session."""
+    def __init__(self, client, references):
+        self.client=client
+        self.references=references
+
+    def search(self, *args, **kwargs):
+        return self.client.search(*args, attachments=[entry["url"] for entry in self.references], **kwargs)
+
+
+async def _prepare_attachments(inp, inherited=None):
+    if not isinstance(inp, list):
+        return inp, list(inherited or [])
+    result=copy.deepcopy(inp)
+    pending=[]
+    for item in result:
+        if not isinstance(item, dict):
+            continue
+        field="output" if item.get("type") == "function_call_output" else "content"
+        parts=item.get(field)
+        if not isinstance(parts, list):
+            continue
+        for index, part in enumerate(parts):
+            if isinstance(part, dict) and part.get("type") in ("input_image", "image_url", "input_file", "file"):
+                if field == "content" and item.get("role", "user") != "user":
+                    raise OpenAIAPIError(400, "Attachments must be in user messages or function results", param="input")
+                pending.append((parts, index, part))
+    references=list(inherited or [])
+    if len(pending)+len(references) > 5:
+        raise OpenAIAPIError(400, "At most five attachments are supported per conversation request", param="input")
+    if not pending:
+        return result, references
+    async def load_file(file_id):
+        metadata, data=await _file_operation("get", file_id)
+        media_type=mimetypes.guess_type(metadata["filename"])[0] or "application/octet-stream"
+        return Attachment(metadata["filename"], media_type, data)
+    resolved=[]
+    total=0
+    try:
+        for parts, index, part in pending:
+            attachment=await resolve_attachment(part, load_file)
+            total+=len(attachment.data)
+            if total > MAX_ATTACHMENT_BYTES:
+                raise AttachmentError("Combined attachments exceed 20 MiB", 413)
+            resolved.append((parts, index, attachment))
+        client=get_client()
+        await client.init()
+        for parts, index, attachment in resolved:
+            url=await upload_attachment(client.session, attachment, PPLX_API_VERSION)
+            references.append({"filename": attachment.filename, "url": url})
+            parts[index]={"type": "input_text", "text": f"[Attached file: {attachment.filename}]"}
+    except AttachmentError as exc:
+        raise OpenAIAPIError(exc.status_code, str(exc), param="input") from exc
+    return result, references
+
+
 async def _read_json_object(request):
     try:
         body=await request.json()
@@ -2081,6 +2402,7 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
     if model_name == "auto":
         mode="auto"
 
+    messages, attachment_refs=await _prepare_attachments(messages)
     prepared=_prepare_pplx_from_messages(messages, "chat_completions")
     query=prepared["query"]
     history=prepared["history"]
@@ -2088,6 +2410,8 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
     follow_up_uuid=prepared["follow_up_uuid"]
 
     client=get_client()
+    if attachment_refs:
+        client=_AttachmentClient(client, attachment_refs)
     cid=f"chatcmpl-{uuid4().hex[:12]}"
     created=int(time.time())
 

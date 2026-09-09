@@ -3,9 +3,21 @@
 Reverse proxy for [Perplexity.ai](https://www.perplexity.ai) — use your existing **Pro/Max subscription cookie** to access all models via standard APIs.
 
 Exposes three interfaces:
-- **OpenAI-compatible REST API** (`/v1/chat/completions`) — streaming, thinking
+- **OpenAI-compatible REST API** (`/v1/chat/completions`, `/v1/responses`) — streaming, thinking
 - **MCP server** (Streamable HTTP + SSE) — 5 built-in tools
 - **Debug chat UI** (`/chat`) — test everything with real-time OpenAI format validation
+
+## Release Status (2026-09-09)
+
+This release includes image input, local file storage, and the experimental Responses function bridge in `main`. The production deployment target is Pi5, managed by `pplx-proxy.service` on port **8892**. The limitations below still apply.
+
+| Feature included in this release | Verified status |
+|---|---|
+| PNG image input | A real image request passed through the official OpenAI SDK. |
+| Local `/v1/files` storage | Upload, read, and delete work; limits are 20 MiB per file and 200 MiB total. Storing a document does not mean Perplexity can read it. |
+| Document input | **Incomplete.** After upload, Perplexity requires `/rest/sse/attachment_processing/subscribe`; Cloudflare currently returns 403. Document requests fail explicitly with HTTP 502. |
+| Responses function calling | **Experimental and unreliable.** One complete official SDK auto-selection/client-execution/stream-continuation loop passed, but a repeat returned invalid protocol output and failed. This is a prompt bridge, not native Perplexity function calling. |
+| Chat Completions function tools | Unsupported; HTTP 400. |
 
 ## How It Works
 
@@ -24,7 +36,7 @@ All queries use `search_focus: "internet"` — Perplexity's built-in web search 
 - **Response cleaning** — strips Perplexity citations `[1][2]`, `<grok:*>` tags, `<?xml?>` declarations, `<script>` tags
 - **Rate limit tracking** — tracks Pro Search quota, explicit error when the requested paid model has no remaining quota, notices at every 5th decrement
 - **Substitution notice** — if Perplexity swaps the requested model, the answer still returns with `[Substituted by Perplexity with ...]` at the end
-- **Session continuity** — tracks Perplexity `backend_uuid` so follow-up turns skip history/instructions entirely, sending only the new query
+- **Session continuity** — uses Perplexity `backend_uuid` for eligible plain-text follow-ups; explicit instructions and function conversations retain their complete context
 - **Session keep-alive** — validates at startup and every 6 hours, then persists any rotated cookie returned by Perplexity
 - **Push notifications** — [ntfy.sh](https://ntfy.sh) alerts on cookie expiry or model upgrades
 - **Debug chat UI** — `/chat` page with tools toggle, thinking toggle, streaming toggle, and **OpenAI format validator**
@@ -123,11 +135,14 @@ Tracked candidates such as Claude Haiku 4.5, Gemini 3.1 Flash Lite, and Grok 4.2
 | `GET` | `/chat` | No | **Debug chat UI with OpenAI format validator** |
 | `GET` | `/v1/models` | Yes | List tier-available models |
 | `POST` | `/v1/chat/completions` | Yes | Chat (streaming + non-streaming + thinking) |
-| `POST` | `/v1/responses` | Yes | OpenAI Responses API (stream, store, previous_response_id) |
+| `POST` | `/v1/responses` | Yes | OpenAI Responses API (stream, store, previous_response_id; experimental function bridge and image input) |
 | `GET` | `/v1/responses/{id}` | Yes | Retrieve a stored response |
 | `DELETE` | `/v1/responses/{id}` | Yes | Delete a stored response |
 | `POST` | `/v1/responses/{id}/cancel` | Yes | Cancel an in-progress background response |
 | `GET` | `/v1/responses/{id}/input_items` | Yes | List input items for a stored response |
+| `POST` / `GET` | `/v1/files` | Yes | Upload/list locally stored files |
+| `GET` / `DELETE` | `/v1/files/{id}` | Yes | Retrieve metadata/delete a stored file |
+| `GET` | `/v1/files/{id}/content` | Yes | Read stored bytes |
 | `POST` | `/<api-key>/mcp` | Key in URL | MCP Streamable HTTP |
 | `GET` | `/<api-key>/sse` | Key in URL | MCP SSE |
 | `GET` | `/admin/models` | Yes | Full model map |
@@ -141,7 +156,66 @@ Tracked candidates such as Claude Haiku 4.5, Gemini 3.1 Flash Lite, and Grok 4.2
 
 `POST /v1/responses` accepts OpenAI Responses API requests (`input`, `instructions`, `previous_response_id`, `stream`, `store`, `reasoning`, `text.format`). Responses are stored by default so you can `GET` / `DELETE` them and continue a thread with `previous_response_id`. With `store: false`, they are not retained or retrievable.
 
-Built-in web search is always on. Function calling, file search, code interpreter, computer use, image generation, and image/file inputs are rejected with an explicit error. Responses web-search tools are accepted because built-in search is always enabled. Background requests require `store: true`; only active background requests can be cancelled. Custom sampling values, output-token limits, automatic truncation, and strict JSON schemas are rejected. JSON-object and non-strict schema modes are prompt-based requests, not guaranteed structured output.
+Built-in web search is always on. Responses web-search tools are accepted because they use that existing search behavior. Background requests require `store: true`; only active background requests can be cancelled. Custom sampling values, output-token limits, automatic truncation, and strict **text-output** JSON schemas are rejected. JSON-object and non-strict text schema modes are prompt-based requests, not guaranteed structured output. File search, code interpreter, computer use, and image generation remain unsupported.
+
+Function definitions in `tools` enable an **experimental prompt-mediated bridge**. One full SDK loop succeeded, but a subsequent auto-selection test returned non-JSON output and failed with `tool_protocol_error`. Reliability is not established; passing unit and container tests verifies the proxy behavior, not model compliance. No retry or fallback hides these failures.
+
+The bridge works as follows: Perplexity proposes a JSON call, the proxy validates its name and arguments against the supplied schema, and the client application executes it. Malformed JSON, invalid arguments, or a violated tool choice produce HTTP 502 (`tool_protocol_error`), or `response.failed` after streaming has started. There is no ordinary-text fallback and the proxy never executes client functions. Streaming sends function events only after the entire upstream answer has passed validation.
+
+Function `tool_choice` supports `auto`, `required`, `none`, and `{"type":"function","name":"..."}`. `parallel_tool_calls: false` limits the result to one call. Function parameter schemas, including `strict: true`, are checked locally; this does not provide native constrained generation. Send each result as `function_call_output` with the returned `call_id`. When tool definitions are omitted on a stored continuation, the proxy preserves the function context but uses `tool_choice: "none"`; resend the definitions to enable more calls.
+
+### Function loop with the official Python SDK
+
+Set `PPLX_PROXY_BASE_URL` to your deployed proxy, including `/v1` (for this deployment, `https://pplx.0ruka.dev/v1`). Use the existing proxy API key. Function calling remains experimental; clients must handle explicit failures.
+
+```python
+import json
+import os
+from openai import OpenAI
+
+client = OpenAI(
+    base_url=os.environ["PPLX_PROXY_BASE_URL"],
+    api_key=os.environ["PPLX_PROXY_API_KEY"],
+)
+tools = [{
+    "type": "function", "name": "lookup_inventory",
+    "description": "Read the application's current stock count for a SKU.",
+    "parameters": {
+        "type": "object", "properties": {"sku": {"type": "string"}},
+        "required": ["sku"], "additionalProperties": False,
+    },
+    "strict": True,
+}]
+first = client.responses.create(
+    model="gpt", tools=tools, tool_choice="auto",
+    input="Use lookup_inventory to check the current stock count for DEMO.",
+)
+calls = [item for item in first.output if item.type == "function_call"]
+if not calls:
+    raise RuntimeError("The model did not request the inventory lookup")
+results = []
+for call in calls:
+    if call.name != "lookup_inventory":
+        raise RuntimeError("Unexpected function")
+    sku = json.loads(call.arguments)["sku"]
+    # Client-side execution; replace this sample data with your own lookup.
+    quantity = {"DEMO": 7}[sku]
+    results.append({"type": "function_call_output", "call_id": call.call_id,
+                    "output": json.dumps({"sku": sku, "quantity": quantity})})
+for event in client.responses.create(
+    model="gpt", previous_response_id=first.id, input=results, stream=True,
+):
+    if event.type == "response.output_text.delta":
+        print(event.delta, end="", flush=True)
+    elif event.type == "response.failed":
+        raise RuntimeError(event.response.error)
+```
+
+### Image and file input
+
+A real PNG input has passed an official SDK test. Use a Responses `input_image` content part alongside `input_text`. `/v1/files` accepts multipart `file` and `purpose` fields and returns a local `file_id`; its read/delete endpoints manage those stored bytes. Limits are **20 MiB per file** and **200 MiB total local storage**.
+
+Document upload and model-readable document input are different steps. Document processing must finish through Perplexity's `/rest/sse/attachment_processing/subscribe` endpoint before a query can use it. That endpoint currently receives Cloudflare 403, so document input is **not working** and returns an explicit **502**. Do not treat successful local file upload as a successful document-reading test.
 
 ### OpenAI API
 
