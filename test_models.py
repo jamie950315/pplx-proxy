@@ -3,7 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import server
 
@@ -635,7 +635,9 @@ class RefreshCookieEndpointTests(unittest.TestCase):
         async def run(cache_file):
             with patch.object(server, "COOKIE_FILE", cache_file), \
                  patch.object(server, "_client", None), \
-                 patch.object(server, "_validate_session_cookies", new=accepted):
+                 patch.object(server, "_validate_session_cookies", new=accepted), \
+                 patch.object(server, "_activate_account_model_cache"), \
+                 patch.object(server, "_refresh_live_model_catalogue", new=AsyncMock(return_value={"status": "ok"})):
                 response=await server.refresh_cookie_endpoint(self.JsonRequest())
                 self.assertEqual(response["status"], "ok")
                 self.assertIn("validated", response["message"])
