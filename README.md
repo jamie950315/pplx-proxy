@@ -83,7 +83,7 @@ docker compose up -d --build
 This starts:
 - `pplx-proxy` on `http://localhost:8892`
 - `flaresolverr` inside the Compose network at `http://flaresolverr:8191`
-- `pplx-data` volume for `.cookie_cache.json`, `.models.json`, and `.responses_store.json`
+- `pplx-data` volume for session cache, model fallback/discovery caches, uploaded files, and Responses history
 
 FlareSolverr is optional for chat, streaming, MCP, and Responses API. Without it, `/health` still reports service and cookie age, but `remaining_pro` and `remaining_research` stay `null` and quota exhaustion cannot be checked locally.
 
@@ -96,36 +96,9 @@ FlareSolverr is optional for chat, streaming, MCP, and Responses API. Without it
 
 ## Models
 
-| Model ID | Backend | Tier | Thinking Variant |
-|----------|---------|------|-----------------|
-| `auto` | Perplexity Best | free+ | — |
-| `sonar` | Sonar 2 | pro+ | — |
-| `gpt` / `gpt-5.6-terra` | GPT-5.6 Terra | pro+ | `gpt56_terra_thinking` |
-| `gpt-5.6-sol` | GPT-5.6 Sol | max | `gpt56_sol_thinking` |
-| `gpt-5.5` | GPT-5.5 | pro+ | `gpt55_thinking` |
-| `gpt-mini` | GPT-5 Mini | pro+ | — |
-| `gpt-nano` | GPT-5 Nano | pro+ | — |
-| `sonnet` / `sonnet-5` | Claude Sonnet 5 | pro+ | `claude50sonnetthinking` |
-| `sonnet-4.6` | Claude Sonnet 4.6 | pro+ | `claude46sonnetthinking` |
-| `gemini` | Gemini 3.1 Pro | pro+ | — |
-| `gemini-flash` | Gemini 3.5 Flash | pro+ | — |
-| `grok` / `grok-4.6` | Grok 4.6 | pro+ | — |
-| `grok-4.5` | Grok 4.5 | pro+ | `grok45medium` |
-| `grok-4` | Grok 4 | pro+ | — |
-| `grok-reasoning` | Grok 4.20 Reasoning | pro+ | — |
-| `grok-non-reasoning` | Grok 4.20 Non Reasoning | pro+ | — |
-| `nemotron` | Nemotron 3 Ultra | pro+ | — |
-| `nemotron-3-super` | Nemotron 3 Super | pro+ | — |
-| `glm-5.2` | GLM-5.2 | pro+ | — |
-| `kimi-k2.6` | Kimi K2.6 | pro+ | `kimik26thinking` |
-| `kimi-k3` | Kimi K3 | pro+ | — |
-| `opus` / `opus-4.8` | Claude Opus 4.8 | max | `claude48opusthinking` |
-| `opus-4.7` | Claude Opus 4.7 | max | `claude47opusthinking` |
-| `opus-4.6` | Claude Opus 4.6 | max | `claude46opusthinking` |
+The live, account-specific catalogue is the source of truth. Use authenticated `GET /v1/models` to inspect the exact IDs and names currently available to the configured Perplexity account, including newly added models and reasoning variants. Pass each returned `id` unchanged to inference; `name` is display metadata. `source` distinguishes live picker entries from configured aliases and fallback entries.
 
-Thinking variants are activated via `thinking: true` or `reasoning_effort` parameter — no separate model names needed.
-
-Tracked candidates such as Claude Haiku 4.5, Gemini 3.1 Flash Lite, and Grok 4.20 Multi-Agent remain disabled and are skipped by discovery. Custom model IDs added through `/admin/update-models` are available on Pro and Max accounts; Free accounts only expose `auto`.
+The code still provides a small static fallback map for outages and familiar aliases. Common aliases include `auto`, `gpt`, `sonnet`, `opus`, `gemini`, and `grok`; their displayed model and availability can change with discovery, account tier, or fallback status. They are not a current catalogue. Free accounts expose only `auto`; Pro and Max availability is determined from the authenticated picker when discovery succeeds. When reasoning variants are listed by the picker, their returned IDs are directly invokable. The Chat API's `thinking` and `reasoning_effort` options can also select a paired reasoning preference for supported aliases.
 
 ## API Endpoints
 
@@ -151,6 +124,10 @@ Tracked candidates such as Claude Haiku 4.5, Gemini 3.1 Flash Lite, and Grok 4.2
 | `POST` | `/admin/discover-models` | Yes | Run model discovery |
 
 ## Usage
+
+### OpenAI-compatible clients
+
+Set the base URL to `http://localhost:8892/v1` (or your HTTPS deployment), the API key to `PPLX_PROXY_API_KEY`, and choose an `id` returned by `GET /v1/models`. Streaming chat is supported. Chat Completions function tools are rejected; Responses function calls are experimental and prompt-mediated. When the picker provides both ordinary and reasoning IDs, `thinking: true` or `reasoning_effort` selects that exact paired reasoning ID; the reasoning ID is also listed directly. The proxy does not expose Perplexity's private reasoning blocks. See the API compatibility notes below.
 
 ### Responses API
 
@@ -281,11 +258,18 @@ All responses strictly match the [OpenAI Chat Completions API spec](https://plat
 
 **Use `/chat` to visually verify** — the Format ✓ tab runs 20+ checks per response.
 
-## Auto-Discovery
+## Dynamic Model Discovery
 
-Every `PROBE_INTERVAL_HOURS` (default 24h), pplx-proxy checks if models are still alive. If one dies, it increments the version number (e.g., `gpt54` → `gpt55` → ... up to +1.0, capped at 10 probes) and auto-upgrades. It also probes known new model names that are missing from a persisted `.models.json`, so newly added families such as Grok, Haiku, Flash, Mini, and Nano can be added instead of only version-bumping old IDs. Thinking variants are auto-derived from `_THINKING_MAP`.
+The proxy fetches Perplexity's authenticated web picker at `/rest/models/config/v2` using the existing session cookie and API session. The picker maps display labels and subscription tiers to the actual `model_preference` IDs accepted by the inference endpoint. The proxy exposes only choices marked as searchable and available to the authenticated account tier. Returned IDs are passed through unchanged; display names are metadata, not invocation aliases. Browser-agent, computer/ASI, and research workflow modes use different invocation protocols and are not exposed by the current `perplexity_ask` path; an unknown catalogue schema is rejected so the last known good catalogue remains active.
 
-Manual trigger: `POST /admin/discover-models`
+Discovery runs once during startup and every `PROBE_INTERVAL_HOURS` (default 24). A validated last-known-good picker is atomically cached in `DATA_DIR/.discovered_models.<account-hash>.json`; failed, unauthenticated, timed-out, or malformed refreshes retain that account's catalogue and leave `MODEL_MAP` intact rather than stripping it to fallback aliases. The cache filename contains a one-way hash, not a credential. When neither live discovery nor a cache is available, the existing `.models.json`/built-in mapping remains as a clearly marked fallback. `GET /health` reports `model_discovery` status, model counts, and detailed, sanitized stage/HTTP error diagnostics (`last_error`, e.g. `[auth_session] HTTP 401 at /api/auth/session`). `GET /v1/models` includes `name` and `source` metadata (`discovered`, `configured_alias`, or `fallback`) in addition to the OpenAI model fields. `/admin/models` shows the internal preference and source.
+
+Refresh manually with `POST /admin/discover-models` and the configured Bearer API key. The route uses the same session and picker as startup. Generic aliases such as `gpt`, `sonnet`, `opus`, `gemini`, and `grok` follow the newest matching verified picker choice; versioned aliases are kept only when their display label remains in the picker. These alias rules are explicit mappings; no inference is made from arbitrary names. Fallback aliases remain available if discovery is unavailable. Newly discovered picker IDs can be selected immediately, without rebuilding the image. The cache stores only picker metadata and timestamps, never credentials.
+
+To rebuild and redeploy after code updates:
+- **Systemd (production)**: `git pull && venv/bin/pip install -r requirements.txt && sudo systemctl restart pplx-proxy.service`
+- **Docker Compose**: `docker compose build && docker compose up -d`
+- **Verify**: `curl -fsS http://localhost:8892/health` and `curl -fsS http://localhost:8892/v1/models -H "Authorization: Bearer $PPLX_PROXY_API_KEY"`
 
 ## Configuration
 
@@ -297,9 +281,11 @@ Manual trigger: `POST /admin/discover-models`
 | `DEFAULT_MODEL` | `gpt` | Default when not specified |
 | `PPLX_PROXY_PORT` | `8892` | Listen port |
 | `DATA_DIR` | `.` | Runtime file directory for `.cookie_cache.json`, `.models.json`, and `.responses_store.json` |
+| `PROBE_DISCOVERY_ENABLED` | `true` | Enable authenticated model picker discovery |
+| `PROBE_INTERVAL_HOURS` | `24` | Picker refresh interval; must be positive |
+| `PROBE_TIMEOUT_MINUTES` | `15` | Timeout in minutes for session/catalogue requests; must be positive |
 | `CUSTOM_PROMPTS` | file | Local prompt block prepended to every LobeHub request |
 | `KEEPALIVE_HOURS` | `6` | Session ping interval |
-| `PROBE_INTERVAL_HOURS` | `24` | Auto-discovery interval |
 | `FLARESOLVERR_URL` | `http://localhost:8191` | FlareSolverr endpoint for `/health` quota data |
 | `NTFY_TOPIC` | disabled | Unique ntfy.sh topic: maximum 64 characters using letters, numbers, `_`, or `-`; the shared public `pplx-proxy` name is rejected |
 | `NTFY_URL` | `https://ntfy.sh` | ntfy server URL |

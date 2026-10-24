@@ -165,7 +165,7 @@ class DiscoveryApiTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
         old_models = dict(server.MODEL_REGISTRY.models)
-        with patch.object(server, "MODEL_DISCOVERY_ENABLED", True), \
+        with patch.object(server, "PROBE_DISCOVERY_ENABLED", True), \
              patch.object(server, "_MODEL_REFRESH_LOCK", __import__("asyncio").Lock()), \
              patch.object(server, "get_client", return_value=Client(Session())):
             auth_result = await server._refresh_live_model_catalogue(force=True)
@@ -296,7 +296,7 @@ class ComprehensiveDiscoveryRegressionTests(unittest.IsolatedAsyncioTestCase):
             async def init(self):
                 pass
 
-        with patch.object(server, "MODEL_DISCOVERY_ENABLED", True), \
+        with patch.object(server, "PROBE_DISCOVERY_ENABLED", True), \
              patch.object(server, "_MODEL_REFRESH_LOCK", __import__("asyncio").Lock()), \
              patch.object(server, "get_client", return_value=FakeClient()), \
              patch.object(server, "API_KEY", "secret"):
@@ -341,7 +341,7 @@ class ComprehensiveDiscoveryRegressionTests(unittest.IsolatedAsyncioTestCase):
             async def init(self):
                 pass
 
-        with patch.object(server, "MODEL_DISCOVERY_ENABLED", True), \
+        with patch.object(server, "PROBE_DISCOVERY_ENABLED", True), \
              patch.object(server, "_MODEL_REFRESH_LOCK", __import__("asyncio").Lock()), \
              patch.object(server, "get_client", return_value=FakeClient()):
             res = await server._refresh_live_model_catalogue(force=True)
@@ -388,7 +388,7 @@ class ComprehensiveDiscoveryRegressionTests(unittest.IsolatedAsyncioTestCase):
             async def init(self):
                 pass
 
-        with patch.object(server, "MODEL_DISCOVERY_ENABLED", True), \
+        with patch.object(server, "PROBE_DISCOVERY_ENABLED", True), \
              patch.object(server, "_MODEL_REFRESH_LOCK", __import__("asyncio").Lock()), \
              patch.object(server, "get_client", return_value=FakeClient()):
             res = await server._refresh_live_model_catalogue(force=True)
@@ -421,7 +421,7 @@ class ComprehensiveDiscoveryRegressionTests(unittest.IsolatedAsyncioTestCase):
             async def init(self):
                 pass
 
-        with patch.object(server, "MODEL_DISCOVERY_ENABLED", True), \
+        with patch.object(server, "PROBE_DISCOVERY_ENABLED", True), \
              patch.object(server, "_MODEL_REFRESH_LOCK", __import__("asyncio").Lock()), \
              patch.object(server, "get_client", return_value=FakeClient()):
             res = await server._refresh_live_model_catalogue(force=True)
@@ -463,14 +463,14 @@ class ComprehensiveDiscoveryRegressionTests(unittest.IsolatedAsyncioTestCase):
             async def init(self):
                 pass
 
-        with patch.object(server, "MODEL_DISCOVERY_ENABLED", True), \
+        with patch.object(server, "PROBE_DISCOVERY_ENABLED", True), \
              patch.object(server, "_MODEL_REFRESH_LOCK", __import__("asyncio").Lock()), \
              patch.object(server, "get_client", return_value=FakeClient(GoodSession())):
             good_res = await server._refresh_live_model_catalogue(force=True)
             self.assertEqual(good_res["status"], "ok")
             self.assertIn("m1", server.MODEL_MAP)
 
-        with patch.object(server, "MODEL_DISCOVERY_ENABLED", True), \
+        with patch.object(server, "PROBE_DISCOVERY_ENABLED", True), \
              patch.object(server, "_MODEL_REFRESH_LOCK", __import__("asyncio").Lock()), \
              patch.object(server, "get_client", return_value=FakeClient(BadSession())):
             bad_res = await server._refresh_live_model_catalogue(force=True)

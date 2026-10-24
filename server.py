@@ -517,18 +517,18 @@ def get_model_map() -> dict:
     return {k: v for k, v in MODEL_MAP.items() if not check_tier(k)}
 
 MODEL_MAP=load_model_map()
-_MODEL_DISCOVERY_ENABLED_RAW=os.getenv("MODEL_DISCOVERY_ENABLED", "true").lower()
-if _MODEL_DISCOVERY_ENABLED_RAW not in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
-    raise ValueError("MODEL_DISCOVERY_ENABLED must be a boolean")
-MODEL_DISCOVERY_ENABLED=_MODEL_DISCOVERY_ENABLED_RAW in {"1", "true", "yes", "on"}
-MODEL_DISCOVERY_INTERVAL_HOURS=float(os.getenv("MODEL_DISCOVERY_INTERVAL_HOURS", "24"))
-MODEL_DISCOVERY_TIMEOUT=float(os.getenv("MODEL_DISCOVERY_TIMEOUT", "15"))
-if MODEL_DISCOVERY_INTERVAL_HOURS <= 0 or MODEL_DISCOVERY_TIMEOUT <= 0:
-    raise ValueError("MODEL_DISCOVERY_INTERVAL_HOURS and MODEL_DISCOVERY_TIMEOUT must be positive")
+_PROBE_DISCOVERY_ENABLED_RAW=os.getenv("PROBE_DISCOVERY_ENABLED", "true").lower()
+if _PROBE_DISCOVERY_ENABLED_RAW not in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
+    raise ValueError("PROBE_DISCOVERY_ENABLED must be a boolean")
+PROBE_DISCOVERY_ENABLED=_PROBE_DISCOVERY_ENABLED_RAW in {"1", "true", "yes", "on"}
+PROBE_INTERVAL_HOURS=float(os.getenv("PROBE_INTERVAL_HOURS", "24"))
+PROBE_TIMEOUT_MINUTES=float(os.getenv("PROBE_TIMEOUT_MINUTES", "15"))
+if PROBE_INTERVAL_HOURS <= 0 or PROBE_TIMEOUT_MINUTES <= 0:
+    raise ValueError("PROBE_INTERVAL_HOURS and PROBE_TIMEOUT_MINUTES must be positive")
 MODEL_REGISTRY=DiscoveredModelRegistry(MODELS_FILE.with_name(".discovered_models.pending.json"), {
     key: {"mode": value[0], "pref": value[1], "source": "fallback"}
     for key, value in MODEL_MAP.items()
-}, int(MODEL_DISCOVERY_INTERVAL_HOURS * 3600))
+}, int(PROBE_INTERVAL_HOURS * 3600))
 _MODEL_REFRESH_LOCK=asyncio.Lock()
 
 def _install_discovered_models(discovered: dict):
@@ -600,7 +600,7 @@ def _activate_account_model_cache(client):
     path=MODELS_FILE.with_name(f".discovered_models.{digest}.json")
     if MODEL_REGISTRY.cache_path == path:
         return
-    MODEL_REGISTRY=DiscoveredModelRegistry(path, MODEL_REGISTRY.fallback, int(MODEL_DISCOVERY_INTERVAL_HOURS * 3600))
+    MODEL_REGISTRY=DiscoveredModelRegistry(path, MODEL_REGISTRY.fallback, int(PROBE_INTERVAL_HOURS * 3600))
     if MODEL_REGISTRY.account_tier in {"free", "pro", "max"}:
         global ACCOUNT_TYPE
         ACCOUNT_TYPE=MODEL_REGISTRY.account_tier
@@ -3052,7 +3052,7 @@ async def _refresh_live_model_catalogue(force=True):
 async def _refresh_live_model_catalogue_impl(force=True):
     """Fetch the authenticated picker with the existing Perplexity session."""
     global ACCOUNT_TYPE
-    if not MODEL_DISCOVERY_ENABLED:
+    if not PROBE_DISCOVERY_ENABLED:
         return {"status": "disabled", **MODEL_REGISTRY.status()}
     stage="session_init"
     try:
@@ -3062,7 +3062,7 @@ async def _refresh_live_model_catalogue_impl(force=True):
         _activate_account_model_cache(client)
         headers={"accept": "application/json", "x-app-apiversion": PPLX_API_VERSION}
         stage="auth_session"
-        session_response=await client.session.get(AUTH_SESSION_URL, headers=headers, timeout=MODEL_DISCOVERY_TIMEOUT)
+        session_response=await client.session.get(AUTH_SESSION_URL, headers=headers, timeout=PROBE_TIMEOUT_MINUTES)
         session_response.raise_for_status()
         session_payload=session_response.json()
         user=session_payload.get("user") if isinstance(session_payload, dict) else None
@@ -3075,7 +3075,7 @@ async def _refresh_live_model_catalogue_impl(force=True):
         stage="model_config"
         response=await client.session.get(MODEL_CONFIG_URL,
             params={"version": PPLX_API_VERSION, "source": "default"},
-            headers=headers, timeout=MODEL_DISCOVERY_TIMEOUT)
+            headers=headers, timeout=PROBE_TIMEOUT_MINUTES)
         response.raise_for_status()
         payload=response.json()
         stage="catalogue_parse"
@@ -3145,7 +3145,6 @@ async def get_models_admin(_=Depends(verify_api_key)):
 # ─── Session Keep-Alive ────────────────────────────────────────────────────
 
 KEEPALIVE_HOURS=int(os.getenv("KEEPALIVE_HOURS", "6"))
-PROBE_INTERVAL_HOURS=int(os.getenv("PROBE_INTERVAL_HOURS", "24"))
 
 def _normalize_ntfy_topic(value: str) -> str:
     """Accept only private topic names that conform to ntfy's documented format."""
