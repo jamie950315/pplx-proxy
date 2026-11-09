@@ -55,7 +55,7 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);height:100vh
 <body>
 <div class="hdr">
 <h1>pplx-proxy debug</h1>
-<select id="mdl"><option value="gpt">gpt</option><option value="gpt-5.6-terra">gpt-5.6-terra</option><option value="gpt-5.6-sol">gpt-5.6-sol</option><option value="gpt-5.5">gpt-5.5</option><option value="gpt-mini">gpt-mini</option><option value="gpt-nano">gpt-nano</option><option value="sonnet" selected>sonnet</option><option value="sonnet-5">sonnet-5</option><option value="sonnet-4.6">sonnet-4.6</option><option value="gemini">gemini</option><option value="gemini-flash">gemini-flash</option><option value="grok">grok</option><option value="grok-4.6">grok-4.6</option><option value="grok-4.5">grok-4.5</option><option value="grok-4">grok-4</option><option value="grok-reasoning">grok-reasoning</option><option value="grok-non-reasoning">grok-non-reasoning</option><option value="nemotron">nemotron</option><option value="nemotron-3-super">nemotron-3-super</option><option value="glm-5.2">glm-5.2</option><option value="kimi-k2.6">kimi-k2.6</option><option value="kimi-k3">kimi-k3</option><option value="sonar">sonar</option><option value="auto">auto</option><option value="opus">opus</option><option value="opus-4.8">opus-4.8</option><option value="opus-4.7">opus-4.7</option><option value="opus-4.6">opus-4.6</option></select>
+<select id="mdl"><option value="">Load model list</option></select>
 <label><input type="checkbox" id="thk">thinking</label>
 <label><input type="checkbox" id="str" checked>stream</label>
 <button id="tlb" onclick="tglTools()" style="background:var(--border)">Test unsupported tools OFF</button>
@@ -93,6 +93,17 @@ const B=location.origin,TOOLS=[
 ];
 let H=[],tl=false;
 const $=id=>document.getElementById(id);
+async function loadModels(){
+if(typeof fetch!=='function')return;
+const selected=$('mdl').value,headers={};if($('key').value)headers.Authorization='Bearer '+$('key').value;
+try{const r=await fetch(B+'/v1/models',{headers});if(!r.ok)throw new Error('HTTP '+r.status);const data=await r.json();
+const select=$('mdl');select.replaceChildren();for(const model of data.data||[]){const option=document.createElement('option');option.value=model.id;option.textContent=(model.name||model.id)+' · '+model.id;select.append(option)}
+if(!select.options.length){select.add(new Option('No models available',''));return}
+select.value=[...select.options].some(option=>option.value===selected)?selected:select.options[0].value;
+$('dm').textContent=(data.data||[]).length+' models';
+}catch(error){$('mdl').replaceChildren(new Option('Enter API key or check proxy access',''));$('dm').textContent='Model list unavailable'}
+}
+$('key').onchange=loadModels;$('mdl').onfocus=loadModels;
 $('inp').onkeydown=e=>{if(e.key==='Enter')go()};
 function L(t){$('db').textContent+=t+'\n';$('db').scrollTop=9e9}
 function E(s){return(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}

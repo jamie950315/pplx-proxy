@@ -2,6 +2,7 @@
 .env
 .cookie_cache.json
 .models.json
+.discovered_models.*.json
 CUSTOM_PROMPTS
 .prompt_whitelist.txt
 __pycache__/
