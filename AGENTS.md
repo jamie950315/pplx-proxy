@@ -4,15 +4,13 @@
 
 `pplx-proxy` is a self-hosted reverse proxy for Perplexity.ai. Uses your Pro/Max subscription cookie to access all models through OpenAI-compatible REST API and MCP server.
 
-## Current Work and Deployment (2026-11-09)
+## Current Features and Limitations
 
-- Deployed application commit: `6c5994d` on Pi5, `pplx-proxy.service`, port **8892**. Release includes authenticated picker discovery (PR #1), image input, local file storage, and the experimental Responses function bridge.
-- PR #1 is merged into `main`, preserving the contributor commits. Rollback baseline is `5e40b65`; requirements were unchanged. Use isolated runtime data and a separate localhost port for further testing.
-- Pi5 rollout checks at localhost passed: live picker discovery (11 exact IDs; 40 API entries), health/models/Chat/streaming/Responses smoke checks, and nine non-streaming requests (six new friendly IDs plus `gpt`, `sonnet`, `grok`) with matching upstream `actual_model`. The verified service invocation had no traceback or substitution warnings. Existing persisted aliases remain `gpt56_terra`, `claude50sonnet`, and `grok46low`; credentials/configuration were preserved.
-- Earlier attachment-release public checks (2026-09-09) passed at `https://pplx.0ruka.dev`: ordinary Chat, streaming Chat, Responses, official SDK Chat/Responses PNG input, and Files create/retrieve/delete. Perplexity substituted `gpt56_terra` with `gpt5_nano` during the image checks; image recognition still passed. Existing credentials were preserved.
-- `/v1/files` local upload/read/delete passed; limits are 20 MiB per file and 200 MiB total. Local storage success is not proof of upstream document reading.
+Read `.local/` if present for maintainer deployment notes; keep personal deployment details there, never in tracked files.
+
+- `/v1/files` provides local upload/read/delete; limits are 20 MiB per file and 200 MiB total. Local storage success is not proof of upstream document reading.
 - Documents remain **incomplete**: upstream upload must be followed by `/rest/sse/attachment_processing/subscribe` and confirmed completion. Cloudflare currently returns 403; document requests explicitly fail with 502. Do not report document support as complete.
-- Responses function bridge is **experimental and unreliable**. One official SDK auto-selection/client-execution/stream-continuation loop passed; a repeat returned non-JSON output and correctly failed with `response.failed` / `tool_protocol_error`, so SDK `get_final_response()` had no completed response. It is **prompt-mediated**, not native Perplexity function calling. Do not claim stable or completed support; do not add fallback or automatic retry to hide failures.
+- Responses function bridge is **experimental and unreliable**. It is **prompt-mediated**, not native Perplexity function calling; invalid output fails with `response.failed` / `tool_protocol_error`. Do not add fallback or automatic retry to hide failures.
 - Invalid protocol JSON/schema/tool choices fail with 502 (`tool_protocol_error`) or `response.failed`; never fall back to successful text. Function streams wait for complete validation before emitting callable items. Never execute client functions in the proxy.
 - Chat Completions function tools still return 400. When a stored function continuation omits tool definitions, preserve the full context and effective definitions but use `tool_choice: none`. Explicitly resend definitions to enable further calls.
 
@@ -38,7 +36,7 @@ FastAPI app (`server.py`) with focused attachment, file-storage, and function-pr
 
 **Model Map**: dict of `{model_id: (mode, internal_pref)}`. An authenticated picker catalogue augments the persisted `.models.json`/built-in compatibility map; exact upstream IDs and supported friendly aliases are exposed. Explicit persisted/admin mappings survive refresh/restart. Built-in defaults follow verified matching families; old IDs remain usable even when Perplexity substitutes them. Picker tiers/metadata take precedence for verified entries. Discovery caches are account-keyed `DATA_DIR/.discovered_models.<hash>.json`, atomically written with mode 0600 and no credentials.
 
-**Current discovery release**: PR #1 and lifecycle/configuration fixes are merged into `main` and deployed at `6c5994d`. Six verified friendly IDs are `gpt-6.1-sol` → `gpt6_1_sol`, `gemini-3.8-flash` → `gemini38flash`, `sonnet-5.5` → `claude55sonnet`, `glm-5.3` → `glm_5_3_thinking`, `grok-4.7` → `grok47`, and `nemotron-3.5-super-vl` → `nv_nemotron_3_5_super`. Defaults `gpt`, `sonnet`, `gemini-flash`, `grok`, and `nemotron` use these new generations; explicit persisted mappings are not rewritten.
+**Current discovery release**: PR #1 and lifecycle/configuration fixes are merged into `main`. Six verified friendly IDs are `gpt-6.1-sol` → `gpt6_1_sol`, `gemini-3.8-flash` → `gemini38flash`, `sonnet-5.5` → `claude55sonnet`, `glm-5.3` → `glm_5_3_thinking`, `grok-4.7` → `grok47`, and `nemotron-3.5-super-vl` → `nv_nemotron_3_5_super`. Defaults `gpt`, `sonnet`, `gemini-flash`, `grok`, and `nemotron` use these new generations; explicit persisted mappings are not rewritten.
 
 **Thinking Variants**: activated via `thinking: true` or `reasoning_effort != "none"`. Uses exact picker pairings (e.g., `gpt → gpt6_1_sol_thinking`, `sonnet → claude55sonnetthinking`); never derive a suffix for a picker-verified model. A verified base without a reasoning pair rejects thinking requests with HTTP 400. Reasoning-only IDs are directly invokable. Perplexity does NOT expose internal thinking blocks — `reasoning_content` is populated from search steps (queries, URLs, plan goals).
 
@@ -60,7 +58,7 @@ attachments.py       # Resolve/upload attachments and wait for upstream document
 file_store.py        # Bounded local /v1/files storage
 function_tools.py    # Validate prompt-mediated function proposals; never executes tools
 static/chat.html     # Debug chat UI with OpenAI format validator
-inject_cookie.sh     # Helper to inject cookie + restart
+inject_cookie.sh     # Helper to validate and inject cookie into running service
 test.sh              # Smoke test
 pplx-proxy.service   # systemd unit
 .env.example         # All config params
@@ -137,7 +135,7 @@ Validates: empty query, invalid model, invalid sources, tier restrictions.
 
 ## Discovery Transport and Limits
 
-The picker reuses the live client's cookies, TLS impersonation and User-Agent, with same-origin AJAX headers: `Origin`, `Referer`, `sec-fetch-dest: empty`, `sec-fetch-mode: cors`, and `sec-fetch-site: same-origin`. Leave HTTP negotiation to curl_cffi. On Mac and Pi5, navigation metadata returned Cloudflare 403; AJAX metadata over HTTP/2 returned 200. Forced HTTP/1.1 also returned 403. Do not add another provider, browser bypass, or silent retry path.
+The picker reuses the live client's cookies, TLS impersonation and User-Agent, with same-origin AJAX headers: `Origin`, `Referer`, `sec-fetch-dest: empty`, `sec-fetch-mode: cors`, and `sec-fetch-site: same-origin`. Leave HTTP negotiation to curl_cffi. Navigation metadata and forced HTTP/1.1 have returned Cloudflare 403; same-origin AJAX metadata has succeeded over HTTP/2. Do not add another provider, browser bypass, or silent retry path.
 
 New search-mode picker IDs are immediately selectable, without modifying the static registry. Non-search modes use other protocols and remain excluded. The legacy inference-probe helpers are retained for explicit diagnostics/tests, not automatic discovery. Their bounded numeric patterns cannot find arbitrary names or changed suffixes; alive/substituted models do not trigger version upgrades. Picker/cache failures must stay visible in health/logs even while compatibility models continue working.
 
@@ -294,7 +292,7 @@ Client Response
 2. Messages parsed: `system` → `system_msg`, `user` → `history[]`
 3. System prompt filter: only whitelist-approved lines kept
 4. Query assembled as JSON: `{"instructions":[...],"query":"NVDA stock price"}`
-5. Sent to Perplexity with `search_focus: "internet"`, `model_preference: "claude46sonnet"`
+5. Sent to Perplexity with `search_focus: "internet"`, `model_preference: "claude55sonnet"`
 6. Response parsed from SSE blocks, cleaned, returned as `chat.completion` JSON
 
 **Simplest path — no special handling needed.**
@@ -419,7 +417,7 @@ POST https://www.perplexity.ai/rest/sse/perplexity_ask
   "params": {
     "search_focus": "internet",          ← CRITICAL: enables search results in answer
     "mode": "copilot",                   ← "concise" for auto model only
-    "model_preference": "claude46sonnet", ← internal Perplexity model ID
+    "model_preference": "claude55sonnet", ← internal Perplexity model ID
     "sources": ["web"],
     "use_schematized_api": true,
     "supported_block_use_cases": ["answer_modes", "finance_widgets", ...],
@@ -444,13 +442,11 @@ Perplexity returns SSE events containing `blocks[]` with these types:
 | `sources_answer_mode` | Citation sources | Currently ignored |
 
 
-## Review and Validation (2026-09-09)
+## Review and Validation
 
 - `store=false` Responses are not retained. Corrupt runtime stores and write failures surface as errors.
 - Health checks return cached quota immediately and schedule stale refreshes without waiting for a browser. Check `flaresolverr.status` and `last_error` for quota-fetch failures.
-- This release includes verified PNG input and local file storage. Responses function proposals remain experimental after a successful loop and a failed repeat; document input still fails during upstream processing. Chat function tools remain 400. Custom sampling/output limits and strict text-output schema enforcement are rejected; function parameter validation is separate.
+- Image input and local file storage are supported. Responses function proposals remain experimental; document input still fails during upstream processing. Chat function tools remain 400. Custom sampling/output limits and strict text-output schema enforcement are rejected; function parameter validation is separate.
 - Upstream streams must terminate correctly; interrupted or malformed streams fail. Resources and background tasks close on shutdown. MCP is a required dependency; incompatible installations fail at startup.
 - Prompt bodies are logged only at DEBUG. Docker excludes cookies, response history, and browser state.
-- Pre-release feature verification: 147 Python tests and 7 Node tests passed locally; Docker build and its 147 Python tests passed. Isolated ordinary Chat, streaming, and Responses smoke checks passed. These tests validate proxy behavior, not model protocol compliance, and do not remove the document-processing blocker or the observed function reliability failure.
 - Verify with `venv/bin/python -m unittest discover`, `node --test test_chat.js`, `venv/bin/python -m compileall -q server.py smoke_test.py`, Docker build, and `./test.sh URL` against an isolated service connected to Perplexity.
-- Deploy `main` to Pi5 via `pplx-proxy.service` on port 8892. Production rollout verification must cover ordinary Chat, streaming, and Responses, with existing credentials preserved. Use isolated runtime data and a separate localhost port for further feature tests.

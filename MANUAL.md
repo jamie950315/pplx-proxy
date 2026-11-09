@@ -4,9 +4,9 @@ A comprehensive guide to installing, configuring, and using pplx-proxy — a sel
 
 ---
 
-## Current Deployment and Branch Status (2026-09-09)
+## Feature limitations
 
-This release includes image input, local file storage, and the experimental Responses function bridge in `main`. The production deployment target is Pi5, managed by `pplx-proxy.service` on port **8892**. A real PNG input passed an official OpenAI SDK test. One complete Responses function loop also passed, but a repeated auto-selection test failed because the model returned non-JSON output; the prompt bridge remains experimental and unreliable. Local file upload/read/delete works, but document reading is **incomplete**: Perplexity's attachment-processing subscription currently receives Cloudflare 403, and the proxy reports HTTP 502.
+Image input and local file storage are supported. Document input depends on an upstream processing endpoint that has returned Cloudflare 403; processing failures return HTTP 502. The Responses function bridge is experimental and prompt-mediated, and invalid output fails explicitly.
 
 ## Table of Contents
 
@@ -35,7 +35,7 @@ This release includes image input, local file storage, and the experimental Resp
 
 pplx-proxy is a FastAPI application that sits between your application and Perplexity.ai's web backend. Instead of using Perplexity's official (paid) API, it authenticates with your existing Pro or Max subscription cookie, translates requests into Perplexity's internal SSE protocol, and exposes the result through industry-standard interfaces.
 
-This gives you account-specific access to GPT-6.1 Sol, Claude Sonnet 5.5, Gemini 3.8 Flash, Grok 4.7, GLM-5.3, Nemotron 3.5 Super VL, and other models Perplexity offers — all through the same API format your tools already speak.
+Depending on account and upstream availability, this provides access to GPT-6.1 Sol, Claude Sonnet 5.5, Gemini 3.8 Flash, Grok 4.7, GLM-5.3, Nemotron 3.5 Super VL, and other models Perplexity offers — all through the same API format your tools already speak.
 
 Three interfaces are available:
 
@@ -93,7 +93,7 @@ pplx-proxy authenticates by replaying the session cookie from your browser.
 PPLX_COOKIE=eyJhbGciOiJkaX...your_token_here...
 ```
 
-The cookie typically stays valid for 7+ days. pplx-proxy keeps it alive with automatic periodic pings.
+Cookie validity is controlled by Perplexity. The proxy periodically validates the session and persists rotated cookies.
 
 ---
 
@@ -107,7 +107,9 @@ All settings live in the `.env` file. Here is the full reference:
 | `PPLX_PROXY_API_KEY` | *(empty)* | Bearer token for API auth. If empty, no authentication is required |
 | `ACCOUNT_TYPE` | `pro` | Your subscription tier: `free`, `pro`, or `max` |
 | `DEFAULT_MODEL` | `gpt` | Model used when no model is specified in the request |
-| `PPLX_PROXY_PORT` | `8892` | Port to listen on |
+| `PPLX_PROXY_PORT` | `8892` | Port used by the built-in runner and Compose host mapping; pass `--port` explicitly to uvicorn |
+| `DATA_DIR` | project directory | Runtime cookie, model and response stores, discovery caches, and uploads |
+| `FLARESOLVERR_URL` | `http://localhost:8191` | Endpoint for quota data |
 | `KEEPALIVE_HOURS` | `6` | Interval between session validation and cookie-rotation persistence |
 | `PROBE_DISCOVERY_ENABLED` | `true` | Fetch authenticated picker at startup and schedule refreshes |
 | `PROBE_INTERVAL_HOURS` | `24` | Positive interval between picker refreshes |
@@ -121,12 +123,6 @@ All settings live in the `.env` file. Here is the full reference:
 | `USER_AGENT` | Chrome 130 string | HTTP User-Agent header |
 | `COOKIE_MAX_AGE_HOURS` | `168` | Maximum age before cookie cache is considered stale |
 | `LOG_LEVEL` | `INFO` | Python logging level |
-
-On macOS, copy the configured private topic without exposing it or adding a trailing newline:
-
-```bash
-ssh YOUR_PI 'value=$(sed -n "s/^NTFY_TOPIC=//p" ~/pplx-proxy/.env); printf %s "$value"' | pbcopy
-```
 
 ---
 
@@ -218,7 +214,7 @@ This table describes built-in compatibility defaults, not the current upstream c
 
 Static candidates such as Haiku or Multi-Agent remain disabled unless verified picker entries make their actual upstream IDs available. Custom IDs are available on Pro/Max accounts; Free accounts expose only `auto`.
 
-Discovery uses the existing authenticated AsyncSession with same-origin AJAX metadata, not navigation headers. Mac/Pi5 checks returned picker 200 over negotiated HTTP/2; navigation metadata or forced HTTP/1.1 returned Cloudflare 403. A failed refresh preserves the private last-known-good cache and reports `/health.model_discovery.last_error` plus a warning. No automatic inference fallback conceals the failure. Cache files are `DATA_DIR/.discovered_models.<account-hash>.json`, atomically written with mode 0600 and without credentials. Disable discovery with `PROBE_DISCOVERY_ENABLED=false`; no periodic task is started.
+Discovery uses the existing authenticated AsyncSession with same-origin AJAX metadata, not navigation headers. Navigation metadata and forced HTTP/1.1 have returned Cloudflare 403; retain normal HTTP negotiation. A failed refresh preserves the private last-known-good cache and reports `/health.model_discovery.last_error` plus a warning. No automatic inference fallback conceals the failure. Cache files are `DATA_DIR/.discovered_models.<account-hash>.json`, atomically written with mode 0600 and without credentials. Disable discovery with `PROBE_DISCOVERY_ENABLED=false`; no periodic task is started.
 
 The retained numeric-probe helpers are only explicit diagnostics/tests. They cannot discover arbitrary names, changed suffixes, or new families; only the picker provides general name discovery.
 
@@ -228,6 +224,7 @@ The retained numeric-probe helpers are only explicit diagnostics/tests. They can
 |--------|------|------|-------------|
 | GET | `/health` | No | Health check + cookie age |
 | GET | `/chat` | No | Debug chat UI |
+| GET | `/debug` | No | Redirect to `/chat` |
 | GET | `/v1/models` | Bearer | List available models |
 | POST | `/v1/chat/completions` | Bearer | Chat completions |
 | POST | `/v1/responses` | Bearer | OpenAI Responses API create; image input and experimental function bridge |
@@ -247,7 +244,7 @@ The retained numeric-probe helpers are only explicit diagnostics/tests. They can
 
 ### Authentication
 
-**REST API:** pass your API key as a Bearer token:
+**REST API:** when `PPLX_PROXY_API_KEY` is set, pass it as a Bearer token; an empty key disables REST authentication:
 ```
 Authorization: Bearer YOUR_KEY
 ```
@@ -480,7 +477,7 @@ File search, code interpreter, computer use, image generation, and encrypted rea
 
 #### Experimental Responses function calling
 
-The proxy provides **prompt-mediated Responses function calling**, not native Perplexity tools. One official SDK run passed automatic tool selection, execution by the client application, and a streamed continuation. A repeat returned non-JSON output and produced `response.failed` / `tool_protocol_error`; SDK `get_final_response()` could not return a completed response. This remains experimental, with insufficient reliability for a completed support claim. Unit tests and Docker checks validate error handling and protocol behavior, not model compliance. There is no automatic retry to conceal this limitation. Perplexity produces a JSON proposal; the proxy validates the complete envelope, function name, tool choice, and argument schema before returning any callable item. The proxy does not execute functions.
+The proxy provides **prompt-mediated Responses function calling**, not native Perplexity tools. Invalid protocol output produces `response.failed` / `tool_protocol_error`. Reliability depends on the upstream model. There is no automatic retry to conceal this limitation. Perplexity produces a JSON proposal; the proxy validates the complete envelope, function name, tool choice, and argument schema before returning any callable item. The proxy does not execute functions.
 
 - Define functions using Responses `tools` entries with `type`, `name`, `description`, and `parameters` (JSON schema). Explicit `strict: true` requires strict schema constraints and is validated locally, not by native constrained generation.
 - Use `tool_choice: "auto"`, `"required"`, `"none"`, or `{"type":"function","name":"lookup_inventory"}`. Set `parallel_tool_calls: false` for at most one call.
@@ -494,7 +491,7 @@ See the [minimal SDK function loop](README.md#function-loop-with-the-official-py
 
 #### Images and local files
 
-A real **PNG image** request passed through the official OpenAI SDK. Responses image input uses `input_image` alongside `input_text`; Chat Completions uses its `image_url` content shape. This result establishes PNG input, not every image format or document type.
+Responses image input uses `input_image` alongside `input_text`; Chat Completions uses its `image_url` content shape.
 
 `POST /v1/files` accepts multipart `file` and `purpose` fields and returns a local file ID. `GET /v1/files/{id}` reads metadata, `GET /v1/files/{id}/content` reads bytes, and `DELETE /v1/files/{id}` removes the file. Limits are **20 MiB per file** and **200 MiB total local storage**. Successful local storage does not establish that Perplexity can parse the file.
 
@@ -665,6 +662,8 @@ There is no longer a `User's current request:` prefix or labeled text block asse
 
 ### systemd Service
 
+Edit the included unit to match your user, installation paths and port before installing it.
+
 ```bash
 sudo cp pplx-proxy.service /etc/systemd/system/
 sudo systemctl daemon-reload
@@ -703,10 +702,10 @@ Browser login
   -> Set PPLX_COOKIE in .env (the value of the `__Secure-next-auth.session-token` cookie from your Perplexity browser session)
   -> pplx-proxy starts
   -> Keep-alive pings every 6h
-  -> Cookie stays alive indefinitely
+  -> Persist rotated cookie; validity remains controlled by Perplexity
   -> (If Perplexity revokes)
   -> ntfy push notification
-  -> Re-inject via /admin/refresh-cookie or update .env + restart
+  -> Re-inject through /admin/refresh-cookie or ./inject_cookie.sh
 ```
 
 Cookie age is reported in `/health`:
@@ -738,7 +737,7 @@ This is the most critical issue in pplx-proxy. There are three independent cause
 
 **Cause 3: System prompts arriving as `role: user`.** Some clients (notably LobeHub) send the user's custom system prompt as a `role: user` message instead of `role: system`. The proxy detects these with system-prompt keywords, reclassifies them as system content, and keeps them out of `history`. For LobeHub, the reclassified prompt is used only for source detection and is never forwarded to Perplexity.
 
-**Cause 4: Missing local prompt injection for LobeHub.** If `CUSTOM_PROMPTS` is empty, missing, or not included in `instructions`, LobeHub turns will lose the local behavior you expect. Fix: ensure `/home/jamie/pplx-proxy/CUSTOM_PROMPTS` exists and logs show `custom_prompts_loaded=true` for LobeHub requests.
+**Cause 4: Missing local prompt injection for LobeHub.** If `CUSTOM_PROMPTS` is empty, missing, or not included in `instructions`, LobeHub turns will lose the local behavior you expect. Fix: ensure `CUSTOM_PROMPTS` exists in the project directory and logs show `custom_prompts_loaded=true` for LobeHub requests.
 
 **How to diagnose:** Check server logs for `PROMPT DEBUG` and `PPLX REQUEST QUERY`. Generic clients should show whitelist-filtered `instructions`. LobeHub should show `instructions=[CUSTOM_PROMPTS]` on every turn, plus `history` and `query` as applicable.
 
@@ -758,9 +757,9 @@ Hard-refresh the `/chat` page (Ctrl+Shift+R). The page has no-cache headers but 
 
 ## 19. Known Limitations
 
-- **Function calling is experimental and unreliable** — one complete SDK loop passed, but a repeated auto-selection run returned invalid protocol output. Only Responses has the bridge; Chat function tools remain HTTP 400. Invalid proposals fail with HTTP 502 or `response.failed`; no fallback or automatic retry is added.
+- **Function calling is experimental and unreliable** — upstream responses may contain invalid protocol output. Only Responses has the bridge; Chat function tools remain HTTP 400. Invalid proposals fail with HTTP 502 or `response.failed`; no fallback or automatic retry is added.
 - **Document input is incomplete** — Cloudflare 403 blocks upstream processing subscription; document-reading requests fail with HTTP 502 despite successful local upload.
-- **Image verification is limited to PNG** — a real SDK PNG request passed; do not generalize this to every media format.
+- **Image and document inputs differ** — local file storage does not guarantee upstream document processing.
 - **Citation stripping** removes `[N]` patterns from ordinary text, which may affect content like `array[0]`. Function arguments are preserved without this cleaning.
 - **Context window**: 96K char total query limit (~32K tokens).
 - **Perplexity API changes** may break the proxy without notice. Picker discovery can find new searchable names only while its schema, authentication and Cloudflare access remain compatible; failures are visible and retain cached/configured models.

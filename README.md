@@ -7,17 +7,11 @@ Exposes three interfaces:
 - **MCP server** (Streamable HTTP + SSE) — 5 built-in tools
 - **Debug chat UI** (`/chat`) — test everything with real-time OpenAI format validation
 
-## Release Status (2026-09-09)
+## Feature limitations
 
-This release includes image input, local file storage, and the experimental Responses function bridge in `main`. The production deployment target is Pi5, managed by `pplx-proxy.service` on port **8892**. The limitations below still apply.
-
-| Feature included in this release | Verified status |
-|---|---|
-| PNG image input | A real image request passed through the official OpenAI SDK. |
-| Local `/v1/files` storage | Upload, read, and delete work; limits are 20 MiB per file and 200 MiB total. Storing a document does not mean Perplexity can read it. |
-| Document input | **Incomplete.** After upload, Perplexity requires `/rest/sse/attachment_processing/subscribe`; Cloudflare currently returns 403. Document requests fail explicitly with HTTP 502. |
-| Responses function calling | **Experimental and unreliable.** One complete official SDK auto-selection/client-execution/stream-continuation loop passed, but a repeat returned invalid protocol output and failed. This is a prompt bridge, not native Perplexity function calling. |
-| Chat Completions function tools | Unsupported; HTTP 400. |
+- Local `/v1/files` storage is limited to 20 MiB per file and 200 MiB total. Storage does not establish that Perplexity can read a document.
+- Document processing requires an upstream subscription endpoint that has returned Cloudflare 403; failures are surfaced as HTTP 502.
+- Responses function calling is experimental and prompt-mediated; invalid output fails explicitly. Chat Completions function tools are unsupported (HTTP 400).
 
 ## How It Works
 
@@ -32,13 +26,13 @@ All queries use `search_focus: "internet"` — Perplexity's built-in web search 
 - **Full OpenAI format compliance** — `system_fingerprint`, `logprobs`, proper `usage` arithmetic, all fields per spec
 - **Thinking/reasoning** — `thinking: true` or `reasoning_effort` param, reasoning streamed as `reasoning_content`
 - **Account tier support** — free/pro/max — only exposes models your tier can access
-- **Auto-discovery** — background task checks model health every 24h, auto-upgrades when versions change
+- **Auto-discovery** — authenticated picker refreshes at startup and periodically; explicit mappings are preserved
 - **Response cleaning** — strips Perplexity citations `[1][2]`, `<grok:*>` tags, `<?xml?>` declarations, `<script>` tags
 - **Rate limit tracking** — tracks Pro Search quota, explicit error when the requested paid model has no remaining quota, notices at every 5th decrement
 - **Substitution notice** — if Perplexity swaps the requested model, the answer still returns with `[Substituted by Perplexity with ...]` at the end
 - **Session continuity** — uses Perplexity `backend_uuid` for eligible plain-text follow-ups; explicit instructions and function conversations retain their complete context
 - **Session keep-alive** — validates at startup and every 6 hours, then persists any rotated cookie returned by Perplexity
-- **Push notifications** — [ntfy.sh](https://ntfy.sh) alerts on cookie expiry or model upgrades
+- **Push notifications** — [ntfy.sh](https://ntfy.sh) alerts on cookie expiry or authentication failure
 - **Debug chat UI** — `/chat` page with tools toggle, thinking toggle, streaming toggle, and **OpenAI format validator**
 - **Dynamic model management** — add/remove models at runtime via admin API
 - **Full input validation** — proper error messages for every malformed request
@@ -100,7 +94,7 @@ The live, account-specific catalogue is the source of truth. Use authenticated `
 
 The static compatibility map retains existing client IDs during picker outages. Built-in rolling defaults are `gpt` → GPT-6.1 Sol, `sonnet` → Claude Sonnet 5.5, `grok` → Grok 4.7, `nemotron` → Nemotron 3.5 Super VL, and `gemini-flash` → Gemini 3.8 Flash. `gemini` retains the Pro-family mapping. Explicit mappings loaded from `.models.json` or saved through `/admin/update-models` are preserved, including across refresh and restart; they do not silently roll to a different preference. Older IDs remain selectable, but Perplexity may substitute an unavailable model. Responses include a substitution notice when detected.
 
-These friendly IDs use preferences verified against the authenticated picker and real account inference:
+These friendly IDs use preferences mapped to these upstream preferences:
 
 | Proxy ID | Perplexity preference | Reasoning |
 |----------|-----------------------|-----------|
@@ -115,10 +109,13 @@ Free accounts expose only `auto`. Pro/Max picker entries are filtered by the aut
 
 ## API Endpoints
 
+Bearer authentication applies when `PPLX_PROXY_API_KEY` is configured; an empty key disables it.
+
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | `GET` | `/health` | No | Health check |
 | `GET` | `/chat` | No | **Debug chat UI with OpenAI format validator** |
+| `GET` | `/debug` | No | Redirect to `/chat` |
 | `GET` | `/v1/models` | Yes | List tier-available models |
 | `POST` | `/v1/chat/completions` | Yes | Chat (streaming + non-streaming + thinking) |
 | `POST` | `/v1/responses` | Yes | OpenAI Responses API (stream, store, previous_response_id; experimental function bridge and image input) |
@@ -148,7 +145,7 @@ Set the base URL to `http://localhost:8892/v1` (or your HTTPS deployment), the A
 
 Built-in web search is always on. Responses web-search tools are accepted because they use that existing search behavior. Background requests require `store: true`; only active background requests can be cancelled. Custom sampling values, output-token limits, automatic truncation, and strict **text-output** JSON schemas are rejected. JSON-object and non-strict text schema modes are prompt-based requests, not guaranteed structured output. File search, code interpreter, computer use, and image generation remain unsupported.
 
-Function definitions in `tools` enable an **experimental prompt-mediated bridge**. One full SDK loop succeeded, but a subsequent auto-selection test returned non-JSON output and failed with `tool_protocol_error`. Reliability is not established; passing unit and container tests verifies the proxy behavior, not model compliance. No retry or fallback hides these failures.
+Function definitions in `tools` enable an **experimental prompt-mediated bridge**. Invalid protocol output fails with `tool_protocol_error`; reliability depends on the upstream model. No retry or fallback hides these failures.
 
 The bridge works as follows: Perplexity proposes a JSON call, the proxy validates its name and arguments against the supplied schema, and the client application executes it. Malformed JSON, invalid arguments, or a violated tool choice produce HTTP 502 (`tool_protocol_error`), or `response.failed` after streaming has started. There is no ordinary-text fallback and the proxy never executes client functions. Streaming sends function events only after the entire upstream answer has passed validation.
 
@@ -156,7 +153,7 @@ Function `tool_choice` supports `auto`, `required`, `none`, and `{"type":"functi
 
 ### Function loop with the official Python SDK
 
-Set `PPLX_PROXY_BASE_URL` to your deployed proxy, including `/v1` (for this deployment, `https://pplx.0ruka.dev/v1`). Use the existing proxy API key. Function calling remains experimental; clients must handle explicit failures.
+Set `PPLX_PROXY_BASE_URL` to your deployed proxy, including `/v1` (for example, `https://proxy.example.com/v1`). Use the existing proxy API key. Function calling remains experimental; clients must handle explicit failures.
 
 ```python
 import json
@@ -203,7 +200,7 @@ for event in client.responses.create(
 
 ### Image and file input
 
-A real PNG input has passed an official SDK test. Use a Responses `input_image` content part alongside `input_text`. `/v1/files` accepts multipart `file` and `purpose` fields and returns a local `file_id`; its read/delete endpoints manage those stored bytes. Limits are **20 MiB per file** and **200 MiB total local storage**.
+Use a Responses `input_image` content part alongside `input_text`. `/v1/files` accepts multipart `file` and `purpose` fields and returns a local `file_id`; its read/delete endpoints manage those stored bytes. Limits are **20 MiB per file** and **200 MiB total local storage**.
 
 Document upload and model-readable document input are different steps. Document processing must finish through Perplexity's `/rest/sse/attachment_processing/subscribe` endpoint before a query can use it. That endpoint currently receives Cloudflare 403, so document input is **not working** and returns an explicit **502**. Do not treat successful local file upload as a successful document-reading test.
 
@@ -279,14 +276,14 @@ Discovery runs once during startup and every `PROBE_INTERVAL_HOURS` (default 24)
 
 Refresh manually with `POST /admin/discover-models` and the configured Bearer API key. The route uses the same session and picker as startup. Built-in family aliases follow matching picker choices; explicitly persisted/admin mappings keep their configured preferences. Known friendly version IDs are added when their exact preference is present in the picker. Existing legacy aliases remain available even when absent from the picker and can be substituted upstream; their presence is not proof of current model availability. Newly discovered picker IDs can be selected immediately, without rebuilding the image. The cache stores only picker metadata and timestamps, never credentials.
 
-The request uses the existing `PerplexityClient` AsyncSession, cookies, User-Agent, and TLS impersonation. The picker requires coherent same-origin AJAX metadata (`Origin`, `Referer`, `sec-fetch-dest: empty`, `sec-fetch-mode: cors`), rather than the navigation headers used for session checks. Keep curl_cffi's normal HTTP negotiation: real Mac/Pi5 checks succeeded over HTTP/2, while forcing HTTP/1.1 received Cloudflare 403. This is observed endpoint behavior, not a guarantee about Cloudflare policy.
+The request uses the existing `PerplexityClient` AsyncSession, cookies, User-Agent, and TLS impersonation. The picker requires coherent same-origin AJAX metadata (`Origin`, `Referer`, `sec-fetch-dest: empty`, `sec-fetch-mode: cors`), rather than the navigation headers used for session checks. Keep curl_cffi's normal HTTP negotiation; forced HTTP/1.1 has received Cloudflare 403.
 
 Picker failures remain visible in `/health.model_discovery.last_error` and warning logs; diagnostics contain stage/status/path, never arbitrary upstream bodies or transport exception messages. Cached/configured models remain usable, but no automatic inference-probe fallback masks picker failures. Disable picker fetches and the scheduled task with `PROBE_DISCOVERY_ENABLED=false`.
 
 Unlike the old numeric version probes, the picker can expose genuinely new preference names immediately. The retained legacy probe helpers can only test registry names or bounded numeric patterns (`MAX_VERSION_UPGRADE_PROBES=10`), cannot invent a renamed family/suffix, and are not the scheduled discovery path.
 
 To rebuild and redeploy after code updates:
-- **Systemd (production)**: `git pull && venv/bin/pip install -r requirements.txt && sudo systemctl restart pplx-proxy.service`
+- **systemd**: `git pull && venv/bin/pip install -r requirements.txt && sudo systemctl restart pplx-proxy.service`
 - **Docker Compose**: `docker compose build && docker compose up -d`
 - **Verify**: `curl -fsS http://localhost:8892/health` and `curl -fsS http://localhost:8892/v1/models -H "Authorization: Bearer $PPLX_PROXY_API_KEY"`
 
@@ -298,8 +295,8 @@ To rebuild and redeploy after code updates:
 | `PPLX_PROXY_API_KEY` | — | Bearer auth (empty = no auth) |
 | `ACCOUNT_TYPE` | `pro` | `free`, `pro`, or `max` |
 | `DEFAULT_MODEL` | `gpt` | Default when not specified |
-| `PPLX_PROXY_PORT` | `8892` | Listen port |
-| `DATA_DIR` | `.` | Runtime file directory for `.cookie_cache.json`, `.models.json`, and `.responses_store.json` |
+| `PPLX_PROXY_PORT` | `8892` | Port used by the built-in runner and Compose host mapping; pass `--port` explicitly to uvicorn |
+| `DATA_DIR` | project directory (`.` in `.env.example`) | Runtime cookie, model and response stores, discovery caches and uploads |
 | `PROBE_DISCOVERY_ENABLED` | `true` | Enable authenticated model picker discovery |
 | `PROBE_INTERVAL_HOURS` | `24` | Picker refresh interval; must be positive |
 | `PROBE_TIMEOUT_MINUTES` | `15` | Timeout in minutes for session/catalogue requests; must be positive |
@@ -316,13 +313,9 @@ To rebuild and redeploy after code updates:
 | `COOKIE_MAX_AGE_HOURS` | `168` | Cookie cache max age |
 | `LOG_LEVEL` | `INFO` | Logging level |
 
-On macOS, copy the configured private topic without exposing it or adding a trailing newline:
-
-```bash
-ssh YOUR_PI 'value=$(sed -n "s/^NTFY_TOPIC=//p" ~/pplx-proxy/.env); printf %s "$value"' | pbcopy
-```
-
 ## Deployment (systemd)
+
+Edit `pplx-proxy.service` to match your user, installation paths and port before installing it.
 
 ```bash
 sudo cp pplx-proxy.service /etc/systemd/system/

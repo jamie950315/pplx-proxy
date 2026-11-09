@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Usage: ./inject_cookie.sh (hidden prompt), or pipe the session token on stdin.
+# A running local service is required; set PPLX_PROXY_PORT and PPLX_PROXY_API_KEY in .env if needed.
 # Get __Secure-next-auth.session-token from your logged-in browser cookies.
 set -euo pipefail
 umask 077
