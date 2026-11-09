@@ -73,6 +73,8 @@ _MODEL_ALIAS_FAMILIES={
     "opus": "claude opus",
     "haiku": "claude haiku",
     "gemini": "gemini",
+    "gemini-flash": "gemini",
+    "nemotron": "nemotron",
     "grok": "grok",
     "kimi-k3": "kimi k3",
 }
@@ -370,7 +372,7 @@ DEFAULT_HEADERS={
 _MODEL_REGISTRY={
     "auto": {"entry": ("pro", "pplx_pro"), "tier": "free", "label": "Perplexity Best"},
     "sonar": {"entry": ("pro", "experimental"), "tier": "pro", "label": "Sonar 2"},
-    "gpt": {"entry": ("pro", "gpt56_terra"), "tier": "pro", "label": "GPT-5.6 Terra", "thinking": ("pro", "gpt56_terra_thinking")},
+    "gpt": {"entry": ("pro", "gpt6_1_sol"), "tier": "pro", "label": "GPT-6.1 Sol", "thinking": ("pro", "gpt6_1_sol_thinking")},
     "gpt-6.1-sol": {"entry": ("pro", "gpt6_1_sol"), "tier": "pro", "label": "GPT-6.1 Sol", "thinking": ("pro", "gpt6_1_sol_thinking")},
     "gpt-5.6-terra": {"entry": ("pro", "gpt56_terra"), "tier": "pro", "label": "GPT-5.6 Terra", "thinking": ("pro", "gpt56_terra_thinking")},
     "gpt-5.6-sol": {"entry": ("pro", "gpt56_sol"), "tier": "max", "label": "GPT-5.6 Sol", "thinking": ("pro", "gpt56_sol_thinking")},
@@ -378,10 +380,10 @@ _MODEL_REGISTRY={
     "gpt-mini": {"entry": ("pro", "gpt5_mini"), "tier": "pro", "label": "GPT-5 Mini"},
     "gpt-nano": {"entry": ("pro", "gpt5_nano"), "tier": "pro", "label": "GPT-5 Nano"},
     "gemini": {"entry": ("pro", "gemini31pro_high"), "tier": "pro", "label": "Gemini 3.1 Pro"},
-    "gemini-3.8-flash": {"entry": ("pro", "gemini38flash"), "tier": "pro", "label": "Gemini 3.8 Flash"},
-    "gemini-flash": {"entry": ("pro", "gemini35flash"), "tier": "pro", "label": "Gemini 3.5 Flash"},
+    "gemini-3.8-flash": {"entry": ("pro", "gemini38flash"), "tier": "pro", "label": "Gemini 3.8 Flash", "thinking": ("pro", "gemini38flashthinking")},
+    "gemini-flash": {"entry": ("pro", "gemini38flash"), "tier": "pro", "label": "Gemini 3.8 Flash", "thinking": ("pro", "gemini38flashthinking")},
     "gemini-flash-lite": {"entry": ("pro", "gemini31flashlite"), "tier": "pro", "label": "Gemini 3.1 Flash Lite", "enabled": False},
-    "sonnet": {"entry": ("pro", "claude50sonnet"), "tier": "pro", "label": "Claude Sonnet 5", "thinking": ("pro", "claude50sonnetthinking")},
+    "sonnet": {"entry": ("pro", "claude55sonnet"), "tier": "pro", "label": "Claude Sonnet 5.5", "thinking": ("pro", "claude55sonnetthinking")},
     "sonnet-5.5": {"entry": ("pro", "claude55sonnet"), "tier": "pro", "label": "Claude Sonnet 5.5", "thinking": ("pro", "claude55sonnetthinking")},
     "sonnet-5": {"entry": ("pro", "claude50sonnet"), "tier": "pro", "label": "Claude Sonnet 5", "thinking": ("pro", "claude50sonnetthinking")},
     "sonnet-4.6": {"entry": ("pro", "claude46sonnet"), "tier": "pro", "label": "Claude Sonnet 4.6", "thinking": ("pro", "claude46sonnetthinking")},
@@ -390,19 +392,19 @@ _MODEL_REGISTRY={
     "opus-4.8": {"entry": ("pro", "claude48opus"), "tier": "max", "label": "Claude Opus 4.8", "thinking": ("pro", "claude48opusthinking")},
     "opus-4.7": {"entry": ("pro", "claude47opus"), "tier": "max", "label": "Claude Opus 4.7", "thinking": ("pro", "claude47opusthinking")},
     "opus-4.6": {"entry": ("pro", "claude46opus"), "tier": "max", "label": "Claude Opus 4.6", "thinking": ("pro", "claude46opusthinking")},
-    "grok": {"entry": ("pro", "grok46low"), "tier": "pro", "label": "Grok 4.6"},
-    "grok-4.7": {"entry": ("pro", "grok47low"), "tier": "pro", "label": "Grok 4.7"},
+    "grok": {"entry": ("pro", "grok47"), "tier": "pro", "label": "Grok 4.7", "thinking": ("pro", "grok47thinking")},
+    "grok-4.7": {"entry": ("pro", "grok47"), "tier": "pro", "label": "Grok 4.7", "thinking": ("pro", "grok47thinking")},
     "grok-4.6": {"entry": ("pro", "grok46low"), "tier": "pro", "label": "Grok 4.6"},
     "grok-4.5": {"entry": ("pro", "grok45low"), "tier": "pro", "label": "Grok 4.5", "thinking": ("pro", "grok45medium")},
     "grok-4": {"entry": ("pro", "grok4"), "tier": "pro", "label": "Grok 4"},
     "grok-reasoning": {"entry": ("pro", "grok420reasoning"), "tier": "pro", "label": "Grok 4.20 Reasoning"},
     "grok-non-reasoning": {"entry": ("pro", "grok420nonreasoning"), "tier": "pro", "label": "Grok 4.20 Non Reasoning"},
     "grok-multi": {"entry": ("pro", "grok420multiagent"), "tier": "max", "label": "Grok 4.20 Multi-Agent", "enabled": False},
-    "nemotron": {"entry": ("pro", "nv_nemotron_3_ultra"), "tier": "pro", "label": "Nemotron 3 Ultra"},
-    "nemotron-3.5-super-vl": {"entry": ("pro", "nv_nemotron_35_super_vl"), "tier": "pro", "label": "Nemotron 3.5 Super VL", "thinking": ("pro", "nv_nemotron_35_super_vl_thinking")},
+    "nemotron": {"entry": ("pro", "nv_nemotron_3_5_super"), "tier": "pro", "label": "Nemotron 3.5 Super VL"},
+    "nemotron-3.5-super-vl": {"entry": ("pro", "nv_nemotron_3_5_super"), "tier": "pro", "label": "Nemotron 3.5 Super VL"},
     "nemotron-3-super": {"entry": ("pro", "nv_nemotron_3_super"), "tier": "pro", "label": "Nemotron 3 Super"},
     "glm-5.2": {"entry": ("pro", "glm_5_2"), "tier": "pro", "label": "GLM-5.2"},
-    "glm-5.3": {"entry": ("pro", "glm_5_3"), "tier": "pro", "label": "GLM 5.3", "thinking": ("pro", "glm_5_3_thinking")},
+    "glm-5.3": {"entry": ("pro", "glm_5_3_thinking"), "tier": "pro", "label": "GLM-5.3"},
     "kimi-k2.6": {"entry": ("pro", "kimik26instant"), "tier": "pro", "label": "Kimi K2.6", "thinking": ("pro", "kimik26thinking")},
     "kimi-k3": {"entry": ("pro", "kimik3"), "tier": "pro", "label": "Kimi K3"},
 }
@@ -436,6 +438,10 @@ def _thinking_model_entry(model_id: str, base_entry: tuple) -> tuple:
     discovered=MODEL_REGISTRY.models.get(model_id, {})
     if discovered.get("thinking_pref"):
         return base_entry[0], discovered["thinking_pref"]
+    if discovered.get("picker_verified"):
+        if discovered.get("thinking"):
+            return base_entry
+        raise OpenAIAPIError(400, f"Model '{model_id}' has no reasoning variant in the authenticated picker", param="thinking")
     spec=_MODEL_REGISTRY.get(model_id, {})
     thinking=spec.get("thinking")
     if not thinking:
@@ -495,6 +501,15 @@ def save_model_map(mm: dict):
 
 def check_tier(model_name: str) -> str:
     """Check if model is available for current account tier. Returns error msg or empty string."""
+    metadata=MODEL_REGISTRY.models.get(model_name, {})
+    if metadata.get("picker_verified"):
+        needed=metadata.get("tier", "pro")
+        rank={"free": 0, "pro": 1, "max": 2}
+        if ACCOUNT_TYPE == "free" and model_name != "auto":
+            return f"Model '{model_name}' requires pro tier (current: free)"
+        if rank.get(needed, 1) > rank[ACCOUNT_TYPE]:
+            return f"Model '{model_name}' requires {needed} tier (current: {ACCOUNT_TYPE})"
+        return ""
     allowed=_TIER_MODELS.get(ACCOUNT_TYPE, _TIER_MODELS["pro"])
     if model_name not in allowed:
         if model_name in _ALL_MODELS:
@@ -526,62 +541,60 @@ PROBE_TIMEOUT_MINUTES=float(os.getenv("PROBE_TIMEOUT_MINUTES", "15"))
 if PROBE_INTERVAL_HOURS <= 0 or PROBE_TIMEOUT_MINUTES <= 0:
     raise ValueError("PROBE_INTERVAL_HOURS and PROBE_TIMEOUT_MINUTES must be positive")
 MODEL_REGISTRY=DiscoveredModelRegistry(MODELS_FILE.with_name(".discovered_models.pending.json"), {
-    key: {"mode": value[0], "pref": value[1], "source": "fallback"}
+    key: {"mode": value[0], "pref": value[1], "source": "configured_alias" if MODELS_FILE.exists() else "fallback"}
     for key, value in MODEL_MAP.items()
 }, int(PROBE_INTERVAL_HOURS * 3600))
 _MODEL_REFRESH_LOCK=asyncio.Lock()
 
 def _install_discovered_models(discovered: dict):
-    """Install exact picker IDs plus configured aliases whose target still exists."""
-    global MODEL_MAP, DEFAULT_MODEL, _THINKING_MAP
-    preferences={entry["pref"] for entry in discovered.values()}
+    """Retain configured IDs; derive rolling defaults and exact picker aliases."""
+    global MODEL_MAP, DEFAULT_MODEL
     configured=dict(MODEL_REGISTRY.fallback)
+    preferences={entry["pref"]: entry for entry in discovered.values()}
+    # Friendly version IDs are aliases of verified preferences, not guessed names.
+    for key, spec in _MODEL_REGISTRY.items():
+        if key in _ENABLED_MODEL_IDS and key not in configured and key not in _MODEL_ALIAS_FAMILIES and spec["entry"][1] in preferences:
+            configured[key]={"mode": spec["entry"][0], "pref": spec["entry"][1], "source": "fallback"}
     aliases={}
+    metadata=dict(discovered)
     for key, value in configured.items():
-        if not isinstance(value, dict) or key in discovered:
+        if key in discovered:
             continue
+        target=preferences.get(value["pref"])
         family=_MODEL_ALIAS_FAMILIES.get(key)
-        if (value["pref"] in preferences and not family) or key == "auto":
-            aliases[key]=(value["mode"], value["pref"])
-            continue
-        label=(value.get("label") or _MODEL_LABELS.get(key, "")).casefold()
-        candidates=[entry for entry in discovered.values()
-            if isinstance(entry.get("label"), str)
-            and ((entry["label"].casefold().startswith(family)) if family else entry["label"].casefold() == label)
-            and not entry.get("thinking")]
-        if family == "gemini":
-            pro_models=[entry for entry in candidates if "pro" in entry["label"].casefold()]
-            candidates=pro_models or candidates
-        if not candidates and family:
+        # Persisted/admin mappings are explicit; only built-in defaults follow families.
+        if family and value.get("source") != "configured_alias":
             candidates=[entry for entry in discovered.values()
-                if isinstance(entry.get("label"), str) and entry["label"].casefold().startswith(family)]
-        if candidates:
-            selected=max(candidates, key=lambda entry: tuple(int(number) for number in re.findall(r"\d+", entry["label"])))
-            aliases[key]=(selected["mode"], selected["pref"])
-        else:
-            aliases[key]=(value["mode"], value["pref"])
+                if entry["label"].casefold().startswith(family) and not entry.get("thinking")]
+            if key == "gemini":
+                candidates=[entry for entry in candidates if "pro" in entry["label"].casefold()]
+            elif key == "gemini-flash":
+                candidates=[entry for entry in candidates if "flash" in entry["label"].casefold()]
+            if not candidates and family != "gemini":
+                candidates=[entry for entry in discovered.values() if entry["label"].casefold().startswith(family)]
+            if candidates:
+                target=max(candidates, key=lambda entry: tuple(int(number) for number in re.findall(r"\d+", entry["label"])))
+        mode, pref=(target["mode"], target["pref"]) if target else (value["mode"], value["pref"])
+        if value.get("source") == "configured_alias":
+            mode=value["mode"]
+        aliases[key]=(mode, pref)
+        label=next((spec["label"] for spec in _MODEL_REGISTRY.values() if spec["entry"][1] == pref), key)
+        metadata[key]={**(target or {}), "mode": mode, "pref": pref,
+            "label": target["label"] if target else label,
+            "source": "configured_alias" if discovered or value.get("source") == "configured_alias" else "fallback"}
     MODEL_MAP={**aliases, **{key: (entry["mode"], entry["pref"]) for key, entry in discovered.items()}}
-    dynamic_thinking={k: v["thinking"] for k, v in _MODEL_REGISTRY.items() if "thinking" in v}
-    for key, entry in discovered.items():
+    MODEL_REGISTRY.models=metadata
+    dynamic_thinking={k: v["thinking"] for k, v in _MODEL_REGISTRY.items()
+        if "thinking" in v and k in MODEL_MAP and not metadata.get(k, {}).get("picker_verified")}
+    for key, entry in metadata.items():
         if entry.get("thinking_pref"):
             dynamic_thinking[key]=(entry["mode"], entry["thinking_pref"])
-    for key, (mode, pref) in aliases.items():
-        previous=MODEL_REGISTRY.models.get(key, {})
-        target=next((entry for entry in discovered.values() if entry["pref"] == pref), {})
-        thinking_pref=target.get("thinking_pref")
-        source_val="configured_alias" if discovered else previous.get("source", "fallback")
-        MODEL_REGISTRY.models[key]={
-            "mode": mode, "pref": pref, "label": previous.get("label", _MODEL_LABELS.get(key, key)),
-            "source": source_val,
-        }
-        if thinking_pref:
-            MODEL_REGISTRY.models[key]["thinking_pref"]=thinking_pref
-            dynamic_thinking[key]=(mode, thinking_pref)
     _THINKING_MAP.clear()
     _THINKING_MAP.update(dynamic_thinking)
     if DEFAULT_MODEL not in MODEL_MAP and "auto" in MODEL_MAP:
         log.warning("Configured DEFAULT_MODEL is absent from the live Perplexity picker; using auto")
         DEFAULT_MODEL="auto"
+
 
 if MODEL_REGISTRY.source == "cache":
     if MODEL_REGISTRY.account_tier in {"free", "pro", "max"}:
@@ -945,6 +958,7 @@ class PerplexityClient:
         finally:
             await resp.aclose()
 
+        log.info("Perplexity answer model: requested=%s actual=%s", model_pref, actual_model or "unknown")
         yield {
             "delta": "",
             "answer": full_answer,
@@ -1616,7 +1630,7 @@ def _responses_resolve_model(model_name: str, use_thinking: bool):
         raise OpenAIAPIError(403, tier_err, param="model")
     if model_name not in mm:
         raise OpenAIAPIError(400, f"Unknown model: {model_name}. Available: {list(mm.keys())}", param="model")
-    if use_thinking and model_name in _THINKING_MAP:
+    if use_thinking and (model_name in _THINKING_MAP or MODEL_REGISTRY.models.get(model_name, {}).get("picker_verified")):
         mode, model_pref=_thinking_model_entry(model_name, mm[model_name])
         log.info(f"thinking on → {model_name} using {model_pref}")
     else:
@@ -2509,7 +2523,7 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
 
     # Thinking mode: thinking=true OR reasoning_effort != "none"
     use_thinking=thinking or (reasoning_effort is not None and reasoning_effort != "none")
-    if use_thinking and model_name in _THINKING_MAP:
+    if use_thinking and (model_name in _THINKING_MAP or MODEL_REGISTRY.models.get(model_name, {}).get("picker_verified")):
         mode, model_pref=_thinking_model_entry(model_name, mm[model_name])
         log.info(f"thinking on → {model_name} using {model_pref}")
     else:
@@ -3062,7 +3076,7 @@ async def _refresh_live_model_catalogue_impl(force=True):
         _activate_account_model_cache(client)
         headers={"accept": "application/json", "x-app-apiversion": PPLX_API_VERSION}
         stage="auth_session"
-        session_response=await client.session.get(AUTH_SESSION_URL, headers=headers, timeout=PROBE_TIMEOUT_MINUTES)
+        session_response=await client.session.get(AUTH_SESSION_URL, headers=headers, timeout=PROBE_TIMEOUT_MINUTES * 60)
         session_response.raise_for_status()
         session_payload=session_response.json()
         user=session_payload.get("user") if isinstance(session_payload, dict) else None
@@ -3073,9 +3087,11 @@ async def _refresh_live_model_catalogue_impl(force=True):
         if cookie_account:
             headers["x-pplx-account"]=cookie_account
         stage="model_config"
+        headers.update({"origin": PPLX_BASE, "referer": PPLX_BASE+"/",
+            "sec-fetch-dest": "empty", "sec-fetch-mode": "cors", "sec-fetch-site": "same-origin"})
         response=await client.session.get(MODEL_CONFIG_URL,
             params={"version": PPLX_API_VERSION, "source": "default"},
-            headers=headers, timeout=PROBE_TIMEOUT_MINUTES)
+            headers=headers, timeout=PROBE_TIMEOUT_MINUTES * 60)
         response.raise_for_status()
         payload=response.json()
         stage="catalogue_parse"
@@ -3116,23 +3132,23 @@ async def update_models_endpoint(request: Request, _=Depends(verify_api_key)):
         raise OpenAIAPIError(400, "merge must be a boolean", param="merge")
     if any(not k.strip() or not all(x.strip() for x in v) or v[0] not in ("auto", "pro", "reasoning", "deep research") for k, v in new_models.items()):
         raise OpenAIAPIError(400, "Model entries require non-empty names/preferences and a supported mode", param="models")
-    global MODEL_MAP
-    for key, value in new_models.items():
-        discovered=MODEL_REGISTRY.models.get(key)
-        if discovered and discovered.get("source") == "discovered" and tuple(value) != (discovered["mode"], discovered["pref"]):
-            raise OpenAIAPIError(400, f"Discovered model ID '{key}' is bound to its verified Perplexity picker identifier", param="models")
-    updated=dict(MODEL_MAP) if merge else {}
-    discovered_models={key: (value["mode"], value["pref"]) for key, value in MODEL_REGISTRY.models.items() if value.get("source") == "discovered"}
-    updated.update(discovered_models)
-    updated.update({k: tuple(v) for k, v in new_models.items()})
-    if not updated:
-        raise OpenAIAPIError(400, "Model map cannot be empty", param="models")
-    save_model_map({key: value for key, value in updated.items() if key not in discovered_models})
-    MODEL_MAP=updated
-    for key, value in new_models.items():
-        if key not in discovered_models:
-            MODEL_REGISTRY.models[key]={"mode": value[0], "pref": value[1], "label": _MODEL_LABELS.get(key, key), "source": "configured_alias"}
-    return {"status": "ok", "model_count": len(MODEL_MAP), "models": list(MODEL_MAP.keys())}
+    async with _MODEL_REFRESH_LOCK:
+        global MODEL_MAP
+        for key, value in new_models.items():
+            discovered=MODEL_REGISTRY.models.get(key)
+            if discovered and discovered.get("source") == "discovered" and tuple(value) != (discovered["mode"], discovered["pref"]):
+                raise OpenAIAPIError(400, f"Discovered model ID '{key}' is bound to its verified Perplexity picker identifier", param="models")
+        updated=dict(MODEL_MAP) if merge else {}
+        discovered_models={key: (value["mode"], value["pref"]) for key, value in MODEL_REGISTRY.models.items() if value.get("source") == "discovered"}
+        updated.update(discovered_models)
+        updated.update({k: tuple(v) for k, v in new_models.items()})
+        if not updated:
+            raise OpenAIAPIError(400, "Model map cannot be empty", param="models")
+        configured={key: value for key, value in updated.items() if key not in discovered_models}
+        save_model_map(configured)
+        MODEL_REGISTRY.fallback={key: {"mode": value[0], "pref": value[1], "source": "configured_alias"} for key, value in configured.items()}
+        _install_discovered_models({key: value for key, value in MODEL_REGISTRY.models.items() if value.get("source") == "discovered"})
+        return {"status": "ok", "model_count": len(MODEL_MAP), "models": list(MODEL_MAP.keys())}
 
 
 @app.get("/admin/models")
@@ -3251,32 +3267,34 @@ async def refresh_cookie_endpoint(request: Request, _=Depends(verify_api_key)):
             status_code=401,
             detail="Unable to validate the submitted Perplexity session token",
         )
-    save_cookies(validated_cookies, last_keepalive=time.time())
-    global _client, _rate_limit_refresh_task
-    if _client:
-        await _client.reset(validated_cookies)
-    else:
-        _client=PerplexityClient(validated_cookies)
-    if _rate_limit_refresh_task and not _rate_limit_refresh_task.done():
-        _rate_limit_refresh_task.cancel()
-    _rate_limit_refresh_task=None
-    _reset_rate_limit()
-    # Reload model map from file if it exists
-    global MODEL_MAP
-    MODEL_MAP=load_model_map()
-    global DEFAULT_MODEL
-    DEFAULT_MODEL=CONFIGURED_DEFAULT_MODEL
-    _activate_account_model_cache(_client)
-    _configured_session_state.update({"status": "active", "source": "admin", "message": None})
+    async with _MODEL_REFRESH_LOCK:
+        save_cookies(validated_cookies, last_keepalive=time.time())
+        global _client, _rate_limit_refresh_task
+        if _client:
+            await _client.reset(validated_cookies)
+        else:
+            _client=PerplexityClient(validated_cookies)
+        if _rate_limit_refresh_task and not _rate_limit_refresh_task.done():
+            _rate_limit_refresh_task.cancel()
+        _rate_limit_refresh_task=None
+        _reset_rate_limit()
+        # Reload model map from file if it exists
+        global MODEL_MAP
+        MODEL_MAP=load_model_map()
+        global DEFAULT_MODEL
+        DEFAULT_MODEL=CONFIGURED_DEFAULT_MODEL
+        _activate_account_model_cache(_client)
+        _install_discovered_models({key: value for key, value in MODEL_REGISTRY.models.items() if value.get("source") == "discovered"})
+        _configured_session_state.update({"status": "active", "source": "admin", "message": None})
     await _refresh_live_model_catalogue(force=True)
     return {"status": "ok", "message": "Cookie updated and validated", "models_loaded": len(MODEL_MAP)}
 
 
 async def auto_discover_loop():
     """Refresh the account-specific model picker on its configured interval."""
-    log.info("Model catalogue refresh enabled: every %sh", MODEL_DISCOVERY_INTERVAL_HOURS)
+    log.info("Model catalogue refresh enabled: every %sh", PROBE_INTERVAL_HOURS)
     while True:
-        await asyncio.sleep(MODEL_DISCOVERY_INTERVAL_HOURS * 3600)
+        await asyncio.sleep(PROBE_INTERVAL_HOURS * 3600)
         log.info("Scheduled model catalogue refresh starting")
         try:
             await _refresh_live_model_catalogue(force=True)
@@ -3293,7 +3311,7 @@ async def _service_lifespan(a):
     async with _transport_lifespan(a):
         await reconcile_configured_session()
         _responses_load()
-        if MODEL_DISCOVERY_ENABLED:
+        if PROBE_DISCOVERY_ENABLED:
             try:
                 result=await _refresh_live_model_catalogue(force=not bool(MODEL_REGISTRY.last_success))
                 log.info("Initial model catalogue discovery: %s", result.get("status"))
@@ -3304,9 +3322,10 @@ async def _service_lifespan(a):
             await asyncio.sleep(3)
             await _refresh_rate_limit(block=True)
 
-        tasks=[asyncio.create_task(job()) for job in (
-            session_keepalive_loop, auto_discover_loop, _rate_limit_poll_loop, startup_quota,
-        )]
+        jobs=[session_keepalive_loop, _rate_limit_poll_loop, startup_quota]
+        if PROBE_DISCOVERY_ENABLED:
+            jobs.append(auto_discover_loop)
+        tasks=[asyncio.create_task(job()) for job in jobs]
         log.info("pplx-proxy started on port %s", PORT)
         try:
             yield

@@ -395,7 +395,7 @@ class ComprehensiveDiscoveryRegressionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(res["status"], "error")
             self.assertIn("[model_config]", res["error"])
             self.assertIn("HTTP 502", res["error"])
-            self.assertIn("Bad Gateway", res["error"])
+            self.assertNotIn("Bad Gateway", res["error"])
 
     async def test_malformed_upstream_response(self):
         class OKResponse:

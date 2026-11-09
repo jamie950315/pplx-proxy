@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import tempfile
 import time
 import urllib.parse
@@ -25,16 +24,6 @@ class DiscoveryError(RuntimeError):
     """The upstream catalogue could not be safely interpreted."""
 
 
-def sanitize_discovery_text(text: str) -> str:
-    if not text:
-        return ""
-    clean = re.sub(r"\s+", " ", str(text)).strip()
-    clean = re.sub(r"(session[-_]?token|cookie|authorization)=[^;\s&]+", r"\1=[REDACTED]", clean, flags=re.IGNORECASE)
-    clean = re.sub(r"Bearer\s+[A-Za-z0-9._-]+", "Bearer [REDACTED]", clean, flags=re.IGNORECASE)
-    clean = re.sub(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", "[JWT REDACTED]", clean)
-    return clean
-
-
 def format_discovery_exception(exc: Exception, stage: Optional[str] = None) -> str:
     prefix = f"[{stage}] " if stage else ""
     resp = getattr(exc, "response", None)
@@ -43,29 +32,27 @@ def format_discovery_exception(exc: Exception, stage: Optional[str] = None) -> s
         raw_url = str(getattr(resp, "url", ""))
         if raw_url:
             parsed = urllib.parse.urlparse(raw_url)
-            clean_url = parsed.path or parsed.netloc or raw_url
+            clean_url = parsed.path if parsed.path in {"/api/auth/session", "/rest/models/config/v2"} else "upstream"
         else:
             clean_url = "unknown"
         headers = getattr(resp, "headers", {}) or {}
         content_type = headers.get("content-type") or headers.get("Content-Type") or ""
         if ";" in content_type:
             content_type = content_type.split(";")[0].strip()
-        body_text = ""
-        try:
-            body_text = getattr(resp, "text", "") or ""
-        except Exception:
-            pass
-        clean_body = sanitize_discovery_text(body_text[:150]) if body_text else ""
+        if content_type not in {"text/html", "text/plain", "application/json"}:
+            content_type = ""
+        # Never expose arbitrary upstream bodies through public /health or logs.
+        # They can reflect opaque credentials, and truncation defeats JWT regexes.
         status_str = f"HTTP {status_code}" if status_code else "HTTP error"
         details = [status_str, f"at {clean_url}"]
         if content_type:
             details.append(f"({content_type})")
-        if clean_body:
-            details.append(f": {clean_body}")
         return f"{prefix}{' '.join(details)}"
 
     err_type = type(exc).__name__
-    err_msg = sanitize_discovery_text(str(exc))
+    # Only our own fixed validation errors are safe to include verbatim.
+    # Transport exception messages may contain request headers/cookies.
+    err_msg = str(exc) if isinstance(exc, DiscoveryError) else ""
     if err_msg and err_msg != err_type:
         return f"{prefix}{err_type}: {err_msg}"
     return f"{prefix}{err_type}"
@@ -113,6 +100,7 @@ def parse_catalogue(payload: object, account_tier: str) -> dict:
                 "label": metadata["label"],
                 "tier": required,
                 "source": "discovered",
+                "picker_verified": True,
                 "thinking": field == "reasoning_model",
             }
             for key in ("description", "provider", "capabilities", "context_length", "max_output_tokens"):
@@ -168,8 +156,13 @@ class ModelRegistry:
             for mid, entry in models.items():
                 if not isinstance(mid, str) or not isinstance(entry, dict) or entry.get("pref") != mid:
                     return
-                if entry.get("source") != "discovered":
+                if (entry.get("source") != "discovered" or entry.get("mode") != "pro"
+                    or entry.get("tier") not in TIER_RANK or not isinstance(entry.get("label"), str)
+                    or not isinstance(entry.get("thinking"), bool)
+                    or (entry.get("thinking_pref") and entry["thinking_pref"] not in models)):
                     return
+            # Older caches did not store this flag; validated picker entries still qualify.
+            models = {mid: {**entry, "picker_verified": True} for mid, entry in models.items()}
             self.models = {**self.fallback, **models}
             self.last_success = float(cached["last_success"])
             self.account_tier = cached.get("account_tier")

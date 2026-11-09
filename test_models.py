@@ -50,7 +50,7 @@ class ModelRegistryTests(unittest.TestCase):
             "kimi-k3",
         ]:
             self.assertIn(model_id, model_map)
-        self.assertEqual(model_map["grok"], ("pro", "grok46low"))
+        self.assertEqual(model_map["grok"], ("pro", "grok47"))
         self.assertEqual(model_map["kimi-k3"], ("pro", "kimik3"))
         self.assertEqual(model_map["sonnet-4.6"], ("pro", "claude46sonnet"))
         self.assertNotIn("opus", model_map)
@@ -70,12 +70,12 @@ class ModelRegistryTests(unittest.TestCase):
         self.assertNotIn("grok-multi", model_map)
 
     def test_thinking_map_tracks_latest_defaults(self):
-        self.assertEqual(server._THINKING_MAP["gpt"], ("pro", "gpt56_terra_thinking"))
+        self.assertEqual(server._THINKING_MAP["gpt"], ("pro", "gpt6_1_sol_thinking"))
         self.assertNotIn("gpt-5.4", server._THINKING_MAP)
-        self.assertEqual(server._THINKING_MAP["sonnet"], ("pro", "claude50sonnetthinking"))
-        self.assertNotIn("grok", server._THINKING_MAP)
+        self.assertEqual(server._THINKING_MAP["sonnet"], ("pro", "claude55sonnetthinking"))
+        self.assertEqual(server._THINKING_MAP["grok"], ("pro", "grok47thinking"))
         self.assertEqual(server._THINKING_MAP["grok-4.5"], ("pro", "grok45medium"))
-        self.assertEqual(server._THINKING_MAP["opus"], ("pro", "claude48opusthinking"))
+        self.assertEqual(server._MODEL_REGISTRY["opus"]["thinking"], ("pro", "claude48opusthinking"))
         self.assertNotIn("kimi-k3", server._THINKING_MAP)
 
     def test_tier_error_uses_model_minimum_tier(self):
@@ -110,7 +110,7 @@ class DiscoveryTests(unittest.TestCase):
         report={"added": {}, "unavailable": [], "probed": 0}
 
         async def fake_probe(_client, pref):
-            return pref in {"claude50sonnet", "grok46low", "claude45haiku", "kimik3"}
+            return pref in {"claude55sonnet", "grok47", "claude45haiku", "kimik3"}
 
         async def no_sleep(_seconds):
             return None
@@ -122,8 +122,8 @@ class DiscoveryTests(unittest.TestCase):
                  patch.object(server.asyncio, "sleep", new=no_sleep):
                 changed=await server._discover_known_missing_models(object(), report, sleep_seconds=0)
                 self.assertTrue(changed)
-                self.assertEqual(server.MODEL_MAP["sonnet"], ("pro", "claude50sonnet"))
-                self.assertEqual(server.MODEL_MAP["grok"], ("pro", "grok46low"))
+                self.assertEqual(server.MODEL_MAP["sonnet"], ("pro", "claude55sonnet"))
+                self.assertEqual(server.MODEL_MAP["grok"], ("pro", "grok47"))
                 self.assertEqual(server.MODEL_MAP["kimi-k3"], ("pro", "kimik3"))
                 self.assertNotIn("haiku", server.MODEL_MAP)
                 self.assertIn("sonnet", report["added"])
