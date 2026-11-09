@@ -23,7 +23,7 @@ FastAPI app (`server.py`) with focused attachment, file-storage, and function-pr
 2. Translates to Perplexity's internal SSE (`POST /rest/sse/perplexity_ask`)
 3. Uses `curl_cffi` with Chrome TLS fingerprinting to bypass Cloudflare
 4. Streams responses back in OpenAI SSE or MCP format
-5. Background tasks: session keep-alive (6h) + model discovery (24h)
+5. Background tasks: session keep-alive (6h) + authenticated picker refresh (24h; disabled with PROBE_DISCOVERY_ENABLED=false)
 
 **Critical parameter**: `search_focus: "internet"` must be set in requests to Perplexity. Without it, Perplexity defaults to `"writing"` mode and models will say "I cannot access real-time data" even though search results are found.
 
@@ -31,13 +31,15 @@ FastAPI app (`server.py`) with focused attachment, file-storage, and function-pr
 
 **Account Tiers** (`ACCOUNT_TYPE` in .env):
 - `free`: only `auto`
-- `pro`: all models except Opus
-- `max`: all models including Opus
+- `pro`: authenticated Pro search choices plus compatible configured IDs
+- `max`: includes authenticated Max-only choices and legacy Max IDs
 - Tier filtering applies to API, MCP, model listing, and discovery
 
-**Model Map**: dict of `{model_id: (mode, internal_pref)}`. Loaded from `.models.json` (persisted) or defaults. Filtered by tier at runtime.
+**Model Map**: dict of `{model_id: (mode, internal_pref)}`. An authenticated picker catalogue augments the persisted `.models.json`/built-in compatibility map; exact upstream IDs and supported friendly aliases are exposed. Explicit persisted/admin mappings survive refresh/restart. Built-in defaults follow verified matching families; old IDs remain usable even when Perplexity substitutes them. Picker tiers/metadata take precedence for verified entries. Discovery caches are account-keyed `DATA_DIR/.discovered_models.<hash>.json`, atomically written with mode 0600 and no credentials.
 
-**Thinking Variants**: activated via `thinking: true` or `reasoning_effort != "none"`. Maps from `_THINKING_MAP` (e.g., `gpt → gpt56_terra_thinking`, `sonnet → claude50sonnetthinking`). Perplexity does NOT expose internal thinking blocks — `reasoning_content` is populated from search steps (queries, URLs, plan goals).
+**Current discovery integration**: `integrate/pr1-discovery` merges the contributor's PR commits and fixes lifecycle/configuration ownership. It is not deployed. Six verified friendly IDs are `gpt-6.1-sol` → `gpt6_1_sol`, `gemini-3.8-flash` → `gemini38flash`, `sonnet-5.5` → `claude55sonnet`, `glm-5.3` → `glm_5_3_thinking`, `grok-4.7` → `grok47`, and `nemotron-3.5-super-vl` → `nv_nemotron_3_5_super`. Defaults `gpt`, `sonnet`, `gemini-flash`, `grok`, and `nemotron` use these new generations; explicit persisted mappings are not rewritten.
+
+**Thinking Variants**: activated via `thinking: true` or `reasoning_effort != "none"`. Uses exact picker pairings (e.g., `gpt → gpt6_1_sol_thinking`, `sonnet → claude55sonnetthinking`); never derive a suffix for a picker-verified model. A verified base without a reasoning pair rejects thinking requests with HTTP 400. Reasoning-only IDs are directly invokable. Perplexity does NOT expose internal thinking blocks — `reasoning_content` is populated from search steps (queries, URLs, plan goals).
 
 
 **Context Management**: request payloads are assembled as JSON with `instructions` / `history` / `query`. Queries exceeding 96K characters are rejected before contacting Perplexity. Consecutive assistant messages deduped (keeps last — fixes LibreChat branch artifacts). Generic clients still use whitelist-filtered system prompts from `.prompt_whitelist.txt`, but LobeHub requests now discard upstream system/developer prompt content entirely and prepend local `CUSTOM_PROMPTS` on every turn.
@@ -46,12 +48,13 @@ FastAPI app (`server.py`) with focused attachment, file-storage, and function-pr
 
 **Response Cleaning** (`_clean_response`): strips `[1]` `[2]` citations, `<grok:*>` tags, `<?xml?>` declarations, `<response>` wrappers, `<script>` tags.
 
-**Auto-Discovery**: every `PROBE_INTERVAL_HOURS`, checks if models are alive. Dead models get version-incremented (e.g., `gpt54` → `gpt55`) up to +1.0, capped at 10 probes. If Perplexity substitutes another model, that is treated as temporary unavailability, not a dead version, so discovery does not bump IDs. Pinned names such as `sonnet-4.6` are never auto-upgraded onto a later generation. It also probes known missing model names from `_MODEL_REGISTRY`, so a persisted `.models.json` can gain newly added IDs such as Grok, Haiku, GPT Mini/Nano, and Gemini Flash. Sends ntfy on upgrade or new-model discovery.
+**Auto-Discovery**: fetch `/api/auth/session` and `/rest/models/config/v2` on the existing Perplexity AsyncSession at startup and every `PROBE_INTERVAL_HOURS`. `PROBE_TIMEOUT_MINUTES` is converted to seconds for curl_cffi. Account activation, admin model updates, and refresh publication share one async lock. Failures keep last-known-good state, set public structured `last_error`, and warn; never include upstream bodies or arbitrary exception text. No automatic inference fallback. Disabled discovery starts no refresh task.
 
 ## File Structure
 
 ```
 server.py            # FastAPI, Perplexity client, MCP, admin, discovery, feature integration
+model_discovery.py   # Picker parsing, tier metadata, private atomic catalogue cache
 attachments.py       # Resolve/upload attachments and wait for upstream document processing
 file_store.py        # Bounded local /v1/files storage
 function_tools.py    # Validate prompt-mediated function proposals; never executes tools
@@ -68,7 +71,8 @@ pplx-proxy.service   # systemd unit
 ```
 .env                 # Secrets + config
 .cookie_cache.json   # Cached cookie + timestamp
-.models.json         # Persisted model map
+.models.json         # Persisted explicit model mappings
+.discovered_models.*.json # Account-keyed picker metadata cache (no credentials)
 .responses_store.json # Stored Responses API objects and function history for continuation
 uploads/             # Local uploaded files under DATA_DIR (gitignored)
 CUSTOM_PROMPTS       # Local prompt block prepended to every LobeHub request
@@ -130,20 +134,11 @@ All responses strictly follow the OpenAI Chat Completions spec:
 
 Validates: empty query, invalid model, invalid sources, tier restrictions.
 
-## Discovery Probe Strategy
+## Discovery Transport and Limits
 
-Only base models are probed. Thinking variants auto-derived from `_THINKING_MAP`.
+The picker reuses the live client's cookies, TLS impersonation and User-Agent, with same-origin AJAX headers: `Origin`, `Referer`, `sec-fetch-dest: empty`, `sec-fetch-mode: cors`, and `sec-fetch-site: same-origin`. Leave HTTP negotiation to curl_cffi. On Mac and Pi5, navigation metadata returned Cloudflare 403; AJAX metadata over HTTP/2 returned 200. Forced HTTP/1.1 also returned 403. Do not add another provider, browser bypass, or silent retry path.
 
-- `sonar` (`experimental`) → alive check only, no version pattern
-- `gpt` (`gpt56_terra`) → gpt57...gpt66 (max 10)
-- `sonnet` (`claude50sonnet`) → claude51...claude60 (max 10)
-- `opus` (`claude48opus`) → claude49...claude58 (max 10)
-- `opus-4.6` (`claude46opus`) → claude47...claude56 (max 10)
-- `gemini` (`gemini31pro_high`) → gemini32...gemini41 (max 10)
-- `grok` (`grok46low`) → grok47low...grok56low (max 10)
-- `grok-reasoning` (`grok420reasoning`) → grok421reasoning... (max 10, not unbounded +1.0)
-- `nemotron` (`nv_nemotron_3_super`) → nv_nemotron_4 (max 1)
-- `kimi-k3` (`kimik3`) → alive check only
+New search-mode picker IDs are immediately selectable, without modifying the static registry. Non-search modes use other protocols and remain excluded. The legacy inference-probe helpers are retained for explicit diagnostics/tests, not automatic discovery. Their bounded numeric patterns cannot find arbitrary names or changed suffixes; alive/substituted models do not trigger version upgrades. Picker/cache failures must stay visible in health/logs even while compatibility models continue working.
 
 ## Code Style
 

@@ -35,7 +35,7 @@ This release includes image input, local file storage, and the experimental Resp
 
 pplx-proxy is a FastAPI application that sits between your application and Perplexity.ai's web backend. Instead of using Perplexity's official (paid) API, it authenticates with your existing Pro or Max subscription cookie, translates requests into Perplexity's internal SSE protocol, and exposes the result through industry-standard interfaces.
 
-This gives you access to GPT-5.6 Terra, Claude Sonnet 5, Claude Opus 4.8, Gemini 3.1 Pro, Grok 4.5, GLM-5.2, Kimi K2.6, Nemotron, and other models Perplexity offers — all through the same API format your tools already speak.
+This gives you account-specific access to GPT-6.1 Sol, Claude Sonnet 5.5, Gemini 3.8 Flash, Grok 4.7, GLM-5.3, Nemotron 3.5 Super VL, and other models Perplexity offers — all through the same API format your tools already speak.
 
 Three interfaces are available:
 
@@ -109,7 +109,9 @@ All settings live in the `.env` file. Here is the full reference:
 | `DEFAULT_MODEL` | `gpt` | Model used when no model is specified in the request |
 | `PPLX_PROXY_PORT` | `8892` | Port to listen on |
 | `KEEPALIVE_HOURS` | `6` | Interval between session validation and cookie-rotation persistence |
-| `PROBE_INTERVAL_HOURS` | `24` | Interval between auto-discovery model checks |
+| `PROBE_DISCOVERY_ENABLED` | `true` | Fetch authenticated picker at startup and schedule refreshes |
+| `PROBE_INTERVAL_HOURS` | `24` | Positive interval between picker refreshes |
+| `PROBE_TIMEOUT_MINUTES` | `15` | Positive timeout in minutes for each discovery session/catalogue request |
 | `NTFY_TOPIC` | disabled | Unique ntfy.sh topic: maximum 64 characters using letters, numbers, `_`, or `-`; the shared public `pplx-proxy` name is rejected |
 | `NTFY_URL` | `https://ntfy.sh` | ntfy server URL |
 | `NTFY_COOLDOWN_SECS` | `3600` | Minimum interval between push notifications |
@@ -185,30 +187,40 @@ curl -X POST http://localhost:8892/v1/chat/completions \
 |----------|---------------|-----------|-------|
 | `auto` | Perplexity Best | free | Default Perplexity experience |
 | `sonar` | Sonar 2 | pro | Perplexity's experimental model |
-| `gpt` / `gpt-5.6-terra` | GPT-5.6 Terra | pro | OpenAI's latest |
+| `gpt` / `gpt-6.1-sol` | GPT-6.1 Sol | pro | Paired reasoning variant |
+| `gpt-5.6-terra` | GPT-5.6 Terra | pro | Legacy compatibility ID |
 | `gpt-5.6-sol` | GPT-5.6 Sol | max | Highest-capability GPT-5.6 variant |
 | `gpt-5.5` | GPT-5.5 | pro | Previous GPT model |
 | `gpt-mini` | GPT-5 Mini | pro | Smaller GPT model |
 | `gpt-nano` | GPT-5 Nano | pro | Fastest GPT model |
-| `sonnet` / `sonnet-5` | Claude Sonnet 5 | pro | Anthropic's latest Sonnet |
+| `sonnet` / `sonnet-5.5` | Claude Sonnet 5.5 | pro | Paired reasoning variant |
+| `sonnet-5` | Claude Sonnet 5 | pro | Legacy compatibility ID |
 | `sonnet-4.6` | Claude Sonnet 4.6 | pro | Previous Sonnet version |
 | `gemini` | Gemini 3.1 Pro | pro | Google's flagship |
-| `gemini-flash` | Gemini 3.5 Flash | pro | Faster Gemini model |
-| `grok` / `grok-4.6` | Grok 4.6 | pro | xAI's latest Grok |
+| `gemini-flash` / `gemini-3.8-flash` | Gemini 3.8 Flash | pro | Paired reasoning variant |
+| `grok` / `grok-4.7` | Grok 4.7 | pro | Paired reasoning variant |
+| `grok-4.6` | Grok 4.6 | pro | Legacy compatibility ID |
 | `grok-4.5` | Grok 4.5 | pro | Previous Grok version |
 | `grok-4` | Grok 4 | pro | Previous Grok version |
 | `grok-reasoning` | Grok 4.20 Reasoning | pro | xAI reasoning model |
 | `grok-non-reasoning` | Grok 4.20 Non Reasoning | pro | xAI non-reasoning model |
-| `nemotron` | Nemotron 3 Ultra | pro | NVIDIA's latest model |
+| `nemotron` / `nemotron-3.5-super-vl` | Nemotron 3.5 Super VL | pro | Reasoning-only `nv_nemotron_3_5_super` |
 | `nemotron-3-super` | Nemotron 3 Super | pro | Previous Nemotron version |
-| `glm-5.2` | GLM-5.2 | pro | Z.ai's reasoning model |
+| `glm-5.3` | GLM-5.3 | pro | Reasoning-only `glm_5_3_thinking` |
+| `glm-5.2` | GLM-5.2 | pro | Legacy compatibility ID |
 | `kimi-k2.6` | Kimi K2.6 | pro | Moonshot AI model |
 | `kimi-k3` | Kimi K3 | pro | Moonshot AI model (thinking always on) |
 | `opus` / `opus-4.8` | Claude Opus 4.8 | max | Anthropic's most capable |
 | `opus-4.7` | Claude Opus 4.7 | max | Previous Opus version |
 | `opus-4.6` | Claude Opus 4.6 | max | Previous Opus flagship |
 
-Tracked candidates such as Claude Haiku 4.5, Gemini 3.1 Flash Lite, and Grok 4.20 Multi-Agent remain disabled and are skipped by discovery. Custom model IDs added through `/admin/update-models` are available on Pro and Max accounts; Free accounts only expose `auto`.
+This table describes built-in compatibility defaults, not the current upstream catalogue. Use authenticated `GET /v1/models` for exact picker IDs, labels, tier availability, and source. New searchable picker names appear automatically. Explicit mappings in `.models.json` or saved through `/admin/update-models` remain unchanged across refresh/restart; therefore a configured alias may differ from this table. Legacy IDs are retained, but Perplexity may substitute an unavailable model, with a visible response notice.
+
+Static candidates such as Haiku or Multi-Agent remain disabled unless verified picker entries make their actual upstream IDs available. Custom IDs are available on Pro/Max accounts; Free accounts expose only `auto`.
+
+Discovery uses the existing authenticated AsyncSession with same-origin AJAX metadata, not navigation headers. Mac/Pi5 checks returned picker 200 over negotiated HTTP/2; navigation metadata or forced HTTP/1.1 returned Cloudflare 403. A failed refresh preserves the private last-known-good cache and reports `/health.model_discovery.last_error` plus a warning. No automatic inference fallback conceals the failure. Cache files are `DATA_DIR/.discovered_models.<account-hash>.json`, atomically written with mode 0600 and without credentials. Disable discovery with `PROBE_DISCOVERY_ENABLED=false`; no periodic task is started.
+
+The retained numeric-probe helpers are only explicit diagnostics/tests. They cannot discover arbitrary names, changed suffixes, or new families; only the picker provides general name discovery.
 
 ### Endpoint Summary
 
@@ -360,7 +372,7 @@ Key guarantees:
 
 ## 11. Thinking / Reasoning
 
-Some models support extended thinking, where the model shows its reasoning process before answering.
+Some models offer a paired reasoning preference. Picker-verified base models use that exact pair; a missing pair returns HTTP 400 rather than generating a preference name. Reasoning-only models are directly invokable. Visible reasoning content contains search/planning summaries, not private internal reasoning.
 
 Enable it with either:
 
@@ -394,10 +406,12 @@ In streaming mode, reasoning chunks arrive before content chunks with `delta.rea
 
 | Model | Thinking Variant |
 |-------|-----------------|
-| `gpt` / `gpt-5.6-terra` | `gpt56_terra_thinking` |
+| `gpt` / `gpt-6.1-sol` | `gpt6_1_sol_thinking` |
+| `gpt-5.6-terra` | `gpt56_terra_thinking` |
 | `gpt-5.6-sol` | `gpt56_sol_thinking` |
 | `gpt-5.5` | `gpt55_thinking` |
-| `sonnet` / `sonnet-5` | `claude50sonnetthinking` |
+| `sonnet` / `sonnet-5.5` | `claude55sonnetthinking` |
+| `sonnet-5` | `claude50sonnetthinking` |
 | `sonnet-4.6` | `claude46sonnetthinking` |
 | `grok-4.5` | `grok45medium` |
 | `kimi-k2.6` | `kimik26thinking` |
@@ -413,7 +427,7 @@ pplx-proxy tracks your Perplexity Pro Search quota (`remaining_pro`) and provide
 - On startup, a background task fetches rate limits from Perplexity via FlareSolverr (headless browser, ~10s).
 - Every 1 hour, the counter re-syncs with Perplexity's actual data.
 - After each Pro Search query (copilot mode), the local counter decrements by 1.
-- When `/health` is requested before quota data exists, it waits for a short FlareSolverr sync. Later stale data refreshes in the background.
+- When `/health` is requested with missing or stale quota data, it returns cached/null values immediately and schedules refresh in the background.
 
 **Quota notice:** When `remaining_pro` hits a multiple of 5 (160, 155, 150, ..., 5, 0), the response includes:
 ```
@@ -563,7 +577,7 @@ Returns the full internal model map with mode, preference name, and tier info.
 
 ### POST /admin/update-models
 
-Add or replace models at runtime:
+Add or replace explicit configured mappings at runtime. They survive catalogue refresh/restart; discovered exact IDs stay bound to their verified preference and cannot be remapped. Replacement retains picker IDs and verified friendly version aliases:
 
 ```bash
 curl -X POST http://localhost:8892/admin/update-models \
@@ -587,7 +601,7 @@ curl -X POST http://localhost:8892/admin/refresh-cookie \
 
 ### POST /admin/discover-models
 
-Manually trigger the model auto-discovery probe:
+Manually refresh the authenticated account picker catalogue:
 
 ```bash
 curl -X POST http://localhost:8892/admin/discover-models \
@@ -749,7 +763,7 @@ Hard-refresh the `/chat` page (Ctrl+Shift+R). The page has no-cache headers but 
 - **Image verification is limited to PNG** — a real SDK PNG request passed; do not generalize this to every media format.
 - **Citation stripping** removes `[N]` patterns from ordinary text, which may affect content like `array[0]`. Function arguments are preserved without this cleaning.
 - **Context window**: 96K char total query limit (~32K tokens).
-- **Perplexity API changes** may break the proxy without notice. Auto-discovery catches model changes.
+- **Perplexity API changes** may break the proxy without notice. Picker discovery can find new searchable names only while its schema, authentication and Cloudflare access remain compatible; failures are visible and retain cached/configured models.
 - **Single session** — one cookie per instance. Multiple instances with the same cookie may conflict.
 
 ---
